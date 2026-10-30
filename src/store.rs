@@ -121,16 +121,20 @@ impl Store {
 
     fn replace(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
-        // Processes share this directory, and a shared temp file would let one
-        // rename the other's half-written data into place.
-        let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
+        let tmp = temp_path(path);
         let result = write_synced(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
         if result.is_err() {
             let _ = fs::remove_file(&tmp);
         }
         result
     }
+}
+
+/// Processes share the store directory, and a shared temp file would let one
+/// rename the other's half-written data into place.
+fn temp_path(path: &Path) -> PathBuf {
+    let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("json.{}.{n}.tmp", std::process::id()))
 }
 
 /// Flushes before returning. Otherwise a power loss can keep the rename but
@@ -145,6 +149,7 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// ones, and returns that name. Returns `None` if the file has gone, which
 /// means another process moved it first.
 fn set_aside(path: &Path) -> io::Result<Option<PathBuf>> {
+    // Two processes moving different bad files at the same instant can pick the same free name, which is accepted as too narrow to matter.
     let mut free = path.with_extension("json.corrupt");
     let mut n = 0;
     while free.exists() {
@@ -487,6 +492,68 @@ mod tests {
         r.comments.push(comment("new"));
         store.save(&id, &r).unwrap();
         assert_eq!(std::fs::read(store.path_for(&id).with_extension("json.corrupt")).unwrap(), b"not json");
+        assert_eq!(store.load(&id).review, r);
+    }
+
+    #[test]
+    fn changing_the_long_name_hash_would_orphan_saved_reviews() {
+        // Pinned because a saved review is only found again under this exact name.
+        let store = Store::new(Path::new("repo"));
+        let path = store.path_for(&ReviewId::Branch("a".repeat(300)));
+        let expected = format!("branch-{}~ee7717eba7a17e21.json", "a".repeat(183));
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), expected);
+    }
+
+    #[test]
+    fn temp_names_are_unique_and_carry_the_process_id() {
+        let path = Path::new("repo/branch-feat.json");
+        let (first, second) = (temp_path(path), temp_path(path));
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), path.parent());
+        let name = first.file_name().unwrap().to_str().unwrap();
+        assert!(name.contains(&format!(".{}.", std::process::id())), "{name}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_retry_stops_later_saves_moving_the_healthy_file() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("feat".into());
+        if !corrupt_file_in_read_only_dir(&store, &id) {
+            return;
+        }
+        store.load(&id);
+        set_store_dir_mode(&store, 0o755);
+        let mut r = Review::default();
+        r.comments.push(comment("first"));
+        store.save(&id, &r).unwrap();
+        r.comments.push(comment("second"));
+        store.save(&id, &r).unwrap();
+        // `save` always writes this path, so only a second copy shows a move.
+        assert!(!store.path_for(&id).with_extension("json.corrupt.1").exists());
+        assert_eq!(std::fs::read(store.path_for(&id).with_extension("json.corrupt")).unwrap(), b"not json");
+        assert_eq!(store.load(&id).review, r);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_of_a_healthy_file_stops_later_saves_moving_it() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("feat".into());
+        if !corrupt_file_in_read_only_dir(&store, &id) {
+            return;
+        }
+        store.load(&id);
+        set_store_dir_mode(&store, 0o755);
+        let mut r = Review::default();
+        r.comments.push(comment("repaired"));
+        std::fs::write(store.path_for(&id), serde_json::to_vec(&r).unwrap()).unwrap();
+        assert_eq!(store.load(&id).review, r);
+        store.save(&id, &r).unwrap();
+        // `save` always writes this path, so only a copy shows a move.
+        assert!(!store.path_for(&id).with_extension("json.corrupt").exists());
         assert_eq!(store.load(&id).review, r);
     }
 
