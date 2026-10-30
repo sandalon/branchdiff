@@ -217,3 +217,91 @@ fn diff_output_ignores_user_config() {
         assert_eq!(String::from_utf8_lossy(&configured), String::from_utf8_lossy(&plain), "with {key}");
     }
 }
+
+/// Leaves `feat` in a linked worktree mid-merge with `a.txt` conflicted.
+fn conflicted_worktree(repo: &Repo) -> std::path::PathBuf {
+    let wt = repo.add_worktree("feat");
+    std::fs::write(repo.main.join("a.txt"), "from develop\n").unwrap();
+    repo.commit_all(&repo.main, "develop side");
+    std::fs::write(wt.join("a.txt"), "from feat\n").unwrap();
+    repo.commit_all(&wt, "feat side");
+    assert!(!common::git_unchecked(&wt, &["merge", "--no-edit", "develop"]).status.success());
+    wt
+}
+
+#[test]
+fn in_progress_op_is_per_worktree() {
+    let repo = Repo::new();
+    let wt = conflicted_worktree(&repo);
+    assert_eq!(git::in_progress_op(&wt), Some("merge"));
+    assert_eq!(git::in_progress_op(&repo.main), None);
+}
+
+#[test]
+fn fingerprint_changes_when_conflicted_file_is_edited_again() {
+    let repo = Repo::new();
+    let wt = conflicted_worktree(&repo);
+    let status = run(&wt, &["status", "--porcelain=v2"]);
+    assert!(status.starts_with("u "), "expected an unmerged record: {status}");
+    std::fs::write(wt.join("a.txt"), "resolved 1\n").unwrap();
+    let first = git::fingerprint(&wt).unwrap();
+    std::fs::write(wt.join("a.txt"), "resolved 22\n").unwrap();
+    assert_ne!(first, git::fingerprint(&wt).unwrap());
+}
+
+#[test]
+fn fingerprint_changes_when_untracked_file_is_edited_again() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("new.txt"), "draft 1\n").unwrap();
+    let first = git::fingerprint(&repo.main).unwrap();
+    std::fs::write(repo.main.join("new.txt"), "draft 22\n").unwrap();
+    assert_ne!(first, git::fingerprint(&repo.main).unwrap());
+}
+
+#[test]
+fn fingerprint_sees_a_same_size_edit_through_mtime() {
+    let repo = Repo::new();
+    let file = repo.main.join("a.txt");
+    std::fs::write(&file, "aaaa\n").unwrap();
+    set_mtime(&file, 1_000_000_000);
+    let first = git::fingerprint(&repo.main).unwrap();
+    std::fs::write(&file, "bbbb\n").unwrap();
+    set_mtime(&file, 1_000_000_001);
+    assert_ne!(first, git::fingerprint(&repo.main).unwrap());
+}
+
+#[test]
+fn merge_base_treats_a_flag_like_base_as_a_name() {
+    let repo = Repo::new();
+    assert!(git::merge_base(&repo.main, "--octopus").is_err());
+}
+
+#[test]
+fn list_worktrees_skips_prunable() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::remove_dir_all(&wt).unwrap();
+    let wts = git::list_worktrees(&repo.main).unwrap();
+    let branches: Vec<_> = wts.iter().map(|w| w.branch.clone().unwrap()).collect();
+    assert_eq!(branches, vec!["develop"]);
+}
+
+#[test]
+fn list_worktrees_skips_bare() {
+    let repo = Repo::new();
+    let parent = repo.main.parent().unwrap();
+    run(parent, &["clone", "-q", "--bare", "main", "bare.git"]);
+    let bare = parent.join("bare.git");
+    let wt = parent.join("linked");
+    run(&bare, &["worktree", "add", "-q", "-b", "linked", wt.to_str().unwrap()]);
+    let wts = git::list_worktrees(&bare).unwrap();
+    let branches: Vec<_> = wts.iter().map(|w| w.branch.clone()).collect();
+    assert_eq!(branches, vec![Some("linked".to_string())]);
+}
+
+#[test]
+fn discover_keeps_other_failures_distinct_from_not_a_repo() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join(".git"), "garbage\n").unwrap();
+    assert!(matches!(git::discover(dir.path()), Err(GitError::Failed(_))), "{:?}", git::discover(dir.path()));
+}

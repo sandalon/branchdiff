@@ -78,7 +78,7 @@ where
     S: AsRef<OsStr>,
 {
     if !cwd.is_dir() {
-        return Err(GitError::Failed(format!("{} no longer exists", cwd.display())));
+        return Err(cwd_gone(cwd));
     }
     let mut cmd = Command::new("git");
     for var in REPO_ENV_VARS {
@@ -101,6 +101,8 @@ where
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| match e.kind() {
+            // Spawning also fails with NotFound if `cwd` vanished after the check above.
+            std::io::ErrorKind::NotFound if !cwd.is_dir() => cwd_gone(cwd),
             std::io::ErrorKind::NotFound => GitError::GitMissing,
             _ => GitError::Failed(e.to_string()),
         })?;
@@ -111,18 +113,31 @@ where
     })
 }
 
+fn cwd_gone(cwd: &Path) -> GitError {
+    GitError::Failed(format!("{} no longer exists", cwd.display()))
+}
+
+fn failed(out: Output) -> GitError {
+    if out.stderr.is_empty() {
+        GitError::Failed("git failed without an error message".to_string())
+    } else {
+        GitError::Failed(out.stderr)
+    }
+}
+
 fn ok_stdout(out: Output) -> Result<String, GitError> {
     if out.code == Some(0) {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(GitError::Failed(out.stderr))
+        Err(failed(out))
     }
 }
 
 pub fn discover(cwd: &Path) -> Result<RepoInfo, GitError> {
     let out = run(cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"])?;
     if out.code != Some(0) {
-        return Err(GitError::NotARepo);
+        // Other failures, such as "detected dubious ownership", need their own text.
+        return Err(if out.stderr.contains("not a git repository") { GitError::NotARepo } else { failed(out) });
     }
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut lines = text.lines();
@@ -145,10 +160,12 @@ fn parse_worktrees(text: &str) -> Vec<Worktree> {
             out.extend(cur.take());
         } else if let Some(p) = field.strip_prefix("worktree ") {
             cur = Some(Worktree { path: p.into(), head: String::new(), branch: None });
+        } else if matches!(field.split(' ').next(), Some("bare" | "prunable")) {
+            cur = None; // Neither can be reviewed.
         } else if let (Some(w), Some(h)) = (cur.as_mut(), field.strip_prefix("HEAD ")) {
             w.head = h.to_string();
         } else if let (Some(w), Some(b)) = (cur.as_mut(), field.strip_prefix("branch ")) {
-            w.branch = Some(b.trim_start_matches("refs/heads/").to_string());
+            w.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
         }
     }
     out.extend(cur);
@@ -156,7 +173,7 @@ fn parse_worktrees(text: &str) -> Vec<Worktree> {
 }
 
 pub fn merge_base(cwd: &Path, base: &str) -> Result<String, GitError> {
-    let out = run(cwd, ["merge-base", base, "HEAD"])?;
+    let out = run(cwd, ["merge-base", "--end-of-options", base, "HEAD"])?;
     let unresolved = out.stderr.rsplit_once("Not a valid object name ").map(|(_, name)| name);
     match (out.code, unresolved) {
         (Some(0), _) => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
@@ -172,16 +189,18 @@ pub fn merge_base(cwd: &Path, base: &str) -> Result<String, GitError> {
                 Err(GitError::NoCommits)
             }
         }
-        _ => Err(GitError::Failed(out.stderr)),
+        _ => Err(failed(out)),
     }
 }
 
 /// Hashes `git status` plus the mtime and size of every dirty path. Status
 /// alone is not enough: it does not change when a dirty file is edited again.
+/// `cwd` must be the worktree root, since status paths are root-relative.
+/// HEAD is not covered, so the caller combines this with HEAD.
 pub fn fingerprint(cwd: &Path) -> Result<u64, GitError> {
     let out = run(cwd, ["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
     if out.code != Some(0) {
-        return Err(GitError::Failed(out.stderr));
+        return Err(failed(out));
     }
     let mut h = DefaultHasher::new();
     out.stdout.hash(&mut h);
@@ -214,6 +233,7 @@ fn dirty_paths(status: &[u8]) -> Vec<String> {
     out
 }
 
+/// `cwd` must be the worktree root, since git lists only paths below it.
 pub fn untracked(cwd: &Path) -> Result<Vec<String>, GitError> {
     let text = ok_stdout(run(cwd, ["ls-files", "-z", "--others", "--exclude-standard"])?)?;
     Ok(text.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
@@ -232,7 +252,7 @@ pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
         "-O/dev/null",
         "--end-of-options", merge_base, "--",
     ])?;
-    if out.code == Some(0) { Ok(out.stdout) } else { Err(GitError::Failed(out.stderr)) }
+    if out.code == Some(0) { Ok(out.stdout) } else { Err(failed(out)) }
 }
 
 pub fn branches(cwd: &Path) -> Result<Vec<String>, GitError> {
@@ -252,5 +272,28 @@ pub fn in_progress_op(cwd: &Path) -> Option<&'static str> {
         Some("merge")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_worktrees_strips_the_ref_prefix_only_once() {
+        let wts = parse_worktrees("worktree /a\0HEAD abc\0branch refs/heads/refs/heads/x\0\0");
+        assert_eq!(wts[0].branch.as_deref(), Some("refs/heads/x"));
+    }
+
+    #[test]
+    fn failed_never_gives_a_blank_message() {
+        let out = Output { code: Some(1), stdout: Vec::new(), stderr: String::new() };
+        assert!(!failed(out).to_string().is_empty());
+    }
+
+    #[test]
+    fn failed_keeps_git_stderr() {
+        let out = Output { code: Some(1), stdout: Vec::new(), stderr: "fatal: boom".to_string() };
+        assert_eq!(failed(out), GitError::Failed("fatal: boom".to_string()));
     }
 }
