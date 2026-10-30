@@ -5,8 +5,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, UnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 /// The name of every worker thread. A panic hook can use it to tell a worker's
@@ -19,7 +18,7 @@ const PANIC_NO_MESSAGE: &str = "internal error in a background job";
 #[derive(Debug)]
 pub enum Job {
     ListWorktrees { cwd: PathBuf },
-    Load { path: PathBuf, base: String, generation: u64 },
+    Load { path: PathBuf, base: String },
     ListBranches { cwd: PathBuf },
     Highlight { key: CacheKey, file_index: usize, diffs: Diffs },
 }
@@ -34,30 +33,27 @@ pub struct Loaded {
 #[derive(Debug)]
 pub enum Msg {
     Worktrees(Result<Vec<Worktree>, GitError>),
-    Loaded { path: PathBuf, generation: u64, result: Result<Loaded, GitError> },
+    Loaded { path: PathBuf, result: Result<Loaded, GitError> },
     Branches(Result<Vec<String>, GitError>),
     Highlighted { key: CacheKey, file_index: usize, lines: crate::highlight::HighlightedFile },
     Stale(PathBuf),
     WorktreesChanged,
 }
 
-/// Tracks the newest request per worktree so older results can be dropped.
-#[derive(Default)]
-pub struct Generations {
-    counter: AtomicU64,
-    latest: Mutex<HashMap<PathBuf, u64>>,
+struct Running {
+    base: String,
+    waiting_base: Option<String>,
 }
 
-impl Generations {
-    pub fn next(&self, path: &Path) -> u64 {
-        let g = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-        self.latest.lock().unwrap().insert(path.to_path_buf(), g);
-        g
-    }
-
-    pub fn is_current(&self, path: &Path, generation: u64) -> bool {
-        self.latest.lock().unwrap().get(path) == Some(&generation)
-    }
+/// What to do about a load that has just finished.
+#[derive(Debug, Default)]
+pub struct Finished {
+    /// The waiting job, which now counts as running. Submit it.
+    pub next: Option<Job>,
+    /// The result is for a base the user has left, so drop it. Otherwise a late
+    /// `BaseMissing` would reopen the picker. A result for the same base is
+    /// valid and newer than what's on screen, so it's shown until `next` lands.
+    pub superseded: bool,
 }
 
 /// Allows one running load per worktree, because a load can take seconds and
@@ -65,31 +61,36 @@ impl Generations {
 /// a load replaces any waiting one, so the newest always runs next.
 #[derive(Default)]
 pub struct Loads {
-    running: HashMap<PathBuf, Option<Job>>,
+    running: HashMap<PathBuf, Running>,
 }
 
 impl Loads {
     /// Answers the job to submit now, if the worktree has no load running.
-    pub fn request(&mut self, gens: &Generations, path: PathBuf, base: String) -> Option<Job> {
-        let generation = gens.next(&path);
-        let job = Job::Load { path: path.clone(), base, generation };
+    pub fn request(&mut self, path: PathBuf, base: String) -> Option<Job> {
         match self.running.get_mut(&path) {
-            Some(waiting) => {
-                *waiting = Some(job);
+            Some(running) => {
+                running.waiting_base = Some(base);
                 None
             }
             None => {
-                self.running.insert(path, None);
-                Some(job)
+                self.running.insert(path.clone(), Running { base: base.clone(), waiting_base: None });
+                Some(Job::Load { path, base })
             }
         }
     }
 
-    /// Call for every finished load, stale or not. Answers the job to submit next.
-    pub fn finished(&mut self, path: &Path) -> Option<Job> {
-        let job = self.running.remove(path).flatten()?;
-        self.running.insert(path.to_path_buf(), None);
-        Some(job)
+    /// Call for every finished load.
+    pub fn finished(&mut self, path: &Path) -> Finished {
+        let Some(running) = self.running.get_mut(path) else {
+            return Finished::default();
+        };
+        let Some(base) = running.waiting_base.take() else {
+            self.running.remove(path);
+            return Finished::default();
+        };
+        let superseded = base != running.base;
+        running.base = base.clone();
+        Finished { next: Some(Job::Load { path: path.to_path_buf(), base }), superseded }
     }
 }
 
@@ -133,13 +134,13 @@ fn run(job: Job) -> Msg {
             tests::panic_if_marked(&cwd);
             git::branches(&cwd)
         })),
-        Job::Load { path, base, generation } => {
+        Job::Load { path, base } => {
             let result = guarded(|| {
                 #[cfg(test)]
                 tests::panic_if_marked(&path);
                 load(&path, &base)
             });
-            Msg::Loaded { path, generation, result }
+            Msg::Loaded { path, result }
         }
         Job::Highlight { key, file_index, diffs } => {
             // An empty result still has to be sent: `main` tracks highlights in
@@ -207,27 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn newest_job_wins_when_superseded() {
-        let gens = Generations::default();
-        let first = gens.next("wt".as_ref());
-        let second = gens.next("wt".as_ref());
-        assert!(!gens.is_current("wt".as_ref(), first));
-        assert!(gens.is_current("wt".as_ref(), second));
-    }
-
-    #[test]
-    fn generations_are_per_worktree() {
-        let gens = Generations::default();
-        let a = gens.next("a".as_ref());
-        gens.next("b".as_ref());
-        assert!(gens.is_current("a".as_ref(), a));
-    }
-
-    #[test]
     fn pool_runs_submitted_jobs_and_reports_errors_as_messages() {
         let (tx, rx) = unbounded();
         let pool = Pool::new(2, tx);
-        pool.submit(Job::Load { path: "/definitely/not/a/repo".into(), base: "develop".into(), generation: 1 });
+        pool.submit(Job::Load { path: "/definitely/not/a/repo".into(), base: "develop".into() });
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Msg::Loaded { result: Err(_), .. } => {}
             other => panic!("unexpected {other:?}"),
@@ -243,37 +227,92 @@ mod tests {
         assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Msg::Highlighted { .. }));
     }
 
+    fn base_of(job: Option<Job>) -> String {
+        match job {
+            Some(Job::Load { base, .. }) => base,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     #[test]
     fn only_one_load_runs_per_worktree() {
-        let (gens, mut loads) = (Generations::default(), Loads::default());
-        assert!(loads.request(&gens, "a".into(), "develop".into()).is_some());
-        assert!(loads.request(&gens, "a".into(), "develop".into()).is_none());
-        assert!(loads.request(&gens, "b".into(), "develop".into()).is_some());
+        let mut loads = Loads::default();
+        assert!(loads.request("a".into(), "develop".into()).is_some());
+        assert!(loads.request("a".into(), "develop".into()).is_none());
+        assert!(loads.request("b".into(), "develop".into()).is_some());
     }
 
     #[test]
     fn the_newest_waiting_request_runs_after_the_current_load() {
-        let (gens, mut loads) = (Generations::default(), Loads::default());
-        loads.request(&gens, "a".into(), "develop".into());
-        loads.request(&gens, "a".into(), "develop".into());
-        loads.request(&gens, "a".into(), "main".into());
-        match loads.finished("a".as_ref()) {
-            Some(Job::Load { base, generation, .. }) => {
-                assert_eq!(base, "main");
-                assert!(gens.is_current("a".as_ref(), generation));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.request("a".into(), "develop".into());
+        loads.request("a".into(), "main".into());
+        assert_eq!(base_of(loads.finished("a".as_ref()).next), "main");
         // The waiting job is now running, so another request waits for it.
-        assert!(loads.request(&gens, "a".into(), "develop".into()).is_none());
+        assert!(loads.request("a".into(), "develop".into()).is_none());
+    }
+
+    #[test]
+    fn a_waiting_request_for_the_same_base_keeps_the_finished_result() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.request("a".into(), "develop".into());
+        let done = loads.finished("a".as_ref());
+        assert!(!done.superseded);
+        assert_eq!(base_of(done.next), "develop");
+    }
+
+    #[test]
+    fn a_waiting_request_for_another_base_supersedes_the_finished_result() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.request("a".into(), "main".into());
+        let done = loads.finished("a".as_ref());
+        assert!(done.superseded);
+        assert_eq!(base_of(done.next), "main");
+    }
+
+    #[test]
+    fn a_base_changed_and_changed_back_keeps_the_finished_result() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.request("a".into(), "main".into());
+        loads.request("a".into(), "develop".into());
+        let done = loads.finished("a".as_ref());
+        assert!(!done.superseded);
+        assert_eq!(base_of(done.next), "develop");
+    }
+
+    #[test]
+    fn a_promoted_job_is_compared_using_its_own_base() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.request("a".into(), "main".into());
+        assert!(loads.finished("a".as_ref()).superseded);
+
+        // `main` is running now, so `develop` is the change here.
+        loads.request("a".into(), "develop".into());
+        assert!(loads.finished("a".as_ref()).superseded);
+        loads.request("a".into(), "develop".into());
+        assert!(!loads.finished("a".as_ref()).superseded);
     }
 
     #[test]
     fn a_finished_load_with_nothing_waiting_frees_the_worktree() {
-        let (gens, mut loads) = (Generations::default(), Loads::default());
-        loads.request(&gens, "a".into(), "develop".into());
-        assert!(loads.finished("a".as_ref()).is_none());
-        assert!(loads.request(&gens, "a".into(), "develop".into()).is_some());
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        let done = loads.finished("a".as_ref());
+        assert!(done.next.is_none());
+        assert!(!done.superseded);
+        assert!(loads.request("a".into(), "develop".into()).is_some());
+    }
+
+    #[test]
+    fn finishing_an_unknown_worktree_does_nothing() {
+        let done = Loads::default().finished("a".as_ref());
+        assert!(done.next.is_none());
+        assert!(!done.superseded);
     }
 
     #[test]
@@ -331,11 +370,10 @@ mod tests {
             Msg::Branches(result) => panicked_on_worker(result),
             other => panic!("unexpected {other:?}"),
         }
-        pool.submit(Job::Load { path: PANIC_PATH.into(), base: "develop".into(), generation: 9 });
+        pool.submit(Job::Load { path: PANIC_PATH.into(), base: "develop".into() });
         match next() {
-            Msg::Loaded { path, generation, result } => {
+            Msg::Loaded { path, result } => {
                 assert_eq!(path, Path::new(PANIC_PATH));
-                assert_eq!(generation, 9);
                 panicked_on_worker(result);
             }
             other => panic!("unexpected {other:?}"),
@@ -348,9 +386,9 @@ mod tests {
         }
 
         // This pool has one thread, so an answer proves it outlived the panics.
-        pool.submit(Job::Load { path: "/definitely/not/a/repo".into(), base: "develop".into(), generation: 10 });
+        pool.submit(Job::Load { path: "/definitely/not/a/repo".into(), base: "develop".into() });
         match next() {
-            Msg::Loaded { generation: 10, result: Err(e), .. } => assert!(!e.to_string().contains("panic")),
+            Msg::Loaded { result: Err(e), .. } => assert!(!e.to_string().contains("panic")),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -359,17 +397,17 @@ mod tests {
     fn a_panicking_load_frees_its_worktree() {
         let (tx, rx) = unbounded();
         let pool = Pool::new(1, tx);
-        let (gens, mut loads) = (Generations::default(), Loads::default());
+        let mut loads = Loads::default();
         let path = PathBuf::from(PANIC_PATH);
-        pool.submit(loads.request(&gens, path.clone(), "develop".into()).unwrap());
-        assert!(loads.request(&gens, path.clone(), "develop".into()).is_none());
+        pool.submit(loads.request(path.clone(), "develop".into()).unwrap());
+        assert!(loads.request(path.clone(), "develop".into()).is_none());
 
         for _ in 0..2 {
             let Msg::Loaded { path, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() else { panic!("not a load") };
-            if let Some(job) = loads.finished(&path) {
+            if let Some(job) = loads.finished(&path).next {
                 pool.submit(job);
             }
         }
-        assert!(loads.request(&gens, path, "develop".into()).is_some());
+        assert!(loads.request(path, "develop".into()).is_some());
     }
 }
