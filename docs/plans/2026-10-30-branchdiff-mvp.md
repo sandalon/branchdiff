@@ -1740,6 +1740,15 @@ mod tests {
     }
 
     #[test]
+    fn a_later_worktree_list_clears_a_failed_one() {
+        let mut a = App::new("develop".into());
+        a.handle_msg(Msg::Worktrees(Err(crate::git::GitError::Failed("boom".into()))));
+        assert!(a.fatal.is_some());
+        a.handle_msg(Msg::Worktrees(Ok(vec![wt("a")])));
+        assert!(a.fatal.is_none());
+    }
+
+    #[test]
     fn q_quits() {
         let mut a = app(&["a"]);
         press(&mut a, 'q');
@@ -1946,7 +1955,10 @@ impl App {
 
     pub fn handle_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
-            Msg::Worktrees(Ok(list)) => self.apply_worktrees(list),
+            Msg::Worktrees(Ok(list)) => {
+                self.fatal = None;
+                self.apply_worktrees(list)
+            }
             Msg::Worktrees(Err(e)) => {
                 self.fatal = Some(e);
                 Vec::new()
@@ -2026,7 +2038,7 @@ Note: `Effect::Load` carries no generation. `main` calls `Generations::next` whe
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib app`
-Expected: 12 passed.
+Expected: 13 passed.
 
 **Step 5: Commit**
 
@@ -2389,7 +2401,7 @@ Then add `Hash` to the derives on `LineKind`, `Line` and `Hunk` in `src/diff.rs`
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib app`
-Expected: 25 passed.
+Expected: 26 passed.
 
 **Step 5: Commit**
 
@@ -2913,6 +2925,13 @@ fn error_is_shown_on_the_affected_worktree() {
 }
 
 #[test]
+fn a_failed_worktree_list_is_shown() {
+    let mut a = App::new("develop".into());
+    a.handle_msg(Msg::Worktrees(Err(GitError::Failed("boom".into()))));
+    assert!(render(&mut a).contains("Could not list worktrees: boom"));
+}
+
+#[test]
 fn stale_badge_is_visible() {
     let mut a = app();
     a.handle_msg(Msg::Stale("/r/feat-auth".into()));
@@ -3164,7 +3183,9 @@ fn mark(line: TextLine<'_>, selected: bool) -> TextLine<'_> {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mut text = format!(" base: {}", app.base);
-    if let Some(n) = &app.notice {
+    if let Some(e) = &app.fatal {
+        text = format!(" Could not list worktrees: {e}");
+    } else if let Some(n) = &app.notice {
         text = format!(" {n}");
     } else if let (Some(w), Some(s)) = (app.selected_worktree(), app.current()) {
         let count = s.diffs.as_ref().map_or(0, |d| d.len());
@@ -3253,7 +3274,7 @@ Check each screen by eye against the layout in the design doc, then accept.
 **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --test ui_snapshots`
-Expected: 10 passed.
+Expected: 11 passed.
 
 **Step 7: Commit**
 
