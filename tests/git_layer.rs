@@ -123,3 +123,25 @@ fn fingerprint_changes_when_renamed_file_is_edited_again() {
     std::fs::write(repo.main.join("b.txt"), "edit 22\n").unwrap();
     assert_ne!(first, git::fingerprint(&repo.main).unwrap());
 }
+
+#[test]
+fn merge_base_prefers_no_commits_when_base_is_another_branch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    run(dir.path(), &["init", "-q", "-b", "main"]);
+    assert_eq!(git::merge_base(dir.path(), "develop"), Err(GitError::NoCommits));
+}
+
+#[test]
+fn merge_base_prefers_no_commits_when_base_is_the_unborn_branch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    run(dir.path(), &["init", "-q", "-b", "main"]);
+    assert_eq!(git::merge_base(dir.path(), "main"), Err(GitError::NoCommits));
+}
+
+#[test]
+fn merge_base_prefers_no_commits_on_orphan_worktree_with_missing_base() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    run(&wt, &["checkout", "-q", "--orphan", "lonely"]);
+    assert_eq!(git::merge_base(&wt, "nope"), Err(GitError::NoCommits));
+}

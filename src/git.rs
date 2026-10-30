@@ -131,7 +131,15 @@ pub fn merge_base(cwd: &Path, base: &str) -> Result<String, GitError> {
         (Some(1), _) => Err(GitError::NoMergeBase),
         // Checked first so that a base of "HEAD" on an unborn branch lands here.
         (Some(128), Some("HEAD")) => Err(GitError::NoCommits),
-        (Some(128), Some(name)) if name == base => Err(GitError::BaseMissing(base.to_string())),
+        // Git stops at `base`, so stderr says nothing about an unborn HEAD here.
+        (Some(128), Some(name)) if name == base => {
+            let head = run(cwd, ["rev-parse", "-q", "--verify", "HEAD"])?;
+            if head.code == Some(0) {
+                Err(GitError::BaseMissing(base.to_string()))
+            } else {
+                Err(GitError::NoCommits)
+            }
+        }
         _ => Err(GitError::Failed(out.stderr)),
     }
 }
