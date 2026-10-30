@@ -2182,9 +2182,11 @@ Add these methods:
         let Some(s) = self.current() else { return 0 };
         let Some(diffs) = s.diffs.as_ref() else { return 0 };
         s.review.comments.iter().filter(|c| {
+            // Filter rather than find: a typechange gives two entries with one path.
             let current = diffs.iter()
-                .find(|f| f.path == c.path)
-                .and_then(|f| f.hunks.iter().flat_map(|h| &h.lines).find(|l| l.new_no.or(l.old_no) == Some(c.line)))
+                .filter(|f| f.path == c.path)
+                .flat_map(|f| f.hunks.iter().flat_map(|h| &h.lines))
+                .find(|l| l.new_no.or(l.old_no) == Some(c.line))
                 .map(|l| l.text.as_str());
             c.is_outdated(current)
         }).count()
@@ -3031,7 +3033,39 @@ fn draw_input(f: &mut Frame, app: &App) {
 }
 ```
 
-**Step 4: Review and accept snapshots**
+**Step 4: Handle tabs, carriage returns and content-free files**
+
+ratatui drops control characters, so a tab-indented line would lose its indentation, and a trailing `\r` would throw off width calculations. `Line.text` stays faithful to the file, because comments and reviewed marks compare against it, so convert only when drawing. Add to `src/ui.rs`:
+
+```rust
+use std::borrow::Cow;
+
+const TAB: &str = "    ";
+
+/// Text as drawn: tabs become spaces and carriage returns are removed.
+fn display_text(s: &str) -> Cow<'_, str> {
+    if s.contains(['\t', '\r']) {
+        Cow::Owned(s.replace('\t', TAB).replace('\r', ""))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+```
+
+Use it for every piece of diff text in `unified_rows` and `split_rows`, including highlighted spans, for example `Span::raw(display_text(&line.text))`, and pass the result to `pad` in `split_rows`. Do not change `Line.text`.
+
+In `draw_diff`, next to the binary check, show a message for files with no hunks, such as mode-only changes and empty files, so they don't look like a failed load:
+
+```rust
+    if file.hunks.is_empty() {
+        f.render_widget(Paragraph::new("No content changes").block(block("Diff", focused)), area);
+        return;
+    }
+```
+
+Add these tests to `tests/ui_snapshots.rs`: a tab-indented line renders with four spaces, a CRLF line renders with no stray characters and keeps its neighbours aligned in side-by-side view, and a file with no hunks shows `No content changes`.
+
+**Step 5: Review and accept snapshots**
 
 Run: `cargo test --test ui_snapshots`
 Expected: snapshot tests report new snapshots; non-snapshot tests pass.
@@ -3039,12 +3073,12 @@ Expected: snapshot tests report new snapshots; non-snapshot tests pass.
 Run: `cargo install cargo-insta && cargo insta review`
 Check each screen by eye against the layout in the design doc, then accept.
 
-**Step 5: Run tests to verify they pass**
+**Step 6: Run tests to verify they pass**
 
 Run: `cargo test --test ui_snapshots`
-Expected: 7 passed.
+Expected: 10 passed.
 
-**Step 6: Commit**
+**Step 7: Commit**
 
 ```bash
 git add src/ui.rs tests/ui_snapshots.rs tests/snapshots
