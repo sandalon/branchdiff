@@ -2093,7 +2093,7 @@ Add to the `tests` module in `src/app.rs`:
         let fx = type_comment(&mut a, "fix this");
         let c = &a.current().unwrap().review.comments[0];
         assert_eq!((c.line, c.line_text.as_str(), c.body.as_str()), (1, "let x = 1;", "fix this"));
-        assert!(matches!(fx.as_slice(), [Effect::SaveReview]));
+        assert!(matches!(fx.as_slice(), [Effect::SaveReview { .. }]));
     }
 
     #[test]
@@ -2139,6 +2139,36 @@ Add to the `tests` module in `src/app.rs`:
         assert!(a.is_reviewed(0));
         deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
         assert!(!a.is_reviewed(0));
+    }
+
+    #[test]
+    fn one_x_marks_a_file_whose_old_mark_went_stale() {
+        let mut a = app_on_line();
+        press(&mut a, 'x');
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
+        assert!(!a.is_reviewed(0));
+        press(&mut a, 'x');
+        assert!(a.is_reviewed(0));
+    }
+
+    #[test]
+    fn a_save_records_the_review_it_was_made_for() {
+        let mut a = app(&["a", "b"]);
+        deliver(&mut a, "a", vec![file_with_line("x")]);
+        let fx = press(&mut a, 'x');
+        press(&mut a, ']');
+        assert!(matches!(&fx[0], Effect::SaveReview { id: ReviewId::Branch(b), review }
+            if b == "a" && review.reviewed.len() == 1));
+    }
+
+    #[test]
+    fn only_the_last_save_per_review_is_kept() {
+        let save = |name: &str, marks: usize| Effect::SaveReview {
+            id: ReviewId::Branch(name.into()),
+            review: Review { comments: vec![], reviewed: (0..marks).map(|i| (i.to_string(), 0)).collect() },
+        };
+        let kept = coalesce_saves(vec![save("a", 1), save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
+        assert_eq!(kept, vec![save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
     }
 
     #[test]
@@ -2225,7 +2255,7 @@ Extend `Effect`:
 pub enum Effect {
     Load { path: PathBuf, base: String },
     ReloadWorktrees,
-    SaveReview,
+    SaveReview { id: ReviewId, review: Review },
     CopyExport(String),
     WriteExport(String),
     OpenEditor { path: PathBuf, line: u32 },
@@ -2305,7 +2335,7 @@ Add these methods:
                         if let Some(s) = self.current_mut() {
                             s.review.comments.push(Comment { path, line, side, line_text, body: text });
                             s.outdated = count_outdated(s);
-                            return vec![Effect::SaveReview];
+                            return self.save_effect();
                         }
                     }
                 }
@@ -2315,15 +2345,27 @@ Add these methods:
         Vec::new()
     }
 
+    /// Built when the edit happens, because later keys in the same batch can
+    /// change the selection before `main` performs this.
+    fn save_effect(&self) -> Vec<Effect> {
+        match (self.selected_worktree(), self.current()) {
+            (Some(w), Some(s)) => vec![Effect::SaveReview { id: ReviewId::of(w), review: s.review.clone() }],
+            _ => Vec::new(),
+        }
+    }
+
     fn toggle_reviewed(&mut self) -> Vec<Effect> {
         let Some((path, hash)) = self.current_file().map(|f| (f.path.clone(), content_hash(f))) else {
             return Vec::new();
         };
         let Some(s) = self.current_mut() else { return Vec::new() };
-        if s.review.reviewed.remove(&path).is_none() {
+        // Compare hashes: a mark left over from older content shows as unreviewed.
+        if s.review.reviewed.get(&path) == Some(&hash) {
+            s.review.reviewed.remove(&path);
+        } else {
             s.review.reviewed.insert(path, hash);
         }
-        vec![Effect::SaveReview]
+        self.save_effect()
     }
 
     pub fn is_reviewed(&self, index: usize) -> bool {
@@ -2363,19 +2405,37 @@ Add `pub outdated: usize` to `WorktreeState`, and `s.outdated = count_outdated(s
 Add these free functions and imports:
 
 ```rust
-use crate::store::{Comment, Side};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use crate::store::{fnv1a, Comment, ReviewId, Side};
+use std::collections::HashSet;
 
 /// Identifies a file's content cheaply, since this runs for visible files on
 /// every frame. Files with no `content_id`, such as mode-only changes, pure
 /// renames and dirty submodules, fall back to hashing hunks.
+///
+/// Saved in reviews, so it uses `fnv1a`, which is stable across Rust releases.
 fn content_hash(file: &crate::diff::FileDiff) -> u64 {
-    let mut h = DefaultHasher::new();
-    match &file.content_id {
-        Some(id) => id.hash(&mut h),
-        None => file.hunks.hash(&mut h),
+    if let Some(id) = &file.content_id {
+        return fnv1a(id.as_bytes());
     }
-    h.finish()
+    let mut bytes = Vec::new();
+    for line in file.hunks.iter().flat_map(|h| &h.lines) {
+        bytes.push(line.kind as u8);
+        bytes.extend_from_slice(line.text.as_bytes());
+        bytes.push(b'\n');
+    }
+    fnv1a(&bytes)
+}
+
+/// Keeps the last save per review, since each one costs an fsync and holding
+/// `x` would otherwise queue saves faster than they finish.
+pub fn coalesce_saves(effects: Vec<Effect>) -> Vec<Effect> {
+    let mut seen = HashSet::new();
+    let mut kept: Vec<Effect> = effects.into_iter().rev().filter(|e| match e {
+        Effect::SaveReview { id, .. } => seen.insert(id.clone()),
+        _ => true,
+    }).collect();
+    kept.reverse();
+    kept
 }
 
 /// Counts comments whose line text is no longer at that line in the diff.
@@ -2396,17 +2456,16 @@ fn count_outdated(s: &WorktreeState) -> usize {
 }
 ```
 
-Then add `Hash` to the derives on `LineKind`, `Line` and `Hunk` in `src/diff.rs`.
 
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib app`
-Expected: 26 passed.
+Expected: 29 passed.
 
 **Step 5: Commit**
 
 ```bash
-git add src/app.rs src/diff.rs
+git add src/app.rs
 git commit -m "feat: add comments, reviewed marks, export and editor actions"
 ```
 
@@ -2593,7 +2652,7 @@ Replace `handle_input_key`:
                 if let Some(s) = self.current_mut() {
                     s.review.comments.push(Comment { path, line, side, line_text, body: text });
                     s.outdated = count_outdated(s);
-                    return vec![Effect::SaveReview];
+                    return self.save_effect();
                 }
             }
             Some(Input::Worktree { query }) => {
@@ -3694,7 +3753,7 @@ This is thin glue. `App` is already tested, so verification here is by running t
 ```rust
 use anyhow::{bail, Context, Result};
 use arboard::Clipboard;
-use branchdiff::app::{App, Effect};
+use branchdiff::app::{coalesce_saves, App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
@@ -3821,7 +3880,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
             return Ok(());
         }
         let effects = next_effects(&mut app, &mut rt, &key_rx, &msg_rx)?;
-        for effect in effects {
+        for effect in coalesce_saves(effects) {
             perform(effect, &mut app, &mut rt, terminal)?;
         }
         if let Some(effect) = app.highlight_effect() {
@@ -3873,12 +3932,12 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
             // A branch switch keeps the path but changes the review, and saving
             // the old one would overwrite the new branch's comments.
             let reload: Vec<bool> = list.iter()
-                .map(|w| !app.worktrees.iter().any(|o| o.path == w.path && review_id(o) == review_id(w)))
+                .map(|w| !app.worktrees.iter().any(|o| o.path == w.path && ReviewId::of(o) == ReviewId::of(w)))
                 .collect();
             let effects = app.handle_msg(Msg::Worktrees(Ok(list)));
             for (i, needed) in reload.into_iter().enumerate() {
                 if needed {
-                    let id = review_id(&app.worktrees[i]);
+                    let id = ReviewId::of(&app.worktrees[i]);
                     let loaded = rt.store.load(&id);
                     if let Some(path) = loaded.moved_aside {
                         app.notice = Some(format!("Review could not be read, kept at {}", path.display()));
@@ -3899,13 +3958,6 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
     }
 }
 
-fn review_id(w: &git::Worktree) -> ReviewId {
-    match &w.branch {
-        Some(b) => ReviewId::Branch(b.clone()),
-        None => ReviewId::Commit(w.head.clone()),
-    }
-}
-
 fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut DefaultTerminal) -> Result<()> {
     match effect {
         Effect::Load { path, base } => {
@@ -3922,11 +3974,9 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
                 rt.pool.submit(Job::Highlight { key, file_index, diffs });
             }
         }
-        Effect::SaveReview => {
-            if let (Some(w), Some(s)) = (app.selected_worktree(), app.current()) {
-                if let Err(e) = rt.store.save(&review_id(w), &s.review) {
-                    app.notice = Some(format!("Could not save review: {e}"));
-                }
+        Effect::SaveReview { id, review } => {
+            if let Err(e) = rt.store.save(&id, &review) {
+                app.notice = Some(format!("Could not save review: {e}"));
             }
         }
         Effect::CopyExport(md) => {
@@ -4252,7 +4302,7 @@ The Linux build depends on the system libc. `arboard` is built with `wayland-dat
 
 **Step 3: Write `README.md`**
 
-Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from the design doc, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, and that two `branchdiff` sessions reviewing the same branch overwrite each other's comments when they save.
+Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from the design doc, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save.
 
 **Step 4: Verify the final state**
 
