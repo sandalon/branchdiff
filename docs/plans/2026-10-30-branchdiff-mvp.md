@@ -6,7 +6,7 @@
 
 **Architecture:** A single Rust binary. The UI thread draws only from in-memory state in `App`. A worker pool runs the `git` CLI and returns tagged results over channels, and a watcher thread marks worktrees stale. `App::handle_key` and `App::handle_msg` are pure state transitions that return `Effect`s, so all behaviour is testable without a terminal.
 
-**Tech Stack:** Rust 2021 (toolchain 1.94), ratatui 0.30 (use its `ratatui::crossterm` re-export; do not add crossterm directly), notify 8, syntect 5.3, nucleo-matcher 0.3, arboard 3, clap 4, serde, crossbeam-channel, insta, criterion.
+**Tech Stack:** Rust 2021 (minimum 1.88), ratatui 0.30 (use its `ratatui::crossterm` re-export; do not add crossterm directly), notify 8, syntect 5.3, nucleo-matcher 0.3, arboard 3, clap 4, serde, crossbeam-channel, insta, criterion.
 
 **Working directory:** `.worktrees/mvp`, branch `feature/mvp`. Commit messages end with:
 
@@ -67,7 +67,7 @@ benches/render.rs     Criterion bench
 ## Task 1: Project skeleton
 
 **Files:**
-- Create: `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `README.md`
+- Create: `Cargo.toml`, `src/lib.rs`, `src/main.rs`
 - Modify: `.gitignore`
 
 **Step 1: Write `Cargo.toml`**
@@ -77,12 +77,21 @@ benches/render.rs     Criterion bench
 name = "branchdiff"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
+resolver = "3"
 description = "Fast terminal UI for reviewing git worktrees against a base branch"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "branchdiff"
+path = "src/main.rs"
+bench = false
 
 [dependencies]
 anyhow = "1"
-arboard = "3"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 ignore = "0.4"
@@ -91,7 +100,7 @@ nucleo-matcher = "0.3"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 toml = "1"
 unicode-width = "0.2"
 
@@ -144,6 +153,8 @@ The file should contain:
 ```
 .worktrees/
 target/
+*.snap.new
+*.pending-snap
 ```
 
 **Step 4: Verify it builds**
@@ -2507,7 +2518,26 @@ mod tests {
 Run: `cargo test --lib highlight`
 Expected: FAIL to compile, `hunks` field not found.
 
-**Step 3: Implement**
+**Step 3: Add the extra syntaxes**
+
+syntect's bundled set has no TypeScript, TSX or TOML. Add this to `[dependencies]`:
+
+```toml
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+```
+
+Add a test to the module above:
+
+```rust
+    #[test]
+    fn colours_typescript_tsx_and_toml() {
+        for (path, text) in [("a.ts", "const x: number = 1;"), ("a.tsx", "const a = <div>hi</div>;"), ("a.toml", "a = \"b\"")] {
+            assert!(highlight_file(&file(path, text)).hunks[0][0].len() > 1, "{path}");
+        }
+    }
+```
+
+**Step 4: Implement**
 
 ```rust
 use crate::diff::FileDiff;
@@ -2532,7 +2562,7 @@ fn assets() -> &'static (SyntaxSet, Theme) {
     ASSETS.get_or_init(|| {
         let mut themes = ThemeSet::load_defaults();
         let theme = themes.themes.remove("base16-ocean.dark").expect("bundled theme");
-        (SyntaxSet::load_defaults_newlines(), theme)
+        (two_face::syntax::extra_newlines(), theme)
     })
 }
 
@@ -2592,15 +2622,15 @@ Handle the message, ignoring results for a superseded diff:
 
 In the `Ok(l)` arm of `Msg::Loaded`, also call `s.highlights.clear()`. `main` calls `highlight_effect` after every event, and de-duplicates with a `HashSet` of in-flight `(CacheKey, file_index)` pairs. The full key is needed because clean worktrees share a fingerprint.
 
-**Step 4: Run tests to verify they pass**
+**Step 5: Run tests to verify they pass**
 
 Run: `cargo test --lib`
 Expected: all pass.
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
-git add src/highlight.rs src/app.rs
+git add Cargo.toml Cargo.lock src/highlight.rs src/app.rs
 git commit -m "feat: highlight diffs on worker threads"
 ```
 
@@ -3260,15 +3290,13 @@ fn watcher_reports_stale_worktree_and_new_worktrees() {
 }
 ```
 
-Add `crossbeam-channel = "0.5"` to `[dev-dependencies]`.
-
 Run: `cargo test --test git_layer watcher`
 Expected: 1 passed. If it fails on macOS because the temp path is a symlink, canonicalize roots in `main` and in `owning_worktree` callers. Real paths from `git worktree list` are already canonical, so the fix belongs in the test.
 
 **Step 6: Commit**
 
 ```bash
-git add src/watch.rs tests/git_layer.rs Cargo.toml Cargo.lock
+git add src/watch.rs tests/git_layer.rs
 git commit -m "feat: watch worktrees and the worktree list for changes"
 ```
 
@@ -3445,6 +3473,8 @@ struct Runtime {
     gens: Generations,
     store: Store,
     common_dir: PathBuf,
+    /// Kept alive because on Linux this process hosts the copied text.
+    clipboard: Option<Clipboard>,
     paused: Arc<AtomicBool>,
     repo: PathBuf,
     watch: Option<Sender<watch::Command>>,
@@ -3481,6 +3511,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
         gens: Generations::default(),
         store: Store::new(&info.common_dir),
         common_dir: info.common_dir.clone(),
+        clipboard: Clipboard::new().ok(),
         paused,
         repo: info.toplevel.clone(),
         watch: watch::spawn(info.common_dir.clone(), msg_tx).ok(),
@@ -3578,10 +3609,11 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
             }
         }
         Effect::CopyExport(md) => {
-            let copied = Clipboard::new().and_then(|mut c| c.set_text(md.clone()));
-            app.notice = Some(match copied {
-                Ok(()) => "Copied review comments".to_string(),
-                Err(_) => format!("Clipboard unavailable. {}", write_export(rt, &md)),
+            let copied = rt.clipboard.as_mut().is_some_and(|c| c.set_text(md.clone()).is_ok());
+            app.notice = Some(if copied {
+                "Copied review comments".to_string()
+            } else {
+                format!("Clipboard unavailable. {}", write_export(rt, &md))
             });
         }
         Effect::WriteExport(md) => app.notice = Some(write_export(rt, &md)),
@@ -3829,6 +3861,14 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo test --release --test perf -- --ignored
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
 ```
 
 **Step 2: Write `.github/workflows/release.yml`**
@@ -3858,7 +3898,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Rename binary
         shell: bash
         run: cp "target/${{ matrix.target }}/release/branchdiff${{ matrix.ext }}" "branchdiff-${{ matrix.target }}${{ matrix.ext }}"
@@ -3867,7 +3907,7 @@ jobs:
           files: branchdiff-${{ matrix.target }}${{ matrix.ext }}
 ```
 
-The Linux build depends on the system libc, and `arboard` uses X11 and Wayland at runtime only. If a runner is missing headers, add an `apt-get install` step for `libxcb1-dev`.
+The Linux build depends on the system libc. `arboard` is built with `wayland-data-control`, so it supports both X11 and Wayland. If a runner is missing headers, add an `apt-get install` step for `libxcb1-dev`.
 
 **Step 3: Write `README.md`**
 
