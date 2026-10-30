@@ -34,7 +34,7 @@ Run `branchdiff` from anywhere inside a repo. It discovers worktrees with `git w
 The core rule is that **the UI thread never waits on git.**
 
 - **UI loop:** handles input and draws from in-memory state only. Every keypress gets an immediate response, even while data is loading.
-- **Git workers:** a background thread pool runs git and sends results to the UI over channels. Results are tagged with their request, so late results for a worktree you have left are dropped.
+- **Git workers:** a background thread pool runs git and sends results to the UI over channels. Each worktree has at most one load running. A request made during a load runs next, and the finished result is still shown unless the base branch changed in the meantime.
 - **File watcher:** watches each worktree, debounces bursts of edits, and marks the worktree as stale. It also watches `.git/worktrees`, so worktrees created or removed during a session update the list.
 
 ### Git access
@@ -94,7 +94,7 @@ Loading a worktree:
 1. Run `git merge-base <base> HEAD` in the worktree to find the fork point.
 2. Run `git diff <merge-base>` to get the summary and per-file diffs. This covers committed and uncommitted changes.
 3. Run `git ls-files --others --exclude-standard` to find untracked files, and show them as new files.
-4. Store the results in the cache and send them to the UI, tagged with the originating request.
+4. Send the results to the UI, which keeps them in memory with the key that identifies their inputs.
 
 The default diff is measured from the fork point, not the base branch tip, so changes merged to the base after forking do not appear in the review.
 

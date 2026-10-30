@@ -4,7 +4,7 @@
 
 **Goal:** Build the first release of `branchdiff`, a fast cross-platform TUI for reviewing git worktrees against a base branch, as specified in `docs/plans/2026-10-30-branchdiff-design.md`.
 
-**Architecture:** A single Rust binary. The UI thread draws only from in-memory state in `App`. A worker pool runs the `git` CLI and returns tagged results over channels, and a watcher thread marks worktrees stale. `App::handle_key` and `App::handle_msg` are pure state transitions that return `Effect`s, so all behaviour is testable without a terminal.
+**Architecture:** A single Rust binary. The UI thread draws only from in-memory state in `App`. A worker pool runs the `git` CLI and returns results over channels, and a watcher thread marks worktrees stale. `App::handle_key` and `App::handle_msg` are pure state transitions that return `Effect`s, so all behaviour is testable without a terminal.
 
 **Tech Stack:** Rust 2021 (minimum 1.88), ratatui 0.30 (use its `ratatui::crossterm` re-export; do not add crossterm directly), notify 8, syntect 5.3, two-face 0.5, nucleo-matcher 0.3, arboard 3, clap 4, serde, crossbeam-channel, insta, criterion.
 
@@ -2500,6 +2500,14 @@ Add to the tests in `src/app.rs`:
     }
 
     #[test]
+    fn a_missing_older_base_does_not_reopen_the_picker() {
+        let mut a = app(&["a"]);
+        a.base = "main".into();
+        let fx = a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::BaseMissing("develop".into())) });
+        assert!(fx.is_empty());
+    }
+
+    #[test]
     fn one_worktree_failing_leaves_the_others_usable() {
         let mut a = app(&["a", "b"]);
         a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::NoMergeBase) });
@@ -2643,7 +2651,8 @@ In `handle_msg`, replace the `Msg::Branches` handling and the `Err` arm of `Msg:
 
 ```rust
                         Err(e) => {
-                            let missing = matches!(e, GitError::BaseMissing(_));
+                            // A result for an older base can arrive after the base has changed.
+                            let missing = matches!(&e, GitError::BaseMissing(b) if *b == self.base);
                             s.error = Some(e);
                             if missing && self.input.is_none() {
                                 return vec![Effect::ListBranches];
@@ -2847,7 +2856,7 @@ Handle the message, ignoring results for a superseded diff:
             }
 ```
 
-In the `Ok(l)` arm of `Msg::Loaded`, also call `s.highlights.clear()`. `main` calls `highlight_effect` after every event, and de-duplicates with a `HashSet` of in-flight `(CacheKey, file_index)` pairs. The full key is needed because clean worktrees share a fingerprint.
+In the `Ok(l)` arm of `Msg::Loaded`, before `s.key` is assigned, add `if s.key.as_ref() != Some(&l.key) { s.highlights.clear(); }`. An equal key means the same diff, so a refresh with no changes keeps its colours. Add a test that reloading with an unchanged key keeps `highlights` and a changed key clears them. `main` calls `highlight_effect` after every event, and de-duplicates with a `HashSet` of in-flight `(CacheKey, file_index)` pairs. The full key is needed because clean worktrees share a fingerprint.
 
 **Step 5: Run tests to verify they pass**
 
