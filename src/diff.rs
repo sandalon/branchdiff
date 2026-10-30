@@ -56,32 +56,42 @@ pub fn parse(input: &[u8]) -> Vec<FileDiff> {
     for raw in input.split(|b| *b == b'\n') {
         let line = String::from_utf8_lossy(raw);
         // Inside a hunk the counts decide, so body lines that look like
-        // headers are never misread.
+        // headers are never misread. Every body line starts with one of these
+        // bytes, so anything else means the counts were wrong: the hunk is
+        // over and the line falls through to the header handling.
         if old_left > 0 || new_left > 0 {
-            let Some(file) = cur.as_mut() else { continue };
-            let Some(hunk) = file.hunks.last_mut() else { continue };
-            let (kind, text) = match line.as_bytes().first() {
-                Some(b'+') => (LineKind::Added, &line[1..]),
-                Some(b'-') => (LineKind::Removed, &line[1..]),
-                Some(b' ') => (LineKind::Context, &line[1..]),
+            let body = match line.as_bytes().first() {
+                Some(b'+') => Some((LineKind::Added, &line[1..])),
+                Some(b'-') => Some((LineKind::Removed, &line[1..])),
+                Some(b' ') => Some((LineKind::Context, &line[1..])),
                 Some(b'\\') => continue,
-                None => (LineKind::Context, ""),
-                _ => continue,
+                _ => None,
             };
-            let (o, n) = match kind {
-                LineKind::Added => (None, Some(new_no)),
-                LineKind::Removed => (Some(old_no), None),
-                LineKind::Context => (Some(old_no), Some(new_no)),
-            };
-            if o.is_some() { old_no += 1; old_left -= 1; }
-            if n.is_some() { new_no += 1; new_left -= 1; }
-            match kind {
-                LineKind::Added => file.added += 1,
-                LineKind::Removed => file.removed += 1,
-                LineKind::Context => {}
+            if let Some((kind, text)) = body {
+                let Some(file) = cur.as_mut() else { continue };
+                let Some(hunk) = file.hunks.last_mut() else { continue };
+                let (o, n) = match kind {
+                    LineKind::Added => (None, Some(new_no)),
+                    LineKind::Removed => (Some(old_no), None),
+                    LineKind::Context => (Some(old_no), Some(new_no)),
+                };
+                if o.is_some() {
+                    old_no = old_no.saturating_add(1);
+                    old_left = old_left.saturating_sub(1);
+                }
+                if n.is_some() {
+                    new_no = new_no.saturating_add(1);
+                    new_left = new_left.saturating_sub(1);
+                }
+                match kind {
+                    LineKind::Added => file.added = file.added.saturating_add(1),
+                    LineKind::Removed => file.removed = file.removed.saturating_add(1),
+                    LineKind::Context => {}
+                }
+                hunk.lines.push(Line { kind, old_no: o, new_no: n, text: text.to_string() });
+                continue;
             }
-            hunk.lines.push(Line { kind, old_no: o, new_no: n, text: text.to_string() });
-            continue;
+            (old_left, new_left) = (0, 0);
         }
 
         if line.starts_with("diff --git ") {
@@ -307,5 +317,83 @@ mod tests {
     #[test]
     fn empty_input_yields_no_files() {
         assert!(parse(b"").is_empty());
+    }
+
+    const NEXT_FILE: &str = "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-x\n+y\n";
+
+    fn assert_next_file_survives(hunk: &str, kept_lines: usize) {
+        let p = format!("diff --git a/a b/a\n--- a/a\n+++ b/a\n{hunk}{NEXT_FILE}");
+        let files = parse(p.as_bytes());
+        assert_eq!(files.len(), 2, "{hunk:?}");
+        assert_eq!(files[0].path, "a", "{hunk:?}");
+        assert_eq!(files[0].hunks[0].lines.len(), kept_lines, "{hunk:?}");
+        assert_eq!((files[1].path.as_str(), files[1].added, files[1].removed), ("b", 1, 1), "{hunk:?}");
+    }
+
+    #[test]
+    fn hunk_body_shorter_than_its_counts_does_not_panic() {
+        let f = &parse(b"diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,1 @@\n+a\n")[0];
+        assert_eq!(f.added, 1);
+        assert_eq!(f.hunks[0].lines.len(), 1);
+    }
+
+    #[test]
+    fn hunk_body_longer_than_its_counts_does_not_panic() {
+        assert_next_file_survives("@@ -1 +1 @@\n-a\n+b\n+c\n-d\n e\n", 2);
+    }
+
+    #[test]
+    fn line_side_exceeding_its_count_does_not_panic() {
+        assert_next_file_survives("@@ -1,3 +1,1 @@\n+a\n+b\n c\n", 3);
+    }
+
+    #[test]
+    fn diff_header_ends_a_miscounted_hunk() {
+        assert_next_file_survives("@@ -1,9 +1,9 @@\n one\n", 1);
+    }
+
+    #[test]
+    fn hunk_starting_at_the_largest_line_number_does_not_panic() {
+        let p = format!("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -{0},2 +{0},2 @@\n a\n b\n", u32::MAX);
+        assert_eq!(parse(p.as_bytes())[0].hunks[0].lines.len(), 2);
+    }
+
+    fn realistic_patch() -> Vec<u8> {
+        let mut p = "diff --git a/src/é中🦀.rs b/src/é中🦀.rs\nindex 814f4a4..475bbc3 100644\n--- a/src/é中🦀.rs\n+++ b/src/é中🦀.rs\n@@ -1,3 +1,3 @@ fn é() {\n é\n-中\n+🦀\n \n\\ No newline at end of file\n".as_bytes().to_vec();
+        p.extend(b"diff --git a/ol\xc3\xa9 x.txt b/n\xc3\xa9w x.txt\nsimilarity index 80%\nrename from ol\xc3\xa9 x.txt\nrename to n\xc3\xa9w x.txt\n--- a/ol\xc3\xa9 x.txt\t\n+++ b/n\xc3\xa9w x.txt\t\n@@ -1 +1 @@\n-a\xff\n+b\r\n");
+        p.extend(b"diff --git \"a/q\\\" \\303\\251\\t.txt\" \"b/q\\\" \\303\\251\\t.txt\"\nnew file mode 100644\nindex 0000000..e69de29\n");
+        p.extend("diff --git a/é.bin b/é.bin\nBinary files a/é.bin and b/é.bin differ\n".as_bytes());
+        p.extend("diff --git a/é b/é\ndeleted file mode 100644\n--- a/é\n+++ /dev/null\n@@ -1 +0,0 @@\n-é\n".as_bytes());
+        p
+    }
+
+    #[test]
+    fn realistic_patch_parses_in_full() {
+        let files = parse(&realistic_patch());
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["src/é中🦀.rs", "néw x.txt", "q\" é\t.txt", "é.bin", "é"]);
+    }
+
+    #[test]
+    fn truncating_a_patch_at_any_byte_does_not_panic() {
+        let p = realistic_patch();
+        for cut in 0..=p.len() {
+            parse(&p[..cut]);
+            parse(&p[cut..]);
+        }
+    }
+
+    // Truncation alone never puts a non-ASCII byte first on a line, which is
+    // the case the `&line[1..]` slices rely on.
+    #[test]
+    fn corrupting_any_byte_of_a_patch_does_not_panic() {
+        let p = realistic_patch();
+        for i in 0..p.len() {
+            for b in [0x00, 0x80, 0xc3, 0xff, b'\n', b'"', b'\\', b' ', b'+', b'-', b'@', b'9'] {
+                let mut bad = p.clone();
+                bad[i] = b;
+                parse(&bad);
+            }
+        }
     }
 }
