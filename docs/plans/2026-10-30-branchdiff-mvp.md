@@ -18,6 +18,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 **Status of this plan's code:** Git commands and output formats were probed against git 2.46, and the dependency set and the ratatui, notify and syntect calls were compiled. The rest of the code here has not been compiled. Treat it as the intended design and fix small API mismatches as you go, keeping the tests' intent.
 
+**Completed tasks:** the code on this branch supersedes this document for Tasks 1 to 3. Reviews changed `git.rs` and `diff.rs` after these sections were written.
+
 ---
 
 ## Facts verified against real git
@@ -933,6 +935,17 @@ fn flags_untracked_binary_files() {
 }
 
 #[test]
+fn untracked_files_get_a_content_id_that_follows_their_bytes() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("n.dat"), [0u8, 1, 2]).unwrap();
+    let first = loaded(&wt)[0].content_id.clone();
+    assert!(first.is_some());
+    std::fs::write(wt.join("n.dat"), [0u8, 1, 3]).unwrap();
+    assert_ne!(first, loaded(&wt)[0].content_id);
+}
+
+#[test]
 fn ignores_user_diff_config_that_changes_output() {
     let repo = Repo::new();
     let wt = repo.add_worktree("feat");
@@ -1222,7 +1235,7 @@ pub fn highlight_file(_file: &FileDiff) -> HighlightedFile {
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib worker`
-Expected: 3 passed.
+Expected: 4 passed.
 
 **Step 5: Commit**
 
@@ -1514,7 +1527,7 @@ pub fn render(branch: &str, base: &str, comments: &[Comment]) -> String {
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib export`
-Expected: 3 passed.
+Expected: 4 passed.
 
 **Step 5: Commit**
 
@@ -1647,7 +1660,8 @@ mod tests {
     fn r_requests_a_reload_of_the_selected_worktree() {
         let mut a = app(&["a"]);
         let fx = press(&mut a, 'r');
-        assert!(matches!(fx.as_slice(), [Effect::Load { .. }]));
+        assert!(fx.contains(&Effect::ReloadWorktrees));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Load { .. })));
     }
 
     #[test]
@@ -1809,10 +1823,9 @@ impl App {
 
     fn reload_selected(&mut self) -> Vec<Effect> {
         let base = self.base.clone();
-        self.selected_worktree()
-            .map(|w| Effect::Load { path: w.path.clone(), base })
-            .into_iter()
-            .collect()
+        let Some(path) = self.selected_worktree().map(|w| w.path.clone()) else { return Vec::new() };
+        // The list too, since a branch switch inside a worktree changes its row.
+        vec![Effect::ReloadWorktrees, Effect::Load { path, base }]
     }
 
     fn step_worktree(&mut self, delta: isize) {
@@ -2267,8 +2280,8 @@ use crate::store::{Comment, Side};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Identifies a file's content cheaply, since this runs for visible files on
-/// every frame. Files with no `content_id` are mode-only or pure renames, and
-/// only those fall back to hashing hunks.
+/// every frame. Files with no `content_id`, such as mode-only changes, pure
+/// renames and dirty submodules, fall back to hashing hunks.
 fn content_hash(file: &crate::diff::FileDiff) -> u64 {
     let mut h = DefaultHasher::new();
     match &file.content_id {
@@ -2301,7 +2314,7 @@ Then add `Hash` to the derives on `LineKind`, `Line` and `Hunk` in `src/diff.rs`
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib app`
-Expected: 23 passed.
+Expected: 25 passed.
 
 **Step 5: Commit**
 
@@ -2582,7 +2595,7 @@ mod tests {
         let mut big = file("a.rs", "fn main() {}");
         let line = big.hunks[0].lines[0].clone();
         big.hunks[0].lines = vec![line; MAX_FILE_LINES + 1];
-        assert_eq!(highlight_file(&big).hunks[0][0].len(), 1);
+        assert!(highlight_file(&big).hunks.is_empty());
     }
 
     #[test]
@@ -2655,10 +2668,14 @@ fn assets() -> &'static (SyntaxSet, Theme) {
 }
 
 pub fn highlight_file(file: &FileDiff) -> HighlightedFile {
+    // Empty, not plain copies: the UI falls back to raw text, and copying every
+    // line of a huge file would cost more than it saves.
+    if file.hunks.iter().map(|h| h.lines.len()).sum::<usize>() > MAX_FILE_LINES {
+        return HighlightedFile::default();
+    }
     let (syntaxes, theme) = assets();
     let ext = file.path.rsplit('.').next().unwrap_or("");
-    let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
-    let syntax = if lines > MAX_FILE_LINES { None } else { syntaxes.find_syntax_by_extension(ext) };
+    let syntax = syntaxes.find_syntax_by_extension(ext);
     let hunks = file.hunks.iter().map(|hunk| {
         let mut state = syntax.map(|s| HighlightLines::new(s, theme));
         hunk.lines.iter().map(|line| {
@@ -3690,12 +3707,17 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
             if let Some(tx) = &rt.watch {
                 let _ = tx.send(watch::Command::SetWorktrees(list.iter().map(|w| w.path.clone()).collect()));
             }
-            let is_new: Vec<bool> = list.iter().map(|w| !app.worktrees.iter().any(|o| o.path == w.path)).collect();
+            // A branch switch keeps the path but changes the review, and saving
+            // the old one would overwrite the new branch's comments.
+            let reload: Vec<bool> = list.iter()
+                .map(|w| !app.worktrees.iter().any(|o| o.path == w.path && review_id(o) == review_id(w)))
+                .collect();
             let effects = app.handle_msg(Msg::Worktrees(Ok(list)));
-            for (i, new) in is_new.into_iter().enumerate() {
-                if new {
+            for (i, needed) in reload.into_iter().enumerate() {
+                if needed {
                     let id = review_id(&app.worktrees[i]);
-                    app.states[i].review = rt.store.load(&id);
+                    let review = rt.store.load(&id);
+                    app.set_review(i, review);
                 }
             }
             effects
@@ -3779,6 +3801,17 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
 }
 ```
 
+Add this method to `App` in `src/app.rs`, with a test that replacing a review recounts `outdated`:
+
+```rust
+    pub fn set_review(&mut self, index: usize, review: Review) {
+        if let Some(s) = self.states.get_mut(index) {
+            s.review = review;
+            s.outdated = count_outdated(s);
+        }
+    }
+```
+
 Two behaviours to preserve while wiring this up:
 
 1. `Msg::Stale` must not trigger a reload, or the diff would move under the cursor. The worktree keeps showing its old data until `r`.
@@ -3842,7 +3875,7 @@ const BUDGET: Duration = Duration::from_millis(16);
 
 fn big_diff() -> Vec<FileDiff> {
     (0..FILES).map(|f| FileDiff {
-        path: format!("src/module_{f}.rs"), old_path: None, status: Status::Modified, binary: false, content_id: None,
+        path: format!("src/module_{f}.rs"), old_path: None, status: Status::Modified, binary: false, content_id: Some(format!("{f}")),
         added: LINES as u32, removed: 0,
         hunks: vec![Hunk {
             header: format!("@@ -0,0 +1,{LINES} @@"),
@@ -3908,7 +3941,7 @@ fn keypress_to_redraw_is_within_budget() {
 **Step 2: Run them**
 
 Run: `cargo test --release --test perf -- --ignored`
-Expected: 2 passed. If `switching_to_a_cached_worktree_is_within_budget` fails, the likely cause is `draw_files` building 5,000 `ListItem`s each frame. Build only the visible window, as `unified_rows` does, then rerun. Do the same for `is_reviewed`, which hashes each file's hunks.
+Expected: 2 passed. If `switching_to_a_cached_worktree_is_within_budget` fails, the likely cause is `draw_files` building 5,000 `ListItem`s each frame. Build only the visible window, as `unified_rows` does, then rerun.
 
 **Step 3: Add a startup check**
 
@@ -3938,7 +3971,7 @@ use branchdiff::diff;
 use criterion::{criterion_group, criterion_main, Criterion};
 
 fn parse_large_patch(c: &mut Criterion) {
-    const LINES: usize = 400;
+    const LINES: usize = 300;
     let mut patch = String::new();
     for f in 0..5_000 {
         patch.push_str(&format!("diff --git a/f{f} b/f{f}\n--- a/f{f}\n+++ b/f{f}\n@@ -1,{LINES} +1,{LINES} @@\n"));
@@ -3954,7 +3987,7 @@ criterion_main!(benches);
 ```
 
 Run: `cargo bench`
-Expected: completes and reports a time for `parse about 100 MB`, which was about 0.2 s when measured in review.
+Expected: completes and reports a time for `parse about 100 MB`, which was about 0.1 s for a shape this size when measured in review.
 
 **Step 5: Commit**
 
@@ -4054,7 +4087,7 @@ Run: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
 Expected: no warnings, all tests pass.
 
 Run: `cargo test --release --test perf -- --ignored`
-Expected: 3 passed.
+Expected: 4 passed.
 
 **Step 5: Commit**
 
