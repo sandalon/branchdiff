@@ -547,3 +547,30 @@ fn oversized_untracked_files_are_not_read_but_still_change_their_content_id() {
     file.set_len(diff::MAX_UNTRACKED_BYTES + 2).unwrap();
     assert_ne!(first.content_id, loaded(&wt)[0].content_id);
 }
+
+#[test]
+fn over_cap_content_id_follows_mtime_alone() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    let file = std::fs::File::create(wt.join("big.log")).unwrap();
+    file.set_len(diff::MAX_UNTRACKED_BYTES + 1).unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(1_000)).unwrap();
+    let first = loaded(&wt)[0].content_id.clone();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(2_000)).unwrap();
+    assert_ne!(first, loaded(&wt)[0].content_id);
+}
+
+#[test]
+fn untracked_hunk_headers_match_git() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("one.txt"), "only\n").unwrap();
+    std::fs::write(wt.join("two.txt"), "x\ny\n").unwrap();
+    let headers = |files: Vec<diff::FileDiff>| -> Vec<String> {
+        files.iter().map(|f| f.hunks[0].header.clone()).collect()
+    };
+    let untracked = headers(loaded(&wt));
+    assert_eq!(untracked, vec!["@@ -0,0 +1 @@", "@@ -0,0 +1,2 @@"]);
+    run(&wt, &["add", "-N", "."]);
+    assert_eq!(untracked, headers(loaded(&wt)));
+}

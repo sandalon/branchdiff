@@ -29,6 +29,9 @@ syntect = { version = "5.3", default-features = false, features = ["parsing", "d
 toml = "1"
 unicode-width = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = "0.8"
 insta = "1"

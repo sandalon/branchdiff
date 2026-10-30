@@ -233,7 +233,9 @@ fn unquote(s: &str) -> String {
 
 use crate::git::{self, GitError};
 use std::collections::hash_map::DefaultHasher;
+use std::fs::{File, Metadata};
 use std::hash::{Hash, Hasher};
+use std::io::{self, Read};
 use std::path::Path;
 
 /// Untracked files above this size are listed but not read, and show as binary.
@@ -257,20 +259,22 @@ fn untracked_file(cwd: &Path, path: String) -> FileDiff {
     f.status = Status::Untracked;
     let full = cwd.join(&path);
     let mut hasher = DefaultHasher::new();
-    // Only regular files are opened: a symlink shows its target, as it does in
-    // a patch, and following one to a FIFO or `/dev/zero` would hang the worker.
-    // Other paths, such as a nested repository's `nest/`, have no content.
+    // A symlink shows its target, as it does in a patch. Everything else goes
+    // through one handle, and only a regular file is read. Other paths, such as
+    // a nested repository's `nest/`, have no content.
     let bytes = match std::fs::symlink_metadata(&full) {
         Ok(m) if m.is_symlink() => {
             std::fs::read_link(&full).map(|t| t.into_os_string().into_encoded_bytes()).unwrap_or_default()
         }
-        Ok(m) if m.is_file() && m.len() > MAX_UNTRACKED_BYTES => {
-            (m.len(), m.modified().ok()).hash(&mut hasher);
-            f.binary = true;
-            Vec::new()
-        }
-        Ok(m) if m.is_file() => std::fs::read(&full).unwrap_or_default(),
-        _ => Vec::new(),
+        _ => match read_regular(&full) {
+            Ok(Regular::Bytes(bytes)) => bytes,
+            Ok(Regular::OverCap(m)) => {
+                (m.len(), m.modified().ok()).hash(&mut hasher);
+                f.binary = true;
+                Vec::new()
+            }
+            Err(_) => Vec::new(),
+        },
     };
     bytes.hash(&mut hasher);
     f.content_id = Some(format!("{:x}", hasher.finish()));
@@ -287,16 +291,107 @@ fn untracked_file(cwd: &Path, path: String) -> FileDiff {
         }).collect();
         f.added = lines.len() as u32;
         if !lines.is_empty() {
-            f.hunks.push(Hunk { header: format!("@@ -0,0 +1,{} @@", lines.len()), lines });
+            // Like git, which leaves out a count of 1.
+            let header = if lines.len() == 1 { "@@ -0,0 +1 @@".to_string() } else { format!("@@ -0,0 +1,{} @@", lines.len()) };
+            f.hunks.push(Hunk { header, lines });
         }
     }
     f.path = path;
     f
 }
 
+#[derive(Debug)]
+enum Regular {
+    /// The content of a file within the cap, or nothing for any other kind of path.
+    Bytes(Vec<u8>),
+    /// Too big to keep, with metadata to identify this version of the file by.
+    OverCap(Metadata),
+}
+
+fn read_regular(path: &Path) -> io::Result<Regular> {
+    let file = open_untracked(path)?;
+    let meta = file.metadata()?;
+    read_handle(file, meta)
+}
+
+/// `meta` comes from `file` itself, not from the path, which can change at any time.
+fn read_handle(mut file: File, meta: Metadata) -> io::Result<Regular> {
+    if !meta.is_file() {
+        return Ok(Regular::Bytes(Vec::new()));
+    }
+    if meta.len() > MAX_UNTRACKED_BYTES {
+        return Ok(Regular::OverCap(meta));
+    }
+    // Bounded because the file can grow after `meta` was taken. What was read of
+    // a file that did is thrown away, so its ID never depends on where it stopped.
+    let mut bytes = Vec::new();
+    file.by_ref().take(MAX_UNTRACKED_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_UNTRACKED_BYTES {
+        return Ok(Regular::OverCap(file.metadata().unwrap_or(meta)));
+    }
+    Ok(Regular::Bytes(bytes))
+}
+
+/// The path may have been replaced since it was listed, so opening must neither
+/// wait for a FIFO's writer, which would hang the worker, nor follow a symlink.
+#[cfg(unix)]
+fn open_untracked(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    File::options().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path)
+}
+
+#[cfg(not(unix))]
+fn open_untracked(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo").arg(path).status().unwrap();
+        assert!(status.success());
+    }
+
+    /// On a thread so that a regression fails here instead of hanging the run.
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_does_not_wait_for_a_fifo_writer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("pipe");
+        mkfifo(&fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_regular(&fifo));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("blocked on a FIFO");
+        assert!(matches!(result, Ok(Regular::Bytes(b)) if b.is_empty()));
+    }
+
+    /// The path is checked for a symlink before this runs, but one can be
+    /// swapped in afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_refuses_a_symlink_swapped_in_after_the_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("secret"), "x\n").unwrap();
+        std::os::unix::fs::symlink("secret", dir.path().join("link")).unwrap();
+        assert!(read_regular(&dir.path().join("link")).is_err());
+    }
+
+    #[test]
+    fn a_file_that_grows_past_the_cap_after_its_size_is_taken_counts_as_over_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "x\n").unwrap();
+        let file = File::open(&path).unwrap();
+        let stale = file.metadata().unwrap();
+        File::options().write(true).open(&path).unwrap().set_len(MAX_UNTRACKED_BYTES + 1).unwrap();
+        let result = read_handle(file, stale).unwrap();
+        assert!(matches!(result, Regular::OverCap(m) if m.len() == MAX_UNTRACKED_BYTES + 1));
+    }
 
     const MODIFY: &str = "diff --git a/a.txt b/a.txt\nindex 814f4a4..475bbc3 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+three\n";
 
