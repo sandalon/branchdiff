@@ -1651,10 +1651,10 @@ mod tests {
         a.handle_key(KeyEvent::from(KeyCode::Char(c)))
     }
 
-    fn deliver(a: &mut App, name: &str, generation: u64, files: Vec<FileDiff>) {
+    fn deliver(a: &mut App, name: &str, files: Vec<FileDiff>) {
         let path: std::path::PathBuf = format!("/r/{name}").into();
         let key = CacheKey { worktree: path.clone(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
-        a.handle_msg(Msg::Loaded { path, generation, result: Ok(Loaded { key, diffs: Arc::new(files), op: None }) });
+        a.handle_msg(Msg::Loaded { path, result: Ok(Loaded { key, diffs: Arc::new(files), op: None }) });
     }
 
     #[test]
@@ -1696,7 +1696,7 @@ mod tests {
     #[test]
     fn each_worktree_remembers_its_position() {
         let mut a = app(&["a", "b"]);
-        deliver(&mut a, "a", 0, vec![file("1"), file("2"), file("3")]);
+        deliver(&mut a, "a", vec![file("1"), file("2"), file("3")]);
         press(&mut a, 'n');
         press(&mut a, 'n');
         press(&mut a, ']');
@@ -1724,7 +1724,7 @@ mod tests {
     #[test]
     fn stale_message_badges_but_does_not_replace_the_diff() {
         let mut a = app(&["a"]);
-        deliver(&mut a, "a", 0, vec![file("1")]);
+        deliver(&mut a, "a", vec![file("1")]);
         let fx = a.handle_msg(Msg::Stale("/r/a".into()));
         assert!(a.current().unwrap().stale);
         assert_eq!(a.current().unwrap().diffs.as_ref().unwrap().len(), 1);
@@ -1963,7 +1963,7 @@ impl App {
                 self.fatal = Some(e);
                 Vec::new()
             }
-            Msg::Loaded { path, result, .. } => {
+            Msg::Loaded { path, result } => {
                 if let Some(i) = self.index_of(&path) {
                     let s = &mut self.states[i];
                     match result {
@@ -2033,7 +2033,7 @@ impl App {
 }
 ```
 
-Note: `Effect::Load` carries no generation. `main` calls `Generations::next` when it runs the effect, and drops stale `Msg::Loaded` before calling `handle_msg`. The tests pass `generation: 0` directly to `handle_msg`, so `App` itself must not check generations.
+Note: `main` drops a result whose base the user has since changed, using `Loads::finished`, before it calls `handle_msg`, so `App` applies every `Msg::Loaded` it receives.
 
 **Step 4: Run tests to verify they pass**
 
@@ -2073,7 +2073,7 @@ Add to the `tests` module in `src/app.rs`:
 
     fn app_on_line() -> App {
         let mut a = app(&["a"]);
-        deliver(&mut a, "a", 0, vec![file_with_line("let x = 1;")]);
+        deliver(&mut a, "a", vec![file_with_line("let x = 1;")]);
         a.focus = Focus::Diff;
         press(&mut a, 'j'); // Row 0 is the hunk header, so row 1 is the line.
         a
@@ -2126,7 +2126,7 @@ Add to the `tests` module in `src/app.rs`:
     #[test]
     fn comment_on_a_hunk_header_is_refused() {
         let mut a = app(&["a"]);
-        deliver(&mut a, "a", 0, vec![file_with_line("x")]);
+        deliver(&mut a, "a", vec![file_with_line("x")]);
         a.focus = Focus::Diff;
         press(&mut a, 'c');
         assert!(a.input.is_none());
@@ -2137,7 +2137,7 @@ Add to the `tests` module in `src/app.rs`:
         let mut a = app_on_line();
         press(&mut a, 'x');
         assert!(a.is_reviewed(0));
-        deliver(&mut a, "a", 0, vec![file_with_line("let x = 2;")]);
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
         assert!(!a.is_reviewed(0));
     }
 
@@ -2154,7 +2154,7 @@ Add to the `tests` module in `src/app.rs`:
         let mut a = app_on_line();
         type_comment(&mut a, "fix");
         assert_eq!(a.outdated_comments(), 0);
-        deliver(&mut a, "a", 0, vec![file_with_line("let x = 2;")]);
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
         assert_eq!(a.outdated_comments(), 1);
     }
 
@@ -2166,7 +2166,7 @@ Add to the `tests` module in `src/app.rs`:
             Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: "TWO".into() },
         ];
         let mut a = app(&["a"]);
-        deliver(&mut a, "a", 0, vec![replaced]);
+        deliver(&mut a, "a", vec![replaced]);
         a.focus = Focus::Diff;
         press(&mut a, 'j');
         press(&mut a, 'j');
@@ -2182,10 +2182,10 @@ Add to the `tests` module in `src/app.rs`:
             content_id: Some(id.into()), added: 0, removed: 0, hunks: vec![],
         };
         let mut a = app(&["a"]);
-        deliver(&mut a, "a", 0, vec![binary("1..2")]);
+        deliver(&mut a, "a", vec![binary("1..2")]);
         press(&mut a, 'x');
         assert!(a.is_reviewed(0));
-        deliver(&mut a, "a", 0, vec![binary("1..3")]);
+        deliver(&mut a, "a", vec![binary("1..3")]);
         assert!(!a.is_reviewed(0));
     }
 
@@ -2470,18 +2470,40 @@ Add to the tests in `src/app.rs`:
     }
 
     #[test]
+    fn a_base_change_reloads_the_selected_worktree_first() {
+        let mut a = app(&["a", "b", "c"]);
+        press(&mut a, '3');
+        press(&mut a, 'b');
+        a.handle_msg(Msg::Branches(Ok(vec!["develop".into(), "main".into()])));
+        for c in "main".chars() {
+            press(&mut a, c);
+        }
+        let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&fx[0], Effect::Load { path, .. } if path.ends_with("c")));
+    }
+
+    #[test]
+    fn a_late_branch_list_keeps_an_open_comment() {
+        let mut a = app_on_line();
+        press(&mut a, 'c');
+        press(&mut a, 'x');
+        a.handle_msg(Msg::Branches(Ok(vec!["develop".into()])));
+        assert!(matches!(a.input, Some(Input::Comment { .. })));
+    }
+
+    #[test]
     fn missing_base_opens_the_base_picker() {
         let mut a = app(&["a"]);
         let path: std::path::PathBuf = "/r/a".into();
-        let fx = a.handle_msg(Msg::Loaded { path, generation: 0, result: Err(crate::git::GitError::BaseMissing("develop".into())) });
+        let fx = a.handle_msg(Msg::Loaded { path, result: Err(crate::git::GitError::BaseMissing("develop".into())) });
         assert!(matches!(fx.as_slice(), [Effect::ListBranches]));
     }
 
     #[test]
     fn one_worktree_failing_leaves_the_others_usable() {
         let mut a = app(&["a", "b"]);
-        a.handle_msg(Msg::Loaded { path: "/r/a".into(), generation: 0, result: Err(crate::git::GitError::NoMergeBase) });
-        deliver(&mut a, "b", 0, vec![file("1")]);
+        a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::NoMergeBase) });
+        deliver(&mut a, "b", vec![file("1")]);
         assert!(a.states[0].error.is_some());
         press(&mut a, ']');
         assert_eq!(a.file_count(), 1);
@@ -2583,9 +2605,11 @@ Replace `handle_input_key`:
     }
 
     fn reload_all(&mut self) -> Vec<Effect> {
-        self.worktrees.iter()
-            .map(|w| Effect::Load { path: w.path.clone(), base: self.base.clone() })
-            .collect()
+        let selected = self.selected_worktree().map(|w| w.path.clone());
+        let mut paths: Vec<PathBuf> = self.worktrees.iter().map(|w| w.path.clone()).collect();
+        // The worktree on screen first, since the pool runs jobs in order.
+        paths.sort_by_key(|p| Some(p) != selected.as_ref());
+        paths.into_iter().map(|path| Effect::Load { path, base: self.base.clone() }).collect()
     }
 ```
 
@@ -2604,7 +2628,10 @@ In `handle_msg`, replace the `Msg::Branches` handling and the `Err` arm of `Msg:
 
 ```rust
             Msg::Branches(Ok(branches)) => {
-                self.input = Some(Input::Base { query: String::new(), branches });
+                // A late reply must not wipe a half-written comment.
+                if self.input.is_none() {
+                    self.input = Some(Input::Base { query: String::new(), branches });
+                }
                 Vec::new()
             }
             Msg::Branches(Err(e)) => {
@@ -2735,7 +2762,9 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 pub const MAX_LINE_LEN: usize = 2_000;
-pub const MAX_FILE_LINES: usize = 50_000;
+/// Syntect manages about 1,000 lines a second on real TypeScript, so this
+/// bounds how long one highlight can hold a worker.
+pub const MAX_FILE_LINES: usize = 5_000;
 
 pub type Span = (Color, String);
 
@@ -2805,7 +2834,7 @@ Add `Effect::Highlight { key: CacheKey, file_index: usize, diffs: Diffs }` to `a
     }
 ```
 
-Add a test in `src/app.rs` that `highlight_effect` returns `None` for a worktree whose loaded diff is empty, using `deliver(&mut a, "a", 0, vec![])`.
+Add a test in `src/app.rs` that `highlight_effect` returns `None` for a worktree whose loaded diff is empty, using `deliver(&mut a, "a", vec![])`.
 
 Handle the message, ignoring results for a superseded diff:
 
@@ -2876,7 +2905,7 @@ fn app() -> App {
     a.handle_msg(Msg::Worktrees(Ok(wts.to_vec())));
     let path: std::path::PathBuf = "/r/feat-auth".into();
     let key = CacheKey { worktree: path.clone(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
-    let _: Vec<Effect> = a.handle_msg(Msg::Loaded { path, generation: 0, result: Ok(Loaded { key, diffs: Arc::new(vec![sample_file()]), op: None }) });
+    let _: Vec<Effect> = a.handle_msg(Msg::Loaded { path, result: Ok(Loaded { key, diffs: Arc::new(vec![sample_file()]), op: None }) });
     a
 }
 
@@ -2919,7 +2948,7 @@ fn help_overlay_lists_every_hotkey() {
 #[test]
 fn error_is_shown_on_the_affected_worktree() {
     let mut a = app();
-    a.handle_msg(Msg::Loaded { path: "/r/fix-cache".into(), generation: 0, result: Err(GitError::NoMergeBase) });
+    a.handle_msg(Msg::Loaded { path: "/r/fix-cache".into(), result: Err(GitError::NoMergeBase) });
     a.handle_key(KeyEvent::from(KeyCode::Char(']')));
     assert!(render(&mut a).contains("no common history"));
 }
@@ -3660,7 +3689,7 @@ use branchdiff::app::{App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
-use branchdiff::worker::{Generations, Job, Loads, Msg, Pool, WORKER_THREAD};
+use branchdiff::worker::{Job, Loads, Msg, Pool, WORKER_THREAD};
 use branchdiff::{editor, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
@@ -3710,6 +3739,8 @@ fn main() -> Result<()> {
     result
 }
 
+const MAX_HIGHLIGHTS: usize = 2;
+
 /// ratatui's hook restores the terminal on a panic from any thread. Workers
 /// catch their own panics and carry on, so the app must keep its screen.
 fn keep_terminal_on_worker_panic() {
@@ -3723,7 +3754,6 @@ fn keep_terminal_on_worker_panic() {
 
 struct Runtime {
     pool: Pool,
-    gens: Generations,
     loads: Loads,
     store: Store,
     common_dir: PathBuf,
@@ -3760,10 +3790,10 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
     let paused = Arc::new(AtomicBool::new(false));
     spawn_input(key_tx, paused.clone());
 
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    // Workers mostly wait on git, so few CPUs is no reason for few threads.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 8));
     let mut rt = Runtime {
         pool: Pool::new(threads, msg_tx.clone()),
-        gens: Generations::default(),
         loads: Loads::default(),
         store: Store::new(&info.common_dir),
         common_dir: info.common_dir.clone(),
@@ -3817,14 +3847,16 @@ fn on_event(app: &mut App, ev: Event) -> Vec<Effect> {
 }
 
 fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
-    // Before the stale check, so a dropped result still frees the worktree.
     if let Msg::Loaded { path, .. } = &msg {
-        if let Some(job) = rt.loads.finished(path) {
+        let done = rt.loads.finished(path);
+        if let Some(job) = done.next {
             rt.pool.submit(job);
+        }
+        if done.superseded {
+            return Vec::new();
         }
     }
     match msg {
-        Msg::Loaded { ref path, generation, .. } if !rt.gens.is_current(path, generation) => Vec::new(),
         Msg::Worktrees(Ok(list)) => {
             if let Some(tx) = &rt.watch {
                 let _ = tx.send(watch::Command::SetWorktrees(list.iter().map(|w| w.path.clone()).collect()));
@@ -3863,14 +3895,16 @@ fn review_id(w: &git::Worktree) -> ReviewId {
 fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut DefaultTerminal) -> Result<()> {
     match effect {
         Effect::Load { path, base } => {
-            if let Some(job) = rt.loads.request(&rt.gens, path, base) {
+            if let Some(job) = rt.loads.request(path, base) {
                 rt.pool.submit(job);
             }
         }
         Effect::ReloadWorktrees => rt.pool.submit(Job::ListWorktrees { cwd: rt.repo.clone() }),
         Effect::ListBranches => rt.pool.submit(Job::ListBranches { cwd: rt.repo.clone() }),
         Effect::Highlight { key, file_index, diffs } => {
-            if rt.highlighting.insert((key.clone(), file_index)) {
+            // Holding `n` would otherwise queue a job per file passed and
+            // bury refreshes. A skipped file is requested again on return.
+            if rt.highlighting.len() < MAX_HIGHLIGHTS && rt.highlighting.insert((key.clone(), file_index)) {
                 rt.pool.submit(Job::Highlight { key, file_index, diffs });
             }
         }
@@ -4022,7 +4056,7 @@ fn loaded_app() -> App {
     for i in 0..WORKTREES {
         let path: std::path::PathBuf = format!("/r/w{i}").into();
         let key = CacheKey { worktree: path.clone(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
-        a.handle_msg(Msg::Loaded { path, generation: 0, result: Ok(Loaded { key, diffs: diffs.clone(), op: None }) });
+        a.handle_msg(Msg::Loaded { path, result: Ok(Loaded { key, diffs: diffs.clone(), op: None }) });
     }
     a
 }
