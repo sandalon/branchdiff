@@ -232,11 +232,11 @@ fn unquote(s: &str) -> String {
 }
 
 use crate::git::{self, GitError};
-use std::collections::hash_map::DefaultHasher;
+use crate::store::fnv1a;
 use std::fs::{File, Metadata};
-use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 /// Untracked files above this size are listed but not read, and show as binary.
 /// Holding one in memory costs about 3 times its size for log lines and 40 times
@@ -266,11 +266,18 @@ fn untracked_files(cwd: &Path, mut budget: usize) -> Result<Vec<FileDiff>, GitEr
     Ok(git::untracked(cwd)?.into_iter().map(|path| untracked_file(cwd, path, &mut budget)).collect())
 }
 
+/// Stands in for a hash of a file too large to read. Saved reviews depend on
+/// content IDs, so these must not change between builds.
+fn metadata_id(m: &Metadata) -> u64 {
+    let nanos = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    fnv1a(format!("{} {nanos}", m.len()).as_bytes())
+}
+
 fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
     let mut f = FileDiff::empty();
     f.status = Status::Untracked;
     let full = cwd.join(&path);
-    let mut hasher = DefaultHasher::new();
+    let mut over_cap_id = None;
     // A symlink shows its target, as it does in a patch. Everything else goes
     // through one handle, and only a regular file is read. Other paths, such as
     // a nested repository's `nest/`, have no content.
@@ -281,15 +288,14 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
         _ => match read_regular(&full, budget) {
             Ok(Regular::Bytes(bytes)) => bytes,
             Ok(Regular::OverCap(m)) => {
-                (m.len(), m.modified().ok()).hash(&mut hasher);
+                over_cap_id = Some(metadata_id(&m));
                 f.binary = true;
                 Vec::new()
             }
             Err(_) => Vec::new(),
         },
     };
-    bytes.hash(&mut hasher);
-    f.content_id = Some(format!("{:x}", hasher.finish()));
+    f.content_id = Some(format!("{:x}", over_cap_id.unwrap_or_else(|| fnv1a(&bytes))));
     // Same heuristic git uses: a NUL in the first 8000 bytes means binary.
     f.binary |= bytes.iter().take(8000).any(|b| *b == 0);
     if !f.binary {
@@ -456,6 +462,18 @@ mod tests {
         for f in &files[1..] {
             assert!(f.binary && f.hunks.is_empty() && f.content_id.is_some(), "{f:?}");
         }
+    }
+
+    #[test]
+    fn untracked_content_ids_are_stable_across_builds() {
+        // Pinned because reviewed marks saved to disk are derived from these.
+        let dir = untracked_repo(&[("a.txt", b"hello"), ("b.txt", b"world")]);
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        File::options().write(true).open(dir.path().join("b.txt")).unwrap().set_modified(mtime).unwrap();
+        let files = untracked_files(dir.path(), 1).unwrap();
+        assert_eq!(files[0].content_id.as_deref(), Some("a430d84680aabd0b"), "read from its bytes");
+        assert!(files[1].binary, "over cap");
+        assert_eq!(files[1].content_id.as_deref(), Some("1427257817dd4a16"), "from size and mtime");
     }
 
     #[test]

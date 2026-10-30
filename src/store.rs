@@ -164,17 +164,17 @@ fn encode(s: &str) -> String {
         }
     }
     if out.len() > MAX_ENCODED_LEN {
-        let hash = format!("~{:016x}", fnv1a(s));
+        let hash = format!("~{:016x}", fnv1a(s.as_bytes()));
         out.truncate(MAX_ENCODED_LEN - hash.len());
         out.push_str(&hash);
     }
     out
 }
 
-/// FNV-1a. File names must not change between builds, which rules out
-/// `DefaultHasher`.
-fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf29ce484222325, |hash, b| (hash ^ u64::from(b)).wrapping_mul(0x100000001b3))
+/// FNV-1a, for hashes that outlive the process. `DefaultHasher` can change
+/// between Rust releases, which would orphan saved reviews and reviewed marks.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, b| (hash ^ u64::from(*b)).wrapping_mul(0x100000001b3))
 }
 
 #[cfg(test)]
