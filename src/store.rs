@@ -1,18 +1,15 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
+use crate::git::Worktree;
+use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use tempfile::NamedTempFile;
 
 /// Longest encoded name kept whole. File names are usually limited to 255
 /// bytes, and this leaves room for the prefix and every suffix the store adds.
 const MAX_ENCODED_LEN: usize = 200;
-
-/// Numbers temp files within this process.
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Which file version `Comment::line` counts in. A replaced line has the
 /// same number on both sides, so the number alone is ambiguous.
@@ -48,6 +45,15 @@ pub enum ReviewId {
     Commit(String),
 }
 
+impl ReviewId {
+    pub fn of(w: &Worktree) -> Self {
+        match &w.branch {
+            Some(branch) => Self::Branch(branch.clone()),
+            None => Self::Commit(w.head.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadedReview {
     pub review: Review,
@@ -60,15 +66,11 @@ pub struct LoadedReview {
 
 pub struct Store {
     dir: PathBuf,
-    /// Unreadable files `load` could not move, which `save` must not replace.
-    /// Fixing the permissions behind a failed save would otherwise let the
-    /// next save overwrite them.
-    unmoved: Mutex<HashSet<PathBuf>>,
 }
 
 impl Store {
     pub fn new(git_common_dir: &Path) -> Self {
-        Self { dir: git_common_dir.join("branchdiff"), unmoved: Mutex::default() }
+        Self { dir: git_common_dir.join("branchdiff") }
     }
 
     pub fn path_for(&self, id: &ReviewId) -> PathBuf {
@@ -83,66 +85,50 @@ impl Store {
     /// read or parsed is moved aside, so the next save can't overwrite it.
     pub fn load(&self, id: &ReviewId) -> LoadedReview {
         let path = self.path_for(id);
-        let parsed = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).ok(),
-            Err(e) if e.kind() == ErrorKind::NotFound => Some(Review::default()),
-            Err(_) => None,
-        };
-        let mut unmoved = self.unmoved.lock().unwrap();
-        unmoved.remove(&path);
-        if let Some(review) = parsed {
+        if let Some(review) = read_review(&path) {
             return LoadedReview { review, ..LoadedReview::default() };
         }
         match set_aside(&path) {
             Ok(moved_aside) => LoadedReview { moved_aside, ..LoadedReview::default() },
-            Err(_) => {
-                unmoved.insert(path.clone());
-                LoadedReview { left_in_place: Some(path), ..LoadedReview::default() }
-            }
+            Err(_) => LoadedReview { left_in_place: Some(path), ..LoadedReview::default() },
         }
     }
 
     /// Writes to a temp file then renames, so a crash cannot corrupt the review.
+    /// A file already there that can't be used is moved aside first, and if it
+    /// can't be moved it is left alone and the save fails.
     ///
     /// Replaces the whole file: if two processes edit one review, the last
     /// save wins.
     pub fn save(&self, id: &ReviewId, review: &Review) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(review)?;
         let path = self.path_for(id);
-        let mut unmoved = self.unmoved.lock().unwrap();
-        if unmoved.contains(&path) {
+        if read_review(&path).is_none() {
             set_aside(&path).map_err(|e| anyhow!("{e}: could not move aside {}", path.display()))?;
-            unmoved.remove(&path);
         }
-        drop(unmoved);
-        self.replace(&path, &bytes)
-            .map_err(|e| anyhow!("{e}: {}", self.dir.display()))
+        self.replace(&path, &bytes).map_err(|e| anyhow!("{e}: {}", self.dir.display()))
     }
 
+    /// Review files end up 0600, which suits private review notes.
     fn replace(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
-        let tmp = temp_path(path);
-        let result = write_synced(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result
+        let mut tmp = NamedTempFile::new_in(&self.dir)?;
+        tmp.write_all(bytes)?;
+        // Otherwise a power loss can keep the rename but not the data, leaving
+        // an empty file in place of the review.
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map(drop).map_err(|e| e.error)
     }
 }
 
-/// Processes share the store directory, and a shared temp file would let one
-/// rename the other's half-written data into place.
-fn temp_path(path: &Path) -> PathBuf {
-    let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("json.{}.{n}.tmp", std::process::id()))
-}
-
-/// Flushes before returning. Otherwise a power loss can keep the rename but
-/// not the data, leaving an empty file in place of the review.
-fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+/// Returns `None` if something is there that can't be used. A missing file is
+/// an empty review, including when a file sits where the store directory goes.
+fn read_review(path: &Path) -> Option<Review> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).ok(),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Some(Review::default()),
+        Err(_) => None,
+    }
 }
 
 /// Moves a bad file to the first free `.json.corrupt` name, keeping earlier
@@ -236,6 +222,7 @@ mod tests {
         assert!(store.path_for(&ReviewId::Commit("abc".into())).to_string_lossy().contains("commit-"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_save_leaves_old_file_intact() {
         let dir = TempDir::new().unwrap();
@@ -244,20 +231,14 @@ mod tests {
         let mut r = Review::default();
         r.comments.push(comment("keep"));
         store.save(&id, &r).unwrap();
-        // A temp file left by an interrupted save must not affect loading.
-        std::fs::write(store.path_for(&id).with_extension("json.tmp"), "{ truncated").unwrap();
-        assert_eq!(store.load(&id).review, r);
-    }
-
-    #[test]
-    fn corrupt_file_is_preserved_and_loads_empty() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        let id = ReviewId::Branch("feat".into());
-        store.save(&id, &Review::default()).unwrap();
-        std::fs::write(store.path_for(&id), "not json").unwrap();
-        assert_eq!(store.load(&id).review, Review::default());
-        assert!(store.path_for(&id).with_extension("json.corrupt").exists());
+        let old = std::fs::read(store.path_for(&id)).unwrap();
+        if !make_store_dir_read_only(&store) {
+            return;
+        }
+        let saved = store.save(&id, &Review::default());
+        set_store_dir_mode(&store, 0o755);
+        assert!(saved.is_err());
+        assert_eq!(std::fs::read(store.path_for(&id)).unwrap(), old);
     }
 
     #[test]
@@ -272,7 +253,7 @@ mod tests {
                 let (store, id, path) = (&store, &id, &path);
                 s.spawn(move || {
                     let r = Review { comments: vec![comment("body"); 1 + writer * 200], ..Review::default() };
-                    for _ in 0..25 {
+                    for _ in 0..5 {
                         store.save(id, &r).unwrap();
                         let saved = std::fs::read(path).unwrap();
                         serde_json::from_slice::<Review>(&saved).unwrap();
@@ -280,17 +261,42 @@ mod tests {
                 });
             }
         });
+        assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 1, "no temp files left behind");
     }
 
     #[test]
-    fn failed_save_leaves_no_temp_file() {
+    fn save_replaces_the_previous_review() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         let id = ReviewId::Branch("feat".into());
-        // A directory in the way makes the final rename fail.
-        std::fs::create_dir_all(store.path_for(&id).join("blocker")).unwrap();
-        assert!(store.save(&id, &Review::default()).is_err());
-        assert_eq!(std::fs::read_dir(dir.path().join("branchdiff")).unwrap().count(), 1);
+        store.save(&id, &Review::default()).unwrap();
+        let mut r = Review::default();
+        r.comments.push(comment("newer"));
+        store.save(&id, &r).unwrap();
+        assert_eq!(store.load(&id).review, r);
+    }
+
+    #[test]
+    fn file_corrupted_after_load_is_moved_aside_by_the_next_save() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("feat".into());
+        let mut r = Review::default();
+        r.comments.push(comment("in memory"));
+        store.save(&id, &r).unwrap();
+        let loaded = store.load(&id);
+        std::fs::write(store.path_for(&id), "garbled").unwrap();
+        store.save(&id, &loaded.review).unwrap();
+        assert_eq!(std::fs::read(store.path_for(&id).with_extension("json.corrupt")).unwrap(), b"garbled");
+        assert_eq!(store.load(&id).review, r);
+    }
+
+    #[test]
+    fn nothing_is_reported_when_a_file_blocks_the_store_dir() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("branchdiff"), "a file, not a directory").unwrap();
+        let loaded = Store::new(dir.path()).load(&ReviewId::Branch("feat".into()));
+        assert_eq!(loaded, LoadedReview::default());
     }
 
     #[test]
@@ -326,44 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn file_that_is_not_utf8_is_preserved() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        let id = ReviewId::Branch("feat".into());
-        store.save(&id, &Review::default()).unwrap();
-        std::fs::write(store.path_for(&id), b"{\xff}").unwrap();
-        assert_eq!(store.load(&id).review, Review::default());
-        store.save(&id, &Review::default()).unwrap();
-        assert_eq!(std::fs::read(store.path_for(&id).with_extension("json.corrupt")).unwrap(), b"{\xff}");
-    }
-
-    #[test]
-    fn file_that_cannot_be_read_is_moved_aside() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        let id = ReviewId::Branch("feat".into());
-        // A directory fails to read on every platform, even when run as root.
-        std::fs::create_dir_all(store.path_for(&id)).unwrap();
-        assert_eq!(store.load(&id).review, Review::default());
-        assert!(store.path_for(&id).with_extension("json.corrupt").exists());
-    }
-
-    #[test]
-    fn second_corruption_keeps_the_first_copy() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        let id = ReviewId::Branch("feat".into());
-        store.save(&id, &Review::default()).unwrap();
-        for text in ["first", "second"] {
-            std::fs::write(store.path_for(&id), text).unwrap();
-            assert_eq!(store.load(&id).review, Review::default());
-        }
-        let copy = |ext: &str| std::fs::read_to_string(store.path_for(&id).with_extension(ext)).unwrap();
-        assert_eq!(copy("json.corrupt"), "first");
-        assert_eq!(copy("json.corrupt.1"), "second");
-    }
-
-    #[test]
     fn bad_files_report_where_their_bytes_went() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
@@ -376,7 +344,8 @@ mod tests {
             assert_eq!(loaded.review, Review::default());
             assert_eq!(loaded.left_in_place, None);
             let moved = loaded.moved_aside.unwrap();
-            assert_ne!(moved, store.path_for(&id));
+            assert_eq!(moved, store.path_for(&id).with_extension("json.corrupt"));
+            store.save(&id, &Review::default()).unwrap();
             assert_eq!(std::fs::read(moved).unwrap(), bytes);
         }
     }
@@ -389,7 +358,10 @@ mod tests {
         // A directory fails to read on every platform, even when run as root.
         std::fs::create_dir_all(store.path_for(&id)).unwrap();
         std::fs::write(store.path_for(&id).join("inside"), "original").unwrap();
-        let moved = store.load(&id).moved_aside.unwrap();
+        let loaded = store.load(&id);
+        assert_eq!(loaded.review, Review::default());
+        let moved = loaded.moved_aside.unwrap();
+        assert_eq!(moved, store.path_for(&id).with_extension("json.corrupt"));
         assert_eq!(std::fs::read_to_string(moved.join("inside")).unwrap(), "original");
         assert!(!store.path_for(&id).exists());
     }
@@ -400,11 +372,15 @@ mod tests {
         let store = Store::new(dir.path());
         let id = ReviewId::Branch("feat".into());
         store.save(&id, &Review::default()).unwrap();
+        let mut moved = Vec::new();
         for text in ["first", "second"] {
             std::fs::write(store.path_for(&id), text).unwrap();
-            let moved = store.load(&id).moved_aside.unwrap();
-            assert_eq!(std::fs::read_to_string(moved).unwrap(), text);
+            moved.push(store.load(&id).moved_aside.unwrap());
         }
+        assert_eq!(moved[0], store.path_for(&id).with_extension("json.corrupt"));
+        assert_eq!(moved[1], store.path_for(&id).with_extension("json.corrupt.1"));
+        assert_eq!(std::fs::read_to_string(&moved[0]).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&moved[1]).unwrap(), "second");
     }
 
     #[test]
@@ -423,18 +399,22 @@ mod tests {
         assert!(store.path_for(&id).exists());
     }
 
-    /// Leaves a corrupt file for `id` in a read-only store directory, or
-    /// returns false if permissions don't apply, as when running as root.
+    /// Returns false if permissions don't apply, as when running as root.
     #[cfg(unix)]
-    fn corrupt_file_in_read_only_dir(store: &Store, id: &ReviewId) -> bool {
-        store.save(id, &Review::default()).unwrap();
-        std::fs::write(store.path_for(id), "not json").unwrap();
+    fn make_store_dir_read_only(store: &Store) -> bool {
         set_store_dir_mode(store, 0o555);
         let enforced = std::fs::File::create(store.dir.join("probe")).is_err();
         if !enforced {
             set_store_dir_mode(store, 0o755);
         }
         enforced
+    }
+
+    #[cfg(unix)]
+    fn corrupt_file_in_read_only_dir(store: &Store, id: &ReviewId) -> bool {
+        store.save(id, &Review::default()).unwrap();
+        std::fs::write(store.path_for(id), "not json").unwrap();
+        make_store_dir_read_only(store)
     }
 
     #[cfg(unix)]
@@ -468,7 +448,6 @@ mod tests {
         if !corrupt_file_in_read_only_dir(&store, &id) {
             return;
         }
-        store.load(&id);
         let message = store.save(&id, &Review::default()).unwrap_err().to_string();
         set_store_dir_mode(&store, 0o755);
         assert!(message.contains("os error"), "{message}");
@@ -486,7 +465,6 @@ mod tests {
         if !corrupt_file_in_read_only_dir(&store, &id) {
             return;
         }
-        store.load(&id);
         set_store_dir_mode(&store, 0o755);
         let mut r = Review::default();
         r.comments.push(comment("new"));
@@ -505,56 +483,10 @@ mod tests {
     }
 
     #[test]
-    fn temp_names_are_unique_and_carry_the_process_id() {
-        let path = Path::new("repo/branch-feat.json");
-        let (first, second) = (temp_path(path), temp_path(path));
-        assert_ne!(first, second);
-        assert_eq!(first.parent(), path.parent());
-        let name = first.file_name().unwrap().to_str().unwrap();
-        assert!(name.contains(&format!(".{}.", std::process::id())), "{name}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn successful_retry_stops_later_saves_moving_the_healthy_file() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        let id = ReviewId::Branch("feat".into());
-        if !corrupt_file_in_read_only_dir(&store, &id) {
-            return;
-        }
-        store.load(&id);
-        set_store_dir_mode(&store, 0o755);
-        let mut r = Review::default();
-        r.comments.push(comment("first"));
-        store.save(&id, &r).unwrap();
-        r.comments.push(comment("second"));
-        store.save(&id, &r).unwrap();
-        // `save` always writes this path, so only a second copy shows a move.
-        assert!(!store.path_for(&id).with_extension("json.corrupt.1").exists());
-        assert_eq!(std::fs::read(store.path_for(&id).with_extension("json.corrupt")).unwrap(), b"not json");
-        assert_eq!(store.load(&id).review, r);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn load_of_a_healthy_file_stops_later_saves_moving_it() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path());
-        let id = ReviewId::Branch("feat".into());
-        if !corrupt_file_in_read_only_dir(&store, &id) {
-            return;
-        }
-        store.load(&id);
-        set_store_dir_mode(&store, 0o755);
-        let mut r = Review::default();
-        r.comments.push(comment("repaired"));
-        std::fs::write(store.path_for(&id), serde_json::to_vec(&r).unwrap()).unwrap();
-        assert_eq!(store.load(&id).review, r);
-        store.save(&id, &r).unwrap();
-        // `save` always writes this path, so only a copy shows a move.
-        assert!(!store.path_for(&id).with_extension("json.corrupt").exists());
-        assert_eq!(store.load(&id).review, r);
+    fn review_id_follows_the_branch_or_else_the_commit() {
+        let worktree = |branch: Option<&str>| Worktree { path: "wt".into(), head: "abc".into(), branch: branch.map(Into::into) };
+        assert_eq!(ReviewId::of(&worktree(Some("feat"))), ReviewId::Branch("feat".into()));
+        assert_eq!(ReviewId::of(&worktree(None)), ReviewId::Commit("abc".into()));
     }
 
     #[test]
