@@ -574,3 +574,13 @@ fn untracked_hunk_headers_match_git() {
     run(&wt, &["add", "-N", "."]);
     assert_eq!(untracked, headers(loaded(&wt)));
 }
+
+/// Five lines, since growing one at a time would leave room for eight.
+#[test]
+fn untracked_lines_hold_no_spare_capacity() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("new.txt"), "1\n2\n3\n4\n5\n").unwrap();
+    let lines = &loaded(&wt)[0].hunks[0].lines;
+    assert_eq!((lines.len(), lines.capacity()), (5, 5));
+}

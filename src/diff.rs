@@ -295,12 +295,13 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
     if !f.binary {
         let text = String::from_utf8_lossy(&bytes);
         // Not `lines()`, which drops the `\r` of CRLF that patch lines keep.
-        let lines: Vec<Line> = text.split_terminator('\n').enumerate().map(|(i, l)| Line {
+        let mut lines: Vec<Line> = text.split_terminator('\n').enumerate().map(|(i, l)| Line {
             kind: LineKind::Added,
             old_no: None,
             new_no: Some(i as u32 + 1),
             text: l.to_string(),
         }).collect();
+        lines.shrink_to_fit();
         *budget = budget.saturating_sub(lines.len().saturating_mul(LINE_OVERHEAD_BYTES));
         f.added = lines.len() as u32;
         if !lines.is_empty() {
