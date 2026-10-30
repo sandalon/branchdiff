@@ -3879,8 +3879,11 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
             for (i, needed) in reload.into_iter().enumerate() {
                 if needed {
                     let id = review_id(&app.worktrees[i]);
-                    let review = rt.store.load(&id);
-                    app.set_review(i, review);
+                    let loaded = rt.store.load(&id);
+                    if let Some(path) = loaded.moved_aside {
+                        app.notice = Some(format!("Review could not be read, kept at {}", path.display()));
+                    }
+                    app.set_review(i, loaded.review);
                 }
             }
             effects
@@ -4247,7 +4250,7 @@ The Linux build depends on the system libc. `arboard` is built with `wayland-dat
 
 **Step 3: Write `README.md`**
 
-Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from the design doc, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, and that a commit inside a real submodule may not show the "changed" badge until `r` is pressed.
+Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from the design doc, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, and that two `branchdiff` sessions reviewing the same branch overwrite each other's comments when they save.
 
 **Step 4: Verify the final state**
 

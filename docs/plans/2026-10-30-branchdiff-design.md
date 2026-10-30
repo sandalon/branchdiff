@@ -102,7 +102,7 @@ Very large diffs render only the visible lines. Binary files show a one-line not
 
 ## Comments and reviewed marks
 
-Comments and reviewed marks are stored as JSON at `<git-common-dir>/branchdiff/<branch>.json`.
+Comments and reviewed marks are stored as JSON under `<git-common-dir>/branchdiff/`, in one file per branch with the branch name encoded into the filename.
 
 - Git does not track this location, so comments cannot be committed by accident.
 - Keying by branch means they survive a worktree being removed and recreated.
