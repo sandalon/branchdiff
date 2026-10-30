@@ -36,6 +36,10 @@ pub struct FileDiff {
     pub old_path: Option<String>,
     pub status: Status,
     pub binary: bool,
+    /// The `a..b` blob pair from the `index` line. Both sides are kept so a
+    /// moved fork point changes the ID. `None` when git writes no `index` line,
+    /// as for mode-only changes and pure renames.
+    pub content_id: Option<String>,
     pub added: u32,
     pub removed: u32,
     pub hunks: Vec<Hunk>,
@@ -43,7 +47,7 @@ pub struct FileDiff {
 
 impl FileDiff {
     fn empty() -> Self {
-        Self { path: String::new(), old_path: None, status: Status::Modified, binary: false, added: 0, removed: 0, hunks: Vec::new() }
+        Self { path: String::new(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 0, removed: 0, hunks: Vec::new() }
     }
 }
 
@@ -91,11 +95,12 @@ pub fn parse(input: &[u8]) -> Vec<FileDiff> {
                 hunk.lines.push(Line { kind, old_no: o, new_no: n, text: text.to_string() });
                 continue;
             }
+            // Not a body line, so the hunk ends here.
             (old_left, new_left) = (0, 0);
         }
 
         if line.starts_with("diff --git ") {
-            files.extend(cur.take());
+            finish_file(&mut files, cur.take());
             let mut f = FileDiff::empty();
             f.path = path_from_git_header(&line).unwrap_or_default();
             cur = Some(f);
@@ -111,6 +116,8 @@ pub fn parse(input: &[u8]) -> Vec<FileDiff> {
             file.old_path = Some(unquote(p));
         } else if let Some(p) = line.strip_prefix("rename to ") {
             file.path = unquote(p);
+        } else if let Some(rest) = line.strip_prefix("index ") {
+            file.content_id = rest.split(' ').next().map(str::to_string);
         } else if line.starts_with("Binary files ") {
             file.binary = true;
         } else if let Some(p) = line.strip_prefix("--- ").or_else(|| line.strip_prefix("+++ ")) {
@@ -122,8 +129,14 @@ pub fn parse(input: &[u8]) -> Vec<FileDiff> {
             }
         }
     }
-    files.extend(cur);
+    finish_file(&mut files, cur);
     files
+}
+
+fn finish_file(files: &mut Vec<FileDiff>, file: Option<FileDiff>) {
+    let Some(mut file) = file else { return };
+    file.hunks.iter_mut().for_each(|h| h.lines.shrink_to_fit());
+    files.push(file);
 }
 
 fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
@@ -237,6 +250,37 @@ mod tests {
         assert_eq!((lines[1].old_no, lines[1].new_no), (Some(2), None));
         assert_eq!((lines[2].old_no, lines[2].new_no), (None, Some(2)));
         assert_eq!(lines[3].new_no, Some(3));
+        assert_eq!(f.hunks[0].header, "@@ -1,2 +1,3 @@");
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "TWO", "three"]);
+    }
+
+    #[test]
+    fn numbers_each_hunk_from_its_own_header() {
+        let p = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -10,2 +10,3 @@ fn f() {\n c\n+d\n e\n";
+        let f = &parse(p.as_bytes())[0];
+        assert_eq!(f.hunks.len(), 2);
+        assert_eq!((f.added, f.removed), (2, 1));
+        let numbers = |h: &Hunk| h.lines.iter().map(|l| (l.old_no, l.new_no)).collect::<Vec<_>>();
+        assert_eq!(f.hunks[0].header, "@@ -1,2 +1,2 @@");
+        assert_eq!(numbers(&f.hunks[0]), [(Some(1), Some(1)), (Some(2), None), (None, Some(2))]);
+        assert_eq!(f.hunks[1].header, "@@ -10,2 +10,3 @@ fn f() {");
+        assert_eq!(numbers(&f.hunks[1]), [(Some(10), Some(10)), (None, Some(11)), (Some(11), Some(12))]);
+    }
+
+    #[test]
+    fn keeps_tabs_and_trailing_carriage_returns_in_text() {
+        let p = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-\ta\tb\r\n+\tc\r\n";
+        let lines = &parse(p.as_bytes())[0].hunks[0].lines;
+        assert_eq!(lines[0].text, "\ta\tb\r");
+        assert_eq!(lines[1].text, "\tc\r");
+    }
+
+    #[test]
+    fn unquotes_both_sides_of_a_rename() {
+        let p = "diff --git \"a/o\\tld.txt\" \"b/n\\tew.txt\"\nsimilarity index 100%\nrename from \"o\\tld.txt\"\nrename to \"n\\tew.txt\"\n";
+        let f = &parse(p.as_bytes())[0];
+        assert_eq!((f.old_path.as_deref(), f.path.as_str()), (Some("o\tld.txt"), "n\tew.txt"));
     }
 
     #[test]
@@ -319,6 +363,50 @@ mod tests {
         assert!(parse(b"").is_empty());
     }
 
+    #[test]
+    fn content_id_is_the_index_token_without_its_mode() {
+        assert_eq!(parse(MODIFY.as_bytes())[0].content_id.as_deref(), Some("814f4a4..475bbc3"));
+    }
+
+    #[test]
+    fn content_id_without_a_mode_keeps_the_whole_token() {
+        let p = "diff --git a/n b/n\nnew file mode 100644\nindex 0000000..e69de29\n";
+        assert_eq!(parse(p.as_bytes())[0].content_id.as_deref(), Some("0000000..e69de29"));
+    }
+
+    #[test]
+    fn binary_file_has_a_content_id() {
+        let p = "diff --git a/bin.dat b/bin.dat\nindex 8352675..9388380 100644\nBinary files a/bin.dat and b/bin.dat differ\n";
+        assert_eq!(parse(p.as_bytes())[0].content_id.as_deref(), Some("8352675..9388380"));
+    }
+
+    #[test]
+    fn pure_rename_and_mode_change_have_no_content_id() {
+        let p = "diff --git a/big.txt b/moved.txt\nsimilarity index 100%\nrename from big.txt\nrename to moved.txt\ndiff --git a/m.sh b/m.sh\nold mode 100644\nnew mode 100755\n";
+        let files = parse(p.as_bytes());
+        assert_eq!((files[0].content_id.as_deref(), files[1].content_id.as_deref()), (None, None));
+    }
+
+    #[test]
+    fn index_lines_in_a_hunk_body_are_not_content_ids() {
+        let body = "@@ -1,2 +1,3 @@\n index 1111111..2222222 100644\n+index 3333333..4444444 100644\n-index 5555555..6666666 100644\n+index 7777777..8888888 100644\n";
+        let without = format!("diff --git a/a b/a\n--- a/a\n+++ b/a\n{body}");
+        assert_eq!(parse(without.as_bytes())[0].content_id, None);
+        let with = format!("diff --git a/a b/a\nindex aaaaaaa..bbbbbbb 100644\n--- a/a\n+++ b/a\n{body}");
+        assert_eq!(parse(with.as_bytes())[0].content_id.as_deref(), Some("aaaaaaa..bbbbbbb"));
+    }
+
+    #[test]
+    fn releases_spare_hunk_capacity_on_every_file() {
+        let body = " a\n".repeat(5);
+        let file = |name: &str| format!("diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1,5 +1,5 @@\n{body}");
+        let files = parse(format!("{}{}", file("x"), file("y")).as_bytes());
+        for f in &files {
+            let lines = &f.hunks[0].lines;
+            assert_eq!((lines.len(), lines.capacity()), (5, 5), "{}", f.path);
+        }
+    }
+
     const NEXT_FILE: &str = "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-x\n+y\n";
 
     fn assert_next_file_survives(hunk: &str, kept_lines: usize) {
@@ -383,7 +471,7 @@ mod tests {
         }
     }
 
-    // Truncation alone never puts a non-ASCII byte first on a line, which is
+    // Truncation alone never puts a non-ASCII byte first on a body line, which is
     // the case the `&line[1..]` slices rely on.
     #[test]
     fn corrupting_any_byte_of_a_patch_does_not_panic() {
