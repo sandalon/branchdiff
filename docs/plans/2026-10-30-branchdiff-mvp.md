@@ -3585,6 +3585,11 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
             }
             effects
         }
+        Msg::Highlighted { ref key, file_index, .. } => {
+            // A reload with an unchanged key must be able to highlight again.
+            rt.highlighting.remove(&(key.clone(), file_index));
+            app.handle_msg(msg)
+        }
         other => app.handle_msg(other),
     }
 }
