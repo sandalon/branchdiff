@@ -1096,12 +1096,27 @@ mod tests {
     #[test]
     fn pool_runs_submitted_jobs_and_reports_errors_as_messages() {
         let (tx, rx) = unbounded();
-        let pool = Pool::new(2, tx);
-        pool.submit(Job::Load { path: "/definitely/not/a/repo".into(), base: "develop".into(), generation: 1 });
+        let gens = Arc::new(Generations::default());
+        let pool = Pool::new(2, tx, gens.clone());
+        let path = PathBuf::from("/definitely/not/a/repo");
+        let generation = gens.next(&path);
+        pool.submit(Job::Load { path, base: "develop".into(), generation });
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Msg::Loaded { result: Err(_), .. } => {}
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn superseded_loads_are_skipped_before_they_start() {
+        let (tx, rx) = unbounded();
+        let gens = Arc::new(Generations::default());
+        let path = PathBuf::from("/definitely/not/a/repo");
+        let old = gens.next(&path);
+        gens.next(&path);
+        let pool = Pool::new(1, tx, gens);
+        pool.submit(Job::Load { path, base: "develop".into(), generation: old });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 }
 ```
@@ -1172,12 +1187,19 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new(threads: usize, msgs: Sender<Msg>) -> Self {
+    pub fn new(threads: usize, msgs: Sender<Msg>, gens: Arc<Generations>) -> Self {
         let (jobs, rx): (Sender<Job>, Receiver<Job>) = unbounded();
         for _ in 0..threads {
-            let (rx, msgs) = (rx.clone(), msgs.clone());
+            let (rx, msgs, gens) = (rx.clone(), msgs.clone(), gens.clone());
             thread::spawn(move || {
                 for job in rx {
+                    // Dropping late results is not enough: a load can take
+                    // seconds, so repeated refreshes would otherwise pile up.
+                    if let Job::Load { path, generation, .. } = &job {
+                        if !gens.is_current(path, *generation) {
+                            continue;
+                        }
+                    }
                     if msgs.send(run(job)).is_err() {
                         break;
                     }
@@ -3609,7 +3631,7 @@ fn main() -> Result<()> {
 
 struct Runtime {
     pool: Pool,
-    gens: Generations,
+    gens: Arc<Generations>,
     store: Store,
     common_dir: PathBuf,
     /// Opened on first copy, then kept alive because on Linux this process
@@ -3646,9 +3668,10 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
     spawn_input(key_tx, paused.clone());
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    let gens = Arc::new(Generations::default());
     let mut rt = Runtime {
-        pool: Pool::new(threads, msg_tx.clone()),
-        gens: Generations::default(),
+        pool: Pool::new(threads, msg_tx.clone(), gens.clone()),
+        gens,
         store: Store::new(&info.common_dir),
         common_dir: info.common_dir.clone(),
         clipboard: None,
@@ -4087,7 +4110,7 @@ Run: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
 Expected: no warnings, all tests pass.
 
 Run: `cargo test --release --test perf -- --ignored`
-Expected: 4 passed.
+Expected: 3 passed.
 
 **Step 5: Commit**
 
