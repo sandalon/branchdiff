@@ -6,7 +6,7 @@
 
 **Architecture:** A single Rust binary. The UI thread draws only from in-memory state in `App`. A worker pool runs the `git` CLI and returns tagged results over channels, and a watcher thread marks worktrees stale. `App::handle_key` and `App::handle_msg` are pure state transitions that return `Effect`s, so all behaviour is testable without a terminal.
 
-**Tech Stack:** Rust 2021 (minimum 1.88), ratatui 0.30 (use its `ratatui::crossterm` re-export; do not add crossterm directly), notify 8, syntect 5.3, nucleo-matcher 0.3, arboard 3, clap 4, serde, crossbeam-channel, insta, criterion.
+**Tech Stack:** Rust 2021 (minimum 1.88), ratatui 0.30 (use its `ratatui::crossterm` re-export; do not add crossterm directly), notify 8, syntect 5.3, two-face 0.5, nucleo-matcher 0.3, arboard 3, clap 4, serde, crossbeam-channel, insta, criterion.
 
 **Working directory:** `.worktrees/mvp`, branch `feature/mvp`. Commit messages end with:
 
@@ -2470,7 +2470,7 @@ git commit -m "feat: add worktree finder and runtime base branch picker"
 Highlighting runs on workers only. The UI draws plain text first, then swaps in colour when `Msg::Highlighted` arrives.
 
 **Files:**
-- Modify: `src/highlight.rs`, `src/app.rs`
+- Modify: `Cargo.toml`, `Cargo.lock`, `src/highlight.rs`, `src/app.rs`
 
 **Step 1: Write the failing tests**
 
@@ -2526,6 +2526,12 @@ syntect's bundled set has no TypeScript, TSX or TOML. Add this to `[dependencies
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 ```
 
+`two-face` replaces syntect's bundled syntaxes, so remove the now-unused feature from syntect:
+
+```toml
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-themes", "regex-fancy"] }
+```
+
 Add a test to the module above:
 
 ```rust
@@ -2576,8 +2582,9 @@ pub fn highlight_file(file: &FileDiff) -> HighlightedFile {
             if line.text.len() > MAX_LINE_LEN {
                 return plain(&line.text);
             }
+            let with_newline = format!("{}\n", line.text);
             let spans = state.as_mut().and_then(|h| {
-                h.highlight_line(&format!("{}\n", line.text), syntaxes).ok()
+                h.highlight_line(&with_newline, syntaxes).ok()
             });
             match spans {
                 Some(spans) => spans.iter().map(|(style, text)| {
@@ -3473,7 +3480,8 @@ struct Runtime {
     gens: Generations,
     store: Store,
     common_dir: PathBuf,
-    /// Kept alive because on Linux this process hosts the copied text.
+    /// Opened on first copy, then kept alive because on Linux this process
+    /// hosts the copied text.
     clipboard: Option<Clipboard>,
     paused: Arc<AtomicBool>,
     repo: PathBuf,
@@ -3511,7 +3519,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
         gens: Generations::default(),
         store: Store::new(&info.common_dir),
         common_dir: info.common_dir.clone(),
-        clipboard: Clipboard::new().ok(),
+        clipboard: None,
         paused,
         repo: info.toplevel.clone(),
         watch: watch::spawn(info.common_dir.clone(), msg_tx).ok(),
@@ -3609,6 +3617,9 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
             }
         }
         Effect::CopyExport(md) => {
+            if rt.clipboard.is_none() {
+                rt.clipboard = Clipboard::new().ok();
+            }
             let copied = rt.clipboard.as_mut().is_some_and(|c| c.set_text(md.clone()).is_ok());
             app.notice = Some(if copied {
                 "Copied review comments".to_string()
@@ -3911,7 +3922,7 @@ The Linux build depends on the system libc. `arboard` is built with `wayland-dat
 
 **Step 3: Write `README.md`**
 
-Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from the design doc, and the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree.
+Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from the design doc, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits.
 
 **Step 4: Verify the final state**
 
