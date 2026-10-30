@@ -214,10 +214,31 @@ fn diff_output_ignores_user_config() {
         ("diff.orderFile", order.to_str().unwrap()),
         ("diff.noprefix", "true"),
         ("diff.interHunkContext", "10"),
+        ("core.abbrev", "12"),
     ] {
         run(&repo.main, &["config", key, value]);
         let configured = git::diff(&repo.main, &head).unwrap();
         assert_eq!(String::from_utf8_lossy(&configured), String::from_utf8_lossy(&plain), "with {key}");
+    }
+}
+
+#[test]
+fn diff_index_lines_hold_full_hashes() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("a.txt"), "one\n").unwrap();
+    repo.commit_all(&repo.main, "base");
+    let head = run(&repo.main, &["rev-parse", "HEAD"]).trim().to_string();
+    std::fs::write(repo.main.join("a.txt"), "two\n").unwrap();
+    std::fs::write(repo.main.join("new.txt"), "").unwrap();
+    run(&repo.main, &["add", "new.txt"]);
+
+    let files = branchdiff::diff::parse(&git::diff(&repo.main, &head).unwrap());
+    assert_eq!(files.len(), 2);
+    for f in &files {
+        let id = f.content_id.as_deref().unwrap();
+        let (old, new) = id.split_once("..").unwrap();
+        assert_eq!((old.len(), new.len()), (40, 40), "{id}");
+        assert!(old.chars().chain(new.chars()).all(|c| c.is_ascii_hexdigit()), "{id}");
     }
 }
 

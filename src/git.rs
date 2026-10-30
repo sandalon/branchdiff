@@ -247,7 +247,7 @@ pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
     let out = run(cwd, [
         "-c", "diff.suppressBlankEmpty=false",
         "diff", "-M", "--no-color", "--no-ext-diff", "--no-textconv",
-        "--src-prefix=a/", "--dst-prefix=b/", "-U3", "--inter-hunk-context=0",
+        "--full-index", "--src-prefix=a/", "--dst-prefix=b/", "-U3", "--inter-hunk-context=0",
         "--no-relative", "--submodule=short", "--ignore-submodules=none",
         // Overrides `diff.orderFile`. On Windows this relies on git's own
         // mapping of /dev/null, which is unverified until CI runs there.
