@@ -44,8 +44,10 @@ pub struct Worktree {
     pub branch: Option<String>,
 }
 
-/// Repository-scoped variables that git sets for hooks and aliases. Inherited
-/// values would point every command at the wrong repository.
+/// Variables that must not reach our git commands. Most are repository-scoped
+/// values git sets for hooks and aliases, which would point every command at
+/// the wrong repository. `GIT_DIFF_OPTS` and `GIT_EXTERNAL_DIFF` would change
+/// diff output instead.
 pub const REPO_ENV_VARS: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
@@ -198,7 +200,7 @@ pub fn merge_base(cwd: &Path, base: &str) -> Result<String, GitError> {
 /// `cwd` must be the worktree root, since status paths are root-relative.
 /// HEAD is not covered, so the caller combines this with HEAD.
 pub fn fingerprint(cwd: &Path) -> Result<u64, GitError> {
-    let out = run(cwd, ["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
+    let out = run(cwd, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none"])?;
     if out.code != Some(0) {
         return Err(failed(out));
     }
@@ -262,7 +264,7 @@ pub fn branches(cwd: &Path) -> Result<Vec<String>, GitError> {
     Ok(text.lines().filter_map(|line| line.strip_suffix(' ')).map(String::from).collect())
 }
 
-/// Non-empty while a rebase or merge is in progress in this worktree.
+/// The operation in progress in this worktree, if it is a rebase or a merge.
 pub fn in_progress_op(cwd: &Path) -> Option<&'static str> {
     let text = ok_stdout(run(cwd, ["rev-parse", "--absolute-git-dir"]).ok()?).ok()?;
     let dir = PathBuf::from(text.trim());

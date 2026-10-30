@@ -196,13 +196,15 @@ fn diff_never_writes_the_index() {
 #[test]
 fn diff_output_ignores_user_config() {
     let repo = Repo::new();
-    std::fs::write(repo.main.join("a.txt"), "1\n\n3\n4\n5\n").unwrap();
+    std::fs::write(repo.main.join("a.txt"), "1\n\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n").unwrap();
     std::fs::write(repo.main.join("z.txt"), "1\n2\n3\n4\n5\n").unwrap();
     repo.commit_all(&repo.main, "base");
     let head = run(&repo.main, &["rev-parse", "HEAD"]).trim().to_string();
-    std::fs::write(repo.main.join("a.txt"), "1\n\n3\nchanged\n5\n").unwrap();
+    // The two a.txt edits are close enough for `diff.interHunkContext` to join.
+    std::fs::write(repo.main.join("a.txt"), "1\n\n3\nchanged\n5\n6\n7\n8\n9\n10\n11\nchanged\n13\n").unwrap();
     std::fs::write(repo.main.join("z.txt"), "1\n2\nchanged\n4\n5\n").unwrap();
     let plain = git::diff(&repo.main, &head).unwrap();
+    assert_eq!(String::from_utf8_lossy(&plain).matches("\n@@ -").count(), 3);
 
     let order = repo.main.parent().unwrap().join("order");
     std::fs::write(&order, "z.txt\na.txt\n").unwrap();
@@ -211,6 +213,7 @@ fn diff_output_ignores_user_config() {
         ("diff.context", "1"),
         ("diff.orderFile", order.to_str().unwrap()),
         ("diff.noprefix", "true"),
+        ("diff.interHunkContext", "10"),
     ] {
         run(&repo.main, &["config", key, value]);
         let configured = git::diff(&repo.main, &head).unwrap();
@@ -218,13 +221,19 @@ fn diff_output_ignores_user_config() {
     }
 }
 
-/// Leaves `feat` in a linked worktree mid-merge with `a.txt` conflicted.
-fn conflicted_worktree(repo: &Repo) -> std::path::PathBuf {
+/// Makes `feat`, in a linked worktree, and `develop` disagree about `a.txt`.
+fn diverged_worktree(repo: &Repo) -> std::path::PathBuf {
     let wt = repo.add_worktree("feat");
     std::fs::write(repo.main.join("a.txt"), "from develop\n").unwrap();
     repo.commit_all(&repo.main, "develop side");
     std::fs::write(wt.join("a.txt"), "from feat\n").unwrap();
     repo.commit_all(&wt, "feat side");
+    wt
+}
+
+/// Leaves `feat` in a linked worktree mid-merge with `a.txt` conflicted.
+fn conflicted_worktree(repo: &Repo) -> std::path::PathBuf {
+    let wt = diverged_worktree(repo);
     assert!(!common::git_unchecked(&wt, &["merge", "--no-edit", "develop"]).status.success());
     wt
 }
@@ -234,6 +243,15 @@ fn in_progress_op_is_per_worktree() {
     let repo = Repo::new();
     let wt = conflicted_worktree(&repo);
     assert_eq!(git::in_progress_op(&wt), Some("merge"));
+    assert_eq!(git::in_progress_op(&repo.main), None);
+}
+
+#[test]
+fn in_progress_op_sees_a_rebase_in_a_linked_worktree() {
+    let repo = Repo::new();
+    let wt = diverged_worktree(&repo);
+    assert!(!common::git_unchecked(&wt, &["rebase", "develop"]).status.success());
+    assert_eq!(git::in_progress_op(&wt), Some("rebase"));
     assert_eq!(git::in_progress_op(&repo.main), None);
 }
 
@@ -271,9 +289,21 @@ fn fingerprint_sees_a_same_size_edit_through_mtime() {
 }
 
 #[test]
+fn fingerprint_sees_a_same_mtime_edit_through_size() {
+    let repo = Repo::new();
+    let file = repo.main.join("a.txt");
+    std::fs::write(&file, "aaaa\n").unwrap();
+    set_mtime(&file, 1_000_000_000);
+    let first = git::fingerprint(&repo.main).unwrap();
+    std::fs::write(&file, "aaaaaaaa\n").unwrap();
+    set_mtime(&file, 1_000_000_000);
+    assert_ne!(first, git::fingerprint(&repo.main).unwrap());
+}
+
+#[test]
 fn merge_base_treats_a_flag_like_base_as_a_name() {
     let repo = Repo::new();
-    assert!(git::merge_base(&repo.main, "--octopus").is_err());
+    assert_eq!(git::merge_base(&repo.main, "--octopus"), Err(GitError::BaseMissing("--octopus".to_string())));
 }
 
 #[test]
@@ -304,4 +334,53 @@ fn discover_keeps_other_failures_distinct_from_not_a_repo() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(dir.path().join(".git"), "garbage\n").unwrap();
     assert!(matches!(git::discover(dir.path()), Err(GitError::Failed(_))), "{:?}", git::discover(dir.path()));
+}
+
+/// Commits a nested repository at `sm` as a gitlink and returns its path.
+fn add_gitlink(repo: &Repo) -> std::path::PathBuf {
+    let sm = repo.main.join("sm");
+    std::fs::create_dir(&sm).unwrap();
+    run(&sm, &["init", "-q", "-b", "main"]);
+    run(&sm, &["config", "user.email", "test@example.com"]);
+    run(&sm, &["config", "user.name", "Test"]);
+    std::fs::write(sm.join("f.txt"), "one\n").unwrap();
+    repo.commit_all(&sm, "sm init");
+    run(&repo.main, &["add", "sm"]);
+    repo.commit_all(&repo.main, "add gitlink");
+    sm
+}
+
+#[test]
+fn fingerprint_sees_a_moved_submodule_despite_config() {
+    let repo = Repo::new();
+    let sm = add_gitlink(&repo);
+    run(&repo.main, &["config", "diff.ignoreSubmodules", "all"]);
+    let first = git::fingerprint(&repo.main).unwrap();
+    std::fs::write(sm.join("f.txt"), "two\n").unwrap();
+    repo.commit_all(&sm, "sm moved");
+    assert_ne!(first, git::fingerprint(&repo.main).unwrap());
+}
+
+#[test]
+fn fingerprint_sees_a_dirty_submodule_despite_config() {
+    let repo = Repo::new();
+    let sm = add_gitlink(&repo);
+    run(&repo.main, &["config", "diff.ignoreSubmodules", "all"]);
+    let first = git::fingerprint(&repo.main).unwrap();
+    std::fs::write(sm.join("f.txt"), "dirty\n").unwrap();
+    assert_ne!(first, git::fingerprint(&repo.main).unwrap());
+}
+
+#[test]
+fn diff_keeps_a_patch_block_for_submodules_despite_config() {
+    let repo = Repo::new();
+    let sm = add_gitlink(&repo);
+    let head = run(&repo.main, &["rev-parse", "HEAD"]).trim().to_string();
+    std::fs::write(sm.join("f.txt"), "two\n").unwrap();
+    repo.commit_all(&sm, "sm moved");
+    run(&repo.main, &["config", "diff.submodule", "log"]);
+    run(&repo.main, &["config", "diff.ignoreSubmodules", "all"]);
+    let diff = git::diff(&repo.main, &head).unwrap();
+    let text = String::from_utf8_lossy(&diff);
+    assert!(text.contains("diff --git a/sm b/sm"), "{text}");
 }
