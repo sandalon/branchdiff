@@ -231,6 +231,69 @@ fn unquote(s: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+use crate::git::{self, GitError};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+
+/// Untracked files above this size are listed but not read, and show as binary.
+/// Holding one in memory costs about 3 times its size for log lines and 40 times
+/// for very short ones, on every reload, so a stray log could exhaust memory.
+pub const MAX_UNTRACKED_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Everything the worktree changed since `merge_base`, including untracked
+/// files. `cwd` must be the worktree root, as for `git::untracked`.
+pub fn load(cwd: &Path, merge_base: &str) -> Result<Vec<FileDiff>, GitError> {
+    let mut files = parse(&git::diff(cwd, merge_base)?);
+    for path in git::untracked(cwd)? {
+        files.push(untracked_file(cwd, path));
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+fn untracked_file(cwd: &Path, path: String) -> FileDiff {
+    let mut f = FileDiff::empty();
+    f.status = Status::Untracked;
+    let full = cwd.join(&path);
+    let mut hasher = DefaultHasher::new();
+    // Only regular files are opened: a symlink shows its target, as it does in
+    // a patch, and following one to a FIFO or `/dev/zero` would hang the worker.
+    // Other paths, such as a nested repository's `nest/`, have no content.
+    let bytes = match std::fs::symlink_metadata(&full) {
+        Ok(m) if m.is_symlink() => {
+            std::fs::read_link(&full).map(|t| t.into_os_string().into_encoded_bytes()).unwrap_or_default()
+        }
+        Ok(m) if m.is_file() && m.len() > MAX_UNTRACKED_BYTES => {
+            (m.len(), m.modified().ok()).hash(&mut hasher);
+            f.binary = true;
+            Vec::new()
+        }
+        Ok(m) if m.is_file() => std::fs::read(&full).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    bytes.hash(&mut hasher);
+    f.content_id = Some(format!("{:x}", hasher.finish()));
+    // Same heuristic git uses: a NUL in the first 8000 bytes means binary.
+    f.binary |= bytes.iter().take(8000).any(|b| *b == 0);
+    if !f.binary {
+        let text = String::from_utf8_lossy(&bytes);
+        // Not `lines()`, which drops the `\r` of CRLF that patch lines keep.
+        let lines: Vec<Line> = text.split_terminator('\n').enumerate().map(|(i, l)| Line {
+            kind: LineKind::Added,
+            old_no: None,
+            new_no: Some(i as u32 + 1),
+            text: l.to_string(),
+        }).collect();
+        f.added = lines.len() as u32;
+        if !lines.is_empty() {
+            f.hunks.push(Hunk { header: format!("@@ -0,0 +1,{} @@", lines.len()), lines });
+        }
+    }
+    f.path = path;
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

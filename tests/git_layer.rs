@@ -405,3 +405,145 @@ fn diff_keeps_a_patch_block_for_submodules_despite_config() {
     let text = String::from_utf8_lossy(&diff);
     assert!(text.contains("diff --git a/sm b/sm"), "{text}");
 }
+
+use branchdiff::diff::{self, Status};
+
+fn loaded(cwd: &std::path::Path) -> Vec<diff::FileDiff> {
+    let mb = git::merge_base(cwd, "develop").unwrap();
+    diff::load(cwd, &mb).unwrap()
+}
+
+#[test]
+fn includes_committed_and_uncommitted_changes() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    repo.commit_all(&wt, "c");
+    std::fs::write(wt.join("a.txt"), "one\ntwo\nthree\ndirty\n").unwrap();
+    let files = loaded(&wt);
+    assert_eq!((files.len(), files[0].added), (1, 2));
+}
+
+#[test]
+fn excludes_changes_only_on_the_base() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(repo.main.join("later.txt"), "x\n").unwrap();
+    repo.commit_all(&repo.main, "later");
+    assert!(loaded(&wt).is_empty());
+}
+
+#[test]
+fn shows_untracked_files_as_new_with_their_content() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("new.txt"), "hello\nworld\n").unwrap();
+    let files = loaded(&wt);
+    assert_eq!((files[0].status, files[0].path.as_str(), files[0].added), (Status::Untracked, "new.txt", 2));
+}
+
+#[test]
+fn respects_gitignore_for_untracked_files() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join(".gitignore"), "skip.txt\n").unwrap();
+    std::fs::write(wt.join("skip.txt"), "x\n").unwrap();
+    assert_eq!(loaded(&wt).iter().filter(|f| f.path == "skip.txt").count(), 0);
+}
+
+#[test]
+fn detects_renames() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    run(&wt, &["mv", "a.txt", "b.txt"]);
+    repo.commit_all(&wt, "mv");
+    let files = loaded(&wt);
+    assert_eq!((files[0].status, files[0].old_path.as_deref()), (Status::Renamed, Some("a.txt")));
+}
+
+#[test]
+fn flags_binary_files() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("b.dat"), [0u8, 1, 2]).unwrap();
+    repo.commit_all(&repo.main, "bin");
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("b.dat"), [3u8, 4, 0]).unwrap();
+    assert!(loaded(&wt)[0].binary);
+}
+
+#[test]
+fn flags_untracked_binary_files() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("n.dat"), [0u8, 159, 146]).unwrap();
+    assert!(loaded(&wt)[0].binary);
+}
+
+#[test]
+fn untracked_files_get_a_content_id_that_follows_their_bytes() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("n.dat"), [0u8, 1, 2]).unwrap();
+    let first = loaded(&wt)[0].content_id.clone();
+    assert!(first.is_some());
+    std::fs::write(wt.join("n.dat"), [0u8, 1, 3]).unwrap();
+    assert_ne!(first, loaded(&wt)[0].content_id);
+}
+
+#[test]
+fn ignores_user_diff_config_that_changes_output() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    run(&repo.main, &["config", "diff.mnemonicPrefix", "true"]);
+    run(&repo.main, &["config", "diff.noprefix", "true"]);
+    std::fs::write(wt.join("a.txt"), "changed\n").unwrap();
+    assert_eq!(loaded(&wt)[0].path, "a.txt");
+}
+
+/// The link is to a FIFO so that following it would hang, which is why this
+/// loads on a thread. A worker that hangs would stall its load forever.
+#[cfg(unix)]
+#[test]
+fn untracked_symlinks_show_their_target_and_are_not_followed() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    let status = std::process::Command::new("mkfifo").arg(wt.join("pipe")).status().unwrap();
+    assert!(status.success());
+    std::os::unix::fs::symlink("pipe", wt.join("link")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(loaded(&wt)));
+    let files = rx.recv_timeout(Duration::from_secs(10)).expect("load hung on a symlink");
+    let lines: Vec<_> = files[0].hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.as_str()).collect();
+    assert_eq!((files[0].path.as_str(), lines), ("link", vec!["pipe"]));
+}
+
+#[test]
+fn untracked_lines_keep_carriage_returns_like_patch_lines_do() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
+    let texts = |files: Vec<diff::FileDiff>| -> Vec<String> {
+        files[0].hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.clone()).collect()
+    };
+    let untracked = texts(loaded(&wt));
+    run(&wt, &["add", "-N", "crlf.txt"]);
+    assert_eq!(untracked, vec!["one\r", "two\r"]);
+    assert_eq!(untracked, texts(loaded(&wt)));
+}
+
+/// Sparse, so the test costs no disk. The start is text, so only the size can
+/// make this count as binary.
+#[test]
+fn oversized_untracked_files_are_not_read_but_still_change_their_content_id() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    let path = wt.join("big.log");
+    std::fs::write(&path, "x\n".repeat(5000)).unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_len(diff::MAX_UNTRACKED_BYTES + 1).unwrap();
+    let first = loaded(&wt).remove(0);
+    assert!(first.binary);
+    assert!(first.hunks.is_empty());
+    file.set_len(diff::MAX_UNTRACKED_BYTES + 2).unwrap();
+    assert_ne!(first.content_id, loaded(&wt)[0].content_id);
+}
