@@ -103,7 +103,8 @@ impl Pool {
         for _ in 0..threads {
             let (rx, msgs) = (rx.clone(), msgs.clone());
             // A failed spawn leaves a smaller pool, which is better than ending
-            // the program. If every spawn fails, `submit` discards all jobs.
+            // the program. If every spawn fails, `submit` discards all jobs and
+            // `Loads` holds each worktree as running for good.
             let _ = thread::Builder::new().name(WORKER_THREAD.into()).spawn(move || {
                 for job in rx {
                     if msgs.send(run(job)).is_err() {
@@ -121,19 +122,33 @@ impl Pool {
 }
 
 fn run(job: Job) -> Msg {
-    #[cfg(test)]
-    tests::arm_panic(&job);
     match job {
-        Job::ListWorktrees { cwd } => Msg::Worktrees(guarded(|| git::list_worktrees(&cwd))),
-        Job::ListBranches { cwd } => Msg::Branches(guarded(|| git::branches(&cwd))),
+        Job::ListWorktrees { cwd } => Msg::Worktrees(guarded(|| {
+            #[cfg(test)]
+            tests::panic_if_marked(&cwd);
+            git::list_worktrees(&cwd)
+        })),
+        Job::ListBranches { cwd } => Msg::Branches(guarded(|| {
+            #[cfg(test)]
+            tests::panic_if_marked(&cwd);
+            git::branches(&cwd)
+        })),
         Job::Load { path, base, generation } => {
-            let result = guarded(|| load(&path, &base));
+            let result = guarded(|| {
+                #[cfg(test)]
+                tests::panic_if_marked(&path);
+                load(&path, &base)
+            });
             Msg::Loaded { path, generation, result }
         }
         Job::Highlight { key, file_index, diffs } => {
             // An empty result still has to be sent: `main` tracks highlights in
             // flight, and one that never reported back would never run again.
-            let highlight = || Ok(diffs.get(file_index).map(crate::highlight::highlight_file).unwrap_or_default());
+            let highlight = || {
+                #[cfg(test)]
+                tests::panic_if_marked(&key.worktree);
+                Ok(diffs.get(file_index).map(crate::highlight::highlight_file).unwrap_or_default())
+            };
             let lines = guarded(highlight).unwrap_or_default();
             Msg::Highlighted { key, file_index, lines }
         }
@@ -146,16 +161,11 @@ fn guarded<T, F>(f: F) -> Result<T, GitError>
 where
     F: FnOnce() -> Result<T, GitError> + UnwindSafe,
 {
-    #[cfg(test)]
-    let f = move || {
-        tests::panic_if_armed();
-        f()
-    };
     catch_unwind(f).unwrap_or_else(|payload| Err(GitError::Failed(panic_text(payload.as_ref()))))
 }
 
-/// One short line for a worktree row. Worker panics print nothing, so this is
-/// all anyone sees of them.
+/// One short line for a worktree row. Once `main` installs the panic hook that
+/// skips workers (Task 16), this is all anyone sees of a worker panic.
 fn panic_text(payload: &(dyn Any + Send)) -> String {
     let message = payload.downcast_ref::<&str>().copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
@@ -179,28 +189,14 @@ fn load(path: &Path, base: &str) -> Result<Loaded, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::time::Duration;
 
     const PANIC_PATH: &str = "/branchdiff-test-panic";
 
-    thread_local! {
-        static PANIC_ARMED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Called by `run`, so that a job naming `PANIC_PATH` panics inside
-    /// `guarded`. No real job can be made to panic on demand.
-    pub(super) fn arm_panic(job: &Job) {
-        let path = match job {
-            Job::ListWorktrees { cwd } | Job::ListBranches { cwd } => cwd,
-            Job::Load { path, .. } => path,
-            Job::Highlight { key, .. } => &key.worktree,
-        };
-        PANIC_ARMED.set(path == Path::new(PANIC_PATH));
-    }
-
-    pub(super) fn panic_if_armed() {
-        if PANIC_ARMED.get() {
+    /// Called inside each job's work in `run`, so that removing `guarded` from
+    /// an arm kills the worker. No real job can be made to panic on demand.
+    pub(super) fn panic_if_marked(path: &Path) {
+        if path == Path::new(PANIC_PATH) {
             panic!("test panic on {}", thread::current().name().unwrap_or("an unnamed thread"));
         }
     }
@@ -298,6 +294,7 @@ mod tests {
     fn a_panic_without_a_usable_message_gets_a_generic_one() {
         assert_eq!(panic_text(&7), PANIC_NO_MESSAGE);
         assert_eq!(panic_text(&""), PANIC_NO_MESSAGE);
+        assert_eq!(panic_text(&"   "), PANIC_NO_MESSAGE);
     }
 
     #[test]
