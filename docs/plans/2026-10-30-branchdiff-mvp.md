@@ -3639,11 +3639,13 @@ use branchdiff::app::{App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
-use branchdiff::worker::{Generations, Job, Loads, Msg, Pool};
+use branchdiff::worker::{Generations, Job, Loads, Msg, Pool, WORKER_THREAD};
 use branchdiff::{editor, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::DefaultTerminal;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -3681,9 +3683,21 @@ fn main() -> Result<()> {
     let base = cli.base.or_else(|| configured_base(&info)).unwrap_or_else(|| "develop".into());
 
     let mut terminal = ratatui::init();
+    keep_terminal_on_worker_panic();
     let result = run(&mut terminal, info, base);
     ratatui::restore();
     result
+}
+
+/// ratatui's hook restores the terminal on a panic from any thread. Workers
+/// catch their own panics and carry on, so the app must keep its screen.
+fn keep_terminal_on_worker_panic() {
+    let ratatui_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() != Some(WORKER_THREAD) {
+            ratatui_hook(info);
+        }
+    }));
 }
 
 struct Runtime {
@@ -3879,7 +3893,9 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
     rt.paused.store(true, Ordering::SeqCst);
     ratatui::restore();
     let status = std::process::Command::new(&prog).args(&args).status();
-    *terminal = ratatui::init();
+    // Not `ratatui::init`, which would stack a new panic hook over ours.
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
     terminal.clear()?;
     rt.paused.store(false, Ordering::SeqCst);
     if let Err(e) = status {
