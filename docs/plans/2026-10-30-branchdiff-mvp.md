@@ -14,7 +14,7 @@
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ```
 
-**Requires:** git 2.31 or newer, for `rev-parse --path-format=absolute`.
+**Requires:** git 2.36 or newer, for `worktree list --porcelain -z`.
 
 **Status of this plan's code:** Git commands and output formats were probed against git 2.46, and the dependency set and the ratatui, notify and syntect calls were compiled. The rest of the code here has not been compiled. Treat it as the intended design and fix small API mismatches as you go, keeping the tests' intent.
 
