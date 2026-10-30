@@ -691,7 +691,7 @@ pub struct FileDiff {
 
 impl FileDiff {
     fn empty() -> Self {
-        Self { path: String::new(), old_path: None, status: Status::Modified, binary: false, added: 0, removed: 0, hunks: Vec::new() }
+        Self { path: String::new(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 0, removed: 0, hunks: Vec::new() }
     }
 }
 
@@ -954,6 +954,8 @@ Add to `src/diff.rs` above the tests module:
 
 ```rust
 use crate::git::{self, GitError};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 /// Everything the worktree changed since `merge_base`, including untracked files.
@@ -970,6 +972,9 @@ fn untracked_file(cwd: &Path, path: String) -> FileDiff {
     let mut f = FileDiff::empty();
     f.status = Status::Untracked;
     let bytes = std::fs::read(cwd.join(&path)).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    f.content_id = Some(format!("{:x}", hasher.finish()));
     // Same heuristic git uses: a NUL in the first 8000 bytes means binary.
     if bytes.iter().take(8000).any(|b| *b == 0) {
         f.binary = true;
@@ -1242,7 +1247,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn comment(body: &str) -> Comment {
-        Comment { path: "a.rs".into(), line: 3, line_text: "let x = 1;".into(), body: body.into() }
+        Comment { path: "a.rs".into(), line: 3, side: Side::New, line_text: "let x = 1;".into(), body: body.into() }
     }
 
     #[test]
@@ -1328,10 +1333,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Which file version `Comment::line` counts in. A replaced line has the
+/// same number on both sides, so the number alone is ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Side { Old, New }
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     pub path: String,
     pub line: u32,
+    pub side: Side,
     pub line_text: String,
     pub body: String,
 }
@@ -1436,7 +1447,7 @@ mod tests {
     use super::*;
 
     fn c(path: &str, line: u32, body: &str) -> Comment {
-        Comment { path: path.into(), line, line_text: "code".into(), body: body.into() }
+        Comment { path: path.into(), line, side: Side::New, line_text: "code".into(), body: body.into() }
     }
 
     #[test]
@@ -1455,6 +1466,13 @@ mod tests {
     }
 
     #[test]
+    fn marks_comments_on_removed_lines() {
+        let mut comment = c("a.rs", 2, "why remove this");
+        comment.side = Side::Old;
+        assert!(render("feat", "develop", &[comment]).contains("Line 2 (removed)"));
+    }
+
+    #[test]
     fn empty_comments_render_empty() {
         assert_eq!(render("feat", "develop", &[]), "");
     }
@@ -1469,7 +1487,7 @@ Expected: FAIL to compile.
 **Step 3: Implement**
 
 ```rust
-use crate::store::Comment;
+use crate::store::{Comment, Side};
 use std::collections::BTreeMap;
 
 pub fn render(branch: &str, base: &str, comments: &[Comment]) -> String {
@@ -1485,7 +1503,8 @@ pub fn render(branch: &str, base: &str, comments: &[Comment]) -> String {
         items.sort_by_key(|c| c.line);
         out.push_str(&format!("\n### `{path}`\n"));
         for c in items {
-            out.push_str(&format!("\n- Line {}: `{}`\n  {}\n", c.line, c.line_text.trim(), c.body));
+            let removed = if c.side == Side::Old { " (removed)" } else { "" };
+            out.push_str(&format!("\n- Line {}{removed}: `{}`\n  {}\n", c.line, c.line_text.trim(), c.body));
         }
     }
     out
@@ -1531,7 +1550,7 @@ mod tests {
     }
 
     fn file(path: &str) -> FileDiff {
-        FileDiff { path: path.into(), old_path: None, status: Status::Modified, binary: false, added: 1, removed: 0, hunks: vec![] }
+        FileDiff { path: path.into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0, hunks: vec![] }
     }
 
     fn app(names: &[&str]) -> App {
@@ -1944,7 +1963,7 @@ Add to the `tests` module in `src/app.rs`:
 
     fn file_with_line(text: &str) -> FileDiff {
         FileDiff {
-            path: "a.rs".into(), old_path: None, status: Status::Modified, binary: false, added: 1, removed: 0,
+            path: "a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0,
             hunks: vec![Hunk {
                 header: "@@ -0,0 +1 @@".into(),
                 lines: vec![Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: text.into() }],
@@ -2040,6 +2059,37 @@ Add to the `tests` module in `src/app.rs`:
     }
 
     #[test]
+    fn comment_on_a_replaced_line_is_not_outdated() {
+        let mut replaced = file_with_line("TWO");
+        replaced.hunks[0].lines = vec![
+            Line { kind: LineKind::Removed, old_no: Some(1), new_no: None, text: "two".into() },
+            Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: "TWO".into() },
+        ];
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", 0, vec![replaced]);
+        a.focus = Focus::Diff;
+        press(&mut a, 'j');
+        press(&mut a, 'j');
+        type_comment(&mut a, "fix");
+        assert_eq!(a.current().unwrap().review.comments[0].side, crate::store::Side::New);
+        assert_eq!(a.outdated_comments(), 0);
+    }
+
+    #[test]
+    fn changing_a_binary_file_resets_its_reviewed_mark() {
+        let binary = |id: &str| FileDiff {
+            path: "b.dat".into(), old_path: None, status: Status::Modified, binary: true,
+            content_id: Some(id.into()), added: 0, removed: 0, hunks: vec![],
+        };
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", 0, vec![binary("1..2")]);
+        press(&mut a, 'x');
+        assert!(a.is_reviewed(0));
+        deliver(&mut a, "a", 0, vec![binary("1..3")]);
+        assert!(!a.is_reviewed(0));
+    }
+
+    #[test]
     fn y_copies_and_shift_y_writes_the_export() {
         let mut a = app_on_line();
         type_comment(&mut a, "fix");
@@ -2087,7 +2137,7 @@ Add to `App` the field `pub input: Option<Input>`, initialised to `None`, and th
 ```rust
 /// A text prompt. While set, keys go here rather than to hotkeys.
 pub enum Input {
-    Comment { path: String, line: u32, line_text: String, text: String },
+    Comment { path: String, line: u32, side: Side, line_text: String, text: String },
 }
 ```
 
@@ -2134,9 +2184,13 @@ Add these methods:
             self.notice = Some("Move to a diff line to comment".into());
             return;
         };
-        let Some(no) = line.new_no.or(line.old_no) else { return };
+        let (no, side) = match (line.new_no, line.old_no) {
+            (Some(n), _) => (n, Side::New),
+            (None, Some(o)) => (o, Side::Old),
+            (None, None) => return,
+        };
         let line_text = line.text.clone();
-        self.input = Some(Input::Comment { path, line: no, line_text, text: String::new() });
+        self.input = Some(Input::Comment { path, line: no, side, line_text, text: String::new() });
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -2146,10 +2200,11 @@ Add these methods:
             KeyCode::Backspace => { text.pop(); }
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => {
-                if let Some(Input::Comment { path, line, line_text, text }) = self.input.take() {
+                if let Some(Input::Comment { path, line, side, line_text, text }) = self.input.take() {
                     if !text.trim().is_empty() {
                         if let Some(s) = self.current_mut() {
-                            s.review.comments.push(Comment { path, line, line_text, body: text });
+                            s.review.comments.push(Comment { path, line, side, line_text, body: text });
+                            s.outdated = count_outdated(s);
                             return vec![Effect::SaveReview];
                         }
                     }
@@ -2177,19 +2232,9 @@ Add these methods:
         s.review.reviewed.get(&f.path) == Some(&content_hash(f))
     }
 
-    /// Counts comments whose line text is no longer at that line in the diff.
+    /// Counted on load and when comments change, because this runs every frame.
     pub fn outdated_comments(&self) -> usize {
-        let Some(s) = self.current() else { return 0 };
-        let Some(diffs) = s.diffs.as_ref() else { return 0 };
-        s.review.comments.iter().filter(|c| {
-            // Filter rather than find: a typechange gives two entries with one path.
-            let current = diffs.iter()
-                .filter(|f| f.path == c.path)
-                .flat_map(|f| f.hunks.iter().flat_map(|h| &h.lines))
-                .find(|l| l.new_no.or(l.old_no) == Some(c.line))
-                .map(|l| l.text.as_str());
-            c.is_outdated(current)
-        }).count()
+        self.current().map_or(0, |s| s.outdated)
     }
 
     fn export(&mut self, effect: fn(String) -> Effect) -> Vec<Effect> {
@@ -2213,16 +2258,41 @@ Add these methods:
     }
 ```
 
-Add this free function and imports:
+Add `pub outdated: usize` to `WorktreeState`, and `s.outdated = count_outdated(s);` in the `Ok(l)` arm of `Msg::Loaded`, after `s.diffs` is set.
+
+Add these free functions and imports:
 
 ```rust
-use crate::store::Comment;
+use crate::store::{Comment, Side};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+/// Identifies a file's content cheaply, since this runs for visible files on
+/// every frame. Files with no `content_id` are mode-only or pure renames, and
+/// only those fall back to hashing hunks.
 fn content_hash(file: &crate::diff::FileDiff) -> u64 {
     let mut h = DefaultHasher::new();
-    file.hunks.hash(&mut h);
+    match &file.content_id {
+        Some(id) => id.hash(&mut h),
+        None => file.hunks.hash(&mut h),
+    }
     h.finish()
+}
+
+/// Counts comments whose line text is no longer at that line in the diff.
+fn count_outdated(s: &WorktreeState) -> usize {
+    let Some(diffs) = s.diffs.as_ref() else { return 0 };
+    s.review.comments.iter().filter(|c| {
+        // Filter rather than find: a typechange gives two entries with one path.
+        let current = diffs.iter()
+            .filter(|f| f.path == c.path)
+            .flat_map(|f| f.hunks.iter().flat_map(|h| &h.lines))
+            .find(|l| match c.side {
+                Side::New => l.new_no == Some(c.line),
+                Side::Old => l.new_no.is_none() && l.old_no == Some(c.line),
+            })
+            .map(|l| l.text.as_str());
+        c.is_outdated(current)
+    }).count()
 }
 ```
 
@@ -2351,7 +2421,7 @@ Add `ListBranches` to `Effect` and new variants to `Input`:
 
 ```rust
 pub enum Input {
-    Comment { path: String, line: u32, line_text: String, text: String },
+    Comment { path: String, line: u32, side: Side, line_text: String, text: String },
     Worktree { query: String },
     Base { query: String, branches: Vec<String> },
 }
@@ -2389,9 +2459,10 @@ Replace `handle_input_key`:
 
     fn submit_input(&mut self) -> Vec<Effect> {
         match self.input.take() {
-            Some(Input::Comment { path, line, line_text, text }) if !text.trim().is_empty() => {
+            Some(Input::Comment { path, line, side, line_text, text }) if !text.trim().is_empty() => {
                 if let Some(s) = self.current_mut() {
-                    s.review.comments.push(Comment { path, line, line_text, body: text });
+                    s.review.comments.push(Comment { path, line, side, line_text, body: text });
+                    s.outdated = count_outdated(s);
                     return vec![Effect::SaveReview];
                 }
             }
@@ -2484,7 +2555,7 @@ mod tests {
 
     fn file(path: &str, text: &str) -> FileDiff {
         FileDiff {
-            path: path.into(), old_path: None, status: Status::Added, binary: false, added: 1, removed: 0,
+            path: path.into(), old_path: None, status: Status::Added, binary: false, content_id: None, added: 1, removed: 0,
             hunks: vec![Hunk {
                 header: "@@ -0,0 +1 @@".into(),
                 lines: vec![Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: text.into() }],
@@ -2504,6 +2575,14 @@ mod tests {
     fn unknown_extension_yields_one_plain_span() {
         let out = highlight_file(&file("a.unknownext", "text"));
         assert_eq!(out.hunks[0][0].len(), 1);
+    }
+
+    #[test]
+    fn files_over_the_line_limit_stay_plain() {
+        let mut big = file("a.rs", "fn main() {}");
+        let line = big.hunks[0].lines[0].clone();
+        big.hunks[0].lines = vec![line; MAX_FILE_LINES + 1];
+        assert_eq!(highlight_file(&big).hunks[0][0].len(), 1);
     }
 
     #[test]
@@ -2556,6 +2635,7 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 pub const MAX_LINE_LEN: usize = 2_000;
+pub const MAX_FILE_LINES: usize = 50_000;
 
 pub type Span = (Color, String);
 
@@ -2577,7 +2657,8 @@ fn assets() -> &'static (SyntaxSet, Theme) {
 pub fn highlight_file(file: &FileDiff) -> HighlightedFile {
     let (syntaxes, theme) = assets();
     let ext = file.path.rsplit('.').next().unwrap_or("");
-    let syntax = syntaxes.find_syntax_by_extension(ext);
+    let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+    let syntax = if lines > MAX_FILE_LINES { None } else { syntaxes.find_syntax_by_extension(ext) };
     let hunks = file.hunks.iter().map(|hunk| {
         let mut state = syntax.map(|s| HighlightLines::new(s, theme));
         hunk.lines.iter().map(|line| {
@@ -2669,7 +2750,7 @@ use std::sync::Arc;
 
 fn sample_file() -> FileDiff {
     FileDiff {
-        path: "src/a.rs".into(), old_path: None, status: Status::Modified, binary: false, added: 1, removed: 1,
+        path: "src/a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 1,
         hunks: vec![Hunk {
             header: "@@ -1,2 +1,2 @@".into(),
             lines: vec![
@@ -3761,7 +3842,7 @@ const BUDGET: Duration = Duration::from_millis(16);
 
 fn big_diff() -> Vec<FileDiff> {
     (0..FILES).map(|f| FileDiff {
-        path: format!("src/module_{f}.rs"), old_path: None, status: Status::Modified, binary: false,
+        path: format!("src/module_{f}.rs"), old_path: None, status: Status::Modified, binary: false, content_id: None,
         added: LINES as u32, removed: 0,
         hunks: vec![Hunk {
             header: format!("@@ -0,0 +1,{LINES} @@"),
@@ -3857,11 +3938,15 @@ use branchdiff::diff;
 use criterion::{criterion_group, criterion_main, Criterion};
 
 fn parse_large_patch(c: &mut Criterion) {
+    const LINES: usize = 400;
     let mut patch = String::new();
     for f in 0..5_000 {
-        patch.push_str(&format!("diff --git a/f{f} b/f{f}\n--- a/f{f}\n+++ b/f{f}\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n"));
+        patch.push_str(&format!("diff --git a/f{f} b/f{f}\n--- a/f{f}\n+++ b/f{f}\n@@ -1,{LINES} +1,{LINES} @@\n"));
+        for i in 0..LINES {
+            patch.push_str(&format!(" let value_{i} = compute_the_thing({i}, \"some typical line of code\");\n"));
+        }
     }
-    c.bench_function("parse 5000 files", |b| b.iter(|| diff::parse(patch.as_bytes())));
+    c.bench_function("parse about 100 MB", |b| b.iter(|| diff::parse(patch.as_bytes())));
 }
 
 criterion_group!(benches, parse_large_patch);
@@ -3869,7 +3954,7 @@ criterion_main!(benches);
 ```
 
 Run: `cargo bench`
-Expected: completes and reports a time for `parse 5000 files`.
+Expected: completes and reports a time for `parse about 100 MB`, which was about 0.2 s when measured in review.
 
 **Step 5: Commit**
 
