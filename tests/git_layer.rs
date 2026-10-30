@@ -1,6 +1,7 @@
 mod common;
 use branchdiff::git::{self, GitError};
 use common::{git as run, Repo};
+use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
 fn discovers_common_dir_from_linked_worktree() {
@@ -171,4 +172,48 @@ fn inherited_git_dir_child() {
     let info = git::discover(&std::env::current_dir().unwrap()).unwrap();
     let expected = std::path::PathBuf::from(expected);
     assert_eq!(info.common_dir.canonicalize().unwrap(), expected.canonicalize().unwrap());
+}
+
+fn set_mtime(path: &std::path::Path, secs: u64) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+}
+
+#[test]
+fn diff_never_writes_the_index() {
+    let repo = Repo::new();
+    let head = run(&repo.main, &["rev-parse", "HEAD"]).trim().to_string();
+    set_mtime(&repo.main.join("a.txt"), 1_000_000_000);
+    let index = repo.main.join(".git/index");
+    let before = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+
+    assert!(git::diff(&repo.main, &head).unwrap().is_empty());
+
+    let after = (std::fs::read(&index).unwrap(), std::fs::metadata(&index).unwrap().modified().unwrap());
+    assert!(before == after, "git diff rewrote the index");
+}
+
+#[test]
+fn diff_output_ignores_user_config() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("a.txt"), "1\n\n3\n4\n5\n").unwrap();
+    std::fs::write(repo.main.join("z.txt"), "1\n2\n3\n4\n5\n").unwrap();
+    repo.commit_all(&repo.main, "base");
+    let head = run(&repo.main, &["rev-parse", "HEAD"]).trim().to_string();
+    std::fs::write(repo.main.join("a.txt"), "1\n\n3\nchanged\n5\n").unwrap();
+    std::fs::write(repo.main.join("z.txt"), "1\n2\nchanged\n4\n5\n").unwrap();
+    let plain = git::diff(&repo.main, &head).unwrap();
+
+    let order = repo.main.parent().unwrap().join("order");
+    std::fs::write(&order, "z.txt\na.txt\n").unwrap();
+    for (key, value) in [
+        ("diff.suppressBlankEmpty", "true"),
+        ("diff.context", "1"),
+        ("diff.orderFile", order.to_str().unwrap()),
+        ("diff.noprefix", "true"),
+    ] {
+        run(&repo.main, &["config", key, value]);
+        let configured = git::diff(&repo.main, &head).unwrap();
+        assert_eq!(String::from_utf8_lossy(&configured), String::from_utf8_lossy(&plain), "with {key}");
+    }
 }

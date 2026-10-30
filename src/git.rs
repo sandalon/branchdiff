@@ -86,8 +86,12 @@ where
     }
     let out = cmd
         .current_dir(cwd)
-        // Keeps paths unquoted so the patch parser sees real names.
+        // Keeps non-ASCII paths readable. Names with tabs or quotes are still
+        // C-quoted, and the patch parser handles those.
         .args(["-c", "core.quotePath=false"])
+        // Stops `git diff` refreshing the index, which takes `index.lock` and
+        // can race a concurrent `git add`. GIT_OPTIONAL_LOCKS does not cover it.
+        .args(["-c", "diff.autoRefreshIndex=false"])
         .args(args)
         // Stops `git status` rewriting the index, which the watcher would see.
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -215,12 +219,18 @@ pub fn untracked(cwd: &Path) -> Result<Vec<String>, GitError> {
     Ok(text.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
 }
 
-/// Diff from `merge_base` to the working tree, with config that would change
-/// the output format turned off.
+/// Diff from `merge_base` to the working tree. Pins the config known to change
+/// the patch format, so the parser sees the same shape under most user config.
 pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
     let out = run(cwd, [
+        "-c", "diff.suppressBlankEmpty=false",
         "diff", "-M", "--no-color", "--no-ext-diff", "--no-textconv",
-        "--src-prefix=a/", "--dst-prefix=b/", merge_base,
+        "--src-prefix=a/", "--dst-prefix=b/", "-U3", "--inter-hunk-context=0",
+        "--no-relative", "--submodule=short", "--ignore-submodules=none",
+        // Overrides `diff.orderFile`. On Windows this relies on git's own
+        // mapping of /dev/null, which is unverified until CI runs there.
+        "-O/dev/null",
+        "--end-of-options", merge_base, "--",
     ])?;
     if out.code == Some(0) { Ok(out.stdout) } else { Err(GitError::Failed(out.stderr)) }
 }
