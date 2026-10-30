@@ -1105,6 +1105,15 @@ mod tests {
     }
 
     #[test]
+    fn highlighting_a_missing_file_gives_an_empty_result() {
+        let (tx, rx) = unbounded();
+        let pool = Pool::new(1, tx);
+        let key = CacheKey { worktree: "a".into(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
+        pool.submit(Job::Highlight { key, file_index: 0, diffs: Arc::new(vec![]) });
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Msg::Highlighted { .. }));
+    }
+
+    #[test]
     fn only_one_load_runs_per_worktree() {
         let (gens, mut loads) = (Generations::default(), Loads::default());
         assert!(loads.request(&gens, "a".into(), "develop".into()).is_some());
@@ -1267,7 +1276,7 @@ fn run(job: Job) -> Msg {
             Msg::Loaded { path, generation, result }
         }
         Job::Highlight { key, file_index, diffs } => {
-            let lines = crate::highlight::highlight_file(&diffs[file_index]);
+            let lines = diffs.get(file_index).map(crate::highlight::highlight_file).unwrap_or_default();
             Msg::Highlighted { key, file_index, lines }
         }
     }
@@ -1301,7 +1310,7 @@ pub fn highlight_file(_file: &FileDiff) -> HighlightedFile {
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib worker`
-Expected: 6 passed.
+Expected: 7 passed.
 
 **Step 5: Commit**
 
@@ -2775,12 +2784,16 @@ Add `Effect::Highlight { key: CacheKey, file_index: usize, diffs: Diffs }` to `a
     /// Requests colour for the current file if it does not have it yet.
     pub fn highlight_effect(&self) -> Option<Effect> {
         let s = self.current()?;
+        // A worktree with no changes has no file to highlight.
+        s.diffs.as_ref()?.get(s.file)?;
         if s.highlights.contains_key(&s.file) {
             return None;
         }
         Some(Effect::Highlight { key: s.key.clone()?, file_index: s.file, diffs: s.diffs.clone()? })
     }
 ```
+
+Add a test in `src/app.rs` that `highlight_effect` returns `None` for a worktree whose loaded diff is empty, using `deliver(&mut a, "a", 0, vec![])`.
 
 Handle the message, ignoring results for a superseded diff:
 
