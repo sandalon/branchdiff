@@ -3882,6 +3882,8 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
                     let loaded = rt.store.load(&id);
                     if let Some(path) = loaded.moved_aside {
                         app.notice = Some(format!("Review could not be read, kept at {}", path.display()));
+                    } else if let Some(path) = loaded.left_in_place {
+                        app.notice = Some(format!("Review could not be read or moved, still at {}", path.display()));
                     }
                     app.set_review(i, loaded.review);
                 }
