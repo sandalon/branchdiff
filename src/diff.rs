@@ -240,21 +240,33 @@ use std::path::Path;
 
 /// Untracked files above this size are listed but not read, and show as binary.
 /// Holding one in memory costs about 3 times its size for log lines and 40 times
-/// for very short ones, on every reload, so a stray log could exhaust memory.
+/// for very short ones, on every reload. This bounds a single file, and
+/// `MAX_UNTRACKED_TOTAL_BYTES` bounds what many of them cost together.
 pub const MAX_UNTRACKED_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What one load may spend on untracked files, charged in `git ls-files` order
+/// so the same files are read every time. Once it is spent, the remaining files
+/// show as over `MAX_UNTRACKED_BYTES` without being read. The file that spends
+/// the last of it is still kept, so one file's cost can come on top of this.
+pub const MAX_UNTRACKED_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+
+/// Charged per line on top of its bytes: `size_of::<Line>()` plus the smallest heap block.
+const LINE_OVERHEAD_BYTES: usize = 64;
 
 /// Everything the worktree changed since `merge_base`, including untracked
 /// files. `cwd` must be the worktree root, as for `git::untracked`.
 pub fn load(cwd: &Path, merge_base: &str) -> Result<Vec<FileDiff>, GitError> {
     let mut files = parse(&git::diff(cwd, merge_base)?);
-    for path in git::untracked(cwd)? {
-        files.push(untracked_file(cwd, path));
-    }
+    files.extend(untracked_files(cwd, MAX_UNTRACKED_TOTAL_BYTES)?);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
-fn untracked_file(cwd: &Path, path: String) -> FileDiff {
+fn untracked_files(cwd: &Path, mut budget: usize) -> Result<Vec<FileDiff>, GitError> {
+    Ok(git::untracked(cwd)?.into_iter().map(|path| untracked_file(cwd, path, &mut budget)).collect())
+}
+
+fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
     let mut f = FileDiff::empty();
     f.status = Status::Untracked;
     let full = cwd.join(&path);
@@ -266,7 +278,7 @@ fn untracked_file(cwd: &Path, path: String) -> FileDiff {
         Ok(m) if m.is_symlink() => {
             std::fs::read_link(&full).map(|t| t.into_os_string().into_encoded_bytes()).unwrap_or_default()
         }
-        _ => match read_regular(&full) {
+        _ => match read_regular(&full, budget) {
             Ok(Regular::Bytes(bytes)) => bytes,
             Ok(Regular::OverCap(m)) => {
                 (m.len(), m.modified().ok()).hash(&mut hasher);
@@ -289,6 +301,7 @@ fn untracked_file(cwd: &Path, path: String) -> FileDiff {
             new_no: Some(i as u32 + 1),
             text: l.to_string(),
         }).collect();
+        *budget = budget.saturating_sub(lines.len().saturating_mul(LINE_OVERHEAD_BYTES));
         f.added = lines.len() as u32;
         if !lines.is_empty() {
             // Like git, which leaves out a count of 1.
@@ -300,7 +313,6 @@ fn untracked_file(cwd: &Path, path: String) -> FileDiff {
     f
 }
 
-#[derive(Debug)]
 enum Regular {
     /// The content of a file within the cap, or nothing for any other kind of path.
     Bytes(Vec<u8>),
@@ -308,24 +320,25 @@ enum Regular {
     OverCap(Metadata),
 }
 
-fn read_regular(path: &Path) -> io::Result<Regular> {
+fn read_regular(path: &Path, budget: &mut usize) -> io::Result<Regular> {
     let file = open_untracked(path)?;
     let meta = file.metadata()?;
-    read_handle(file, meta)
+    read_handle(file, meta, budget)
 }
 
 /// `meta` comes from `file` itself, not from the path, which can change at any time.
-fn read_handle(mut file: File, meta: Metadata) -> io::Result<Regular> {
+fn read_handle(mut file: File, meta: Metadata, budget: &mut usize) -> io::Result<Regular> {
     if !meta.is_file() {
         return Ok(Regular::Bytes(Vec::new()));
     }
-    if meta.len() > MAX_UNTRACKED_BYTES {
+    if meta.len() > MAX_UNTRACKED_BYTES || *budget == 0 {
         return Ok(Regular::OverCap(meta));
     }
     // Bounded because the file can grow after `meta` was taken. What was read of
     // a file that did is thrown away, so its ID never depends on where it stopped.
     let mut bytes = Vec::new();
     file.by_ref().take(MAX_UNTRACKED_BYTES + 1).read_to_end(&mut bytes)?;
+    *budget = budget.saturating_sub(bytes.len());
     if bytes.len() as u64 > MAX_UNTRACKED_BYTES {
         return Ok(Regular::OverCap(file.metadata().unwrap_or(meta)));
     }
@@ -364,7 +377,7 @@ mod tests {
         mkfifo(&fifo);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(read_regular(&fifo));
+            let _ = tx.send(read_regular(&fifo, &mut usize::MAX.clone()));
         });
         let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("blocked on a FIFO");
         assert!(matches!(result, Ok(Regular::Bytes(b)) if b.is_empty()));
@@ -378,7 +391,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("secret"), "x\n").unwrap();
         std::os::unix::fs::symlink("secret", dir.path().join("link")).unwrap();
-        assert!(read_regular(&dir.path().join("link")).is_err());
+        assert!(read_regular(&dir.path().join("link"), &mut usize::MAX.clone()).is_err());
     }
 
     #[test]
@@ -389,8 +402,86 @@ mod tests {
         let file = File::open(&path).unwrap();
         let stale = file.metadata().unwrap();
         File::options().write(true).open(&path).unwrap().set_len(MAX_UNTRACKED_BYTES + 1).unwrap();
-        let result = read_handle(file, stale).unwrap();
+        let mut budget = usize::MAX;
+        let result = read_handle(file, stale, &mut budget).unwrap();
         assert!(matches!(result, Regular::OverCap(m) if m.len() == MAX_UNTRACKED_BYTES + 1));
+        assert_eq!(usize::MAX - budget, MAX_UNTRACKED_BYTES as usize + 1, "what was read still costs");
+    }
+
+    #[test]
+    fn a_file_exactly_at_the_cap_is_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("log");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_UNTRACKED_BYTES).unwrap();
+        let file = File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let result = read_handle(file, meta, &mut usize::MAX.clone()).unwrap();
+        assert!(matches!(result, Regular::Bytes(b) if b.len() as u64 == MAX_UNTRACKED_BYTES));
+    }
+
+    /// An unborn repository is enough, since `git ls-files --others` needs no commits.
+    fn untracked_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(git::run(dir.path(), ["init", "-q"]).unwrap().code, Some(0));
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        dir
+    }
+
+    /// Each file costs 5 bytes plus one line.
+    const FOUR_FILES: [(&str, &[u8]); 4] =
+        [("d.txt", b"dddd\n"), ("c.txt", b"cccc\n"), ("b.txt", b"bbbb\n"), ("a.txt", b"aaaa\n")];
+    const ONE_FILE_COST: usize = 5 + LINE_OVERHEAD_BYTES;
+
+    fn read_paths(files: &[FileDiff]) -> Vec<&str> {
+        files.iter().filter(|f| !f.binary).map(|f| f.path.as_str()).collect()
+    }
+
+    #[test]
+    fn the_budget_is_spent_on_bytes_and_lines_in_path_order() {
+        let dir = untracked_repo(&FOUR_FILES);
+        let spent_after_two = untracked_files(dir.path(), 2 * ONE_FILE_COST).unwrap();
+        assert_eq!(read_paths(&spent_after_two), ["a.txt", "b.txt"]);
+        let one_byte_more = untracked_files(dir.path(), 2 * ONE_FILE_COST + 1).unwrap();
+        assert_eq!(read_paths(&one_byte_more), ["a.txt", "b.txt", "c.txt"], "the last file may overshoot");
+    }
+
+    #[test]
+    fn files_past_the_budget_show_as_over_cap_with_a_content_id() {
+        let dir = untracked_repo(&FOUR_FILES);
+        let files = untracked_files(dir.path(), 1).unwrap();
+        for f in &files[1..] {
+            assert!(f.binary && f.hunks.is_empty() && f.content_id.is_some(), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_files_are_read_on_every_load() {
+        let dir = untracked_repo(&FOUR_FILES);
+        let first = untracked_files(dir.path(), 2 * ONE_FILE_COST).unwrap();
+        assert_eq!(read_paths(&first), ["a.txt", "b.txt"]);
+        for _ in 0..3 {
+            assert_eq!(first, untracked_files(dir.path(), 2 * ONE_FILE_COST).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_binary_file_spends_budget_though_it_is_not_kept() {
+        let dir = untracked_repo(&[("a.bin", &[0; 100]), ("b.txt", b"x\n")]);
+        let spent = untracked_files(dir.path(), 100).unwrap();
+        assert_eq!((spent[0].binary, spent[1].binary), (true, true));
+        assert!(!untracked_files(dir.path(), 101).unwrap()[1].binary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_still_shows_its_target_once_the_budget_is_spent() {
+        let dir = untracked_repo(&[("a.txt", b"aaaa\n")]);
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link")).unwrap();
+        let files = untracked_files(dir.path(), 1).unwrap();
+        assert_eq!(files[1].hunks[0].lines[0].text, "a.txt");
     }
 
     const MODIFY: &str = "diff --git a/a.txt b/a.txt\nindex 814f4a4..475bbc3 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+three\n";
