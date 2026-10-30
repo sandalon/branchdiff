@@ -145,3 +145,30 @@ fn merge_base_prefers_no_commits_on_orphan_worktree_with_missing_base() {
     run(&wt, &["checkout", "-q", "--orphan", "lonely"]);
     assert_eq!(git::merge_base(&wt, "nope"), Err(GitError::NoCommits));
 }
+
+const CHILD_COMMON_DIR: &str = "BRANCHDIFF_TEST_COMMON_DIR";
+
+#[test]
+fn run_ignores_inherited_git_dir() {
+    let repo = Repo::new();
+    let other = Repo::new();
+    let child = "inherited_git_dir_child";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", child])
+        .current_dir(&repo.main)
+        .env("GIT_DIR", other.main.join(".git"))
+        .env(CHILD_COMMON_DIR, repo.main.join(".git"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}");
+}
+
+#[test]
+#[ignore = "run in a child process by run_ignores_inherited_git_dir"]
+fn inherited_git_dir_child() {
+    let Some(expected) = std::env::var_os(CHILD_COMMON_DIR) else { return };
+    let info = git::discover(&std::env::current_dir().unwrap()).unwrap();
+    let expected = std::path::PathBuf::from(expected);
+    assert_eq!(info.common_dir.canonicalize().unwrap(), expected.canonicalize().unwrap());
+}

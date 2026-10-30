@@ -1,15 +1,33 @@
 #![allow(dead_code)]
+use branchdiff::git::REPO_ENV_VARS;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use tempfile::TempDir;
+
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 pub struct Repo {
     _dir: TempDir,
     pub main: PathBuf,
 }
 
+/// Runs git with no inherited repository state or user config, because these
+/// tests may themselves run from a linked worktree or a git hook.
+pub fn git_unchecked(cwd: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new("git");
+    for var in REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.current_dir(cwd)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
 pub fn git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let out = git_unchecked(cwd, args);
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap()
 }

@@ -44,6 +44,28 @@ pub struct Worktree {
     pub branch: Option<String>,
 }
 
+/// Repository-scoped variables that git sets for hooks and aliases. Inherited
+/// values would point every command at the wrong repository.
+pub const REPO_ENV_VARS: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_DIFF_OPTS",
+    "GIT_EXTERNAL_DIFF",
+];
+
 pub struct Output {
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
@@ -58,7 +80,11 @@ where
     if !cwd.is_dir() {
         return Err(GitError::Failed(format!("{} no longer exists", cwd.display())));
     }
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    for var in REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .current_dir(cwd)
         // Keeps paths unquoted so the patch parser sees real names.
         .args(["-c", "core.quotePath=false"])
@@ -67,6 +93,8 @@ where
         .env("GIT_OPTIONAL_LOCKS", "0")
         // `merge_base` matches on stderr text, so it must not be translated.
         .env("LC_ALL", "C")
+        // A prompt would write over the TUI and hang the worker.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => GitError::GitMissing,
