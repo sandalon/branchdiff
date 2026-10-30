@@ -1096,11 +1096,8 @@ mod tests {
     #[test]
     fn pool_runs_submitted_jobs_and_reports_errors_as_messages() {
         let (tx, rx) = unbounded();
-        let gens = Arc::new(Generations::default());
-        let pool = Pool::new(2, tx, gens.clone());
-        let path = PathBuf::from("/definitely/not/a/repo");
-        let generation = gens.next(&path);
-        pool.submit(Job::Load { path, base: "develop".into(), generation });
+        let pool = Pool::new(2, tx);
+        pool.submit(Job::Load { path: "/definitely/not/a/repo".into(), base: "develop".into(), generation: 1 });
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             Msg::Loaded { result: Err(_), .. } => {}
             other => panic!("unexpected {other:?}"),
@@ -1108,15 +1105,36 @@ mod tests {
     }
 
     #[test]
-    fn superseded_loads_are_skipped_before_they_start() {
-        let (tx, rx) = unbounded();
-        let gens = Arc::new(Generations::default());
-        let path = PathBuf::from("/definitely/not/a/repo");
-        let old = gens.next(&path);
-        gens.next(&path);
-        let pool = Pool::new(1, tx, gens);
-        pool.submit(Job::Load { path, base: "develop".into(), generation: old });
-        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    fn only_one_load_runs_per_worktree() {
+        let (gens, mut loads) = (Generations::default(), Loads::default());
+        assert!(loads.request(&gens, "a".into(), "develop".into()).is_some());
+        assert!(loads.request(&gens, "a".into(), "develop".into()).is_none());
+        assert!(loads.request(&gens, "b".into(), "develop".into()).is_some());
+    }
+
+    #[test]
+    fn the_newest_waiting_request_runs_after_the_current_load() {
+        let (gens, mut loads) = (Generations::default(), Loads::default());
+        loads.request(&gens, "a".into(), "develop".into());
+        loads.request(&gens, "a".into(), "develop".into());
+        loads.request(&gens, "a".into(), "main".into());
+        match loads.finished("a".as_ref()) {
+            Some(Job::Load { base, generation, .. }) => {
+                assert_eq!(base, "main");
+                assert!(gens.is_current("a".as_ref(), generation));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // The waiting job is now running, so another request waits for it.
+        assert!(loads.request(&gens, "a".into(), "develop".into()).is_none());
+    }
+
+    #[test]
+    fn a_finished_load_with_nothing_waiting_frees_the_worktree() {
+        let (gens, mut loads) = (Generations::default(), Loads::default());
+        loads.request(&gens, "a".into(), "develop".into());
+        assert!(loads.finished("a".as_ref()).is_none());
+        assert!(loads.request(&gens, "a".into(), "develop".into()).is_some());
     }
 }
 ```
@@ -1182,24 +1200,50 @@ impl Generations {
     }
 }
 
+/// Allows one running load per worktree, because a load can take seconds and
+/// repeated refreshes would otherwise run side by side. A request made during
+/// a load replaces any waiting one, so the newest always runs next.
+#[derive(Default)]
+pub struct Loads {
+    running: HashMap<PathBuf, Option<Job>>,
+}
+
+impl Loads {
+    /// Answers the job to submit now, if the worktree has no load running.
+    pub fn request(&mut self, gens: &Generations, path: PathBuf, base: String) -> Option<Job> {
+        let generation = gens.next(&path);
+        let job = Job::Load { path: path.clone(), base, generation };
+        match self.running.get_mut(&path) {
+            Some(waiting) => {
+                *waiting = Some(job);
+                None
+            }
+            None => {
+                self.running.insert(path, None);
+                Some(job)
+            }
+        }
+    }
+
+    /// Call for every finished load, stale or not. Answers the job to submit next.
+    pub fn finished(&mut self, path: &Path) -> Option<Job> {
+        let job = self.running.remove(path).flatten()?;
+        self.running.insert(path.to_path_buf(), None);
+        Some(job)
+    }
+}
+
 pub struct Pool {
     jobs: Sender<Job>,
 }
 
 impl Pool {
-    pub fn new(threads: usize, msgs: Sender<Msg>, gens: Arc<Generations>) -> Self {
+    pub fn new(threads: usize, msgs: Sender<Msg>) -> Self {
         let (jobs, rx): (Sender<Job>, Receiver<Job>) = unbounded();
         for _ in 0..threads {
-            let (rx, msgs, gens) = (rx.clone(), msgs.clone(), gens.clone());
+            let (rx, msgs) = (rx.clone(), msgs.clone());
             thread::spawn(move || {
                 for job in rx {
-                    // Dropping late results is not enough: a load can take
-                    // seconds, so repeated refreshes would otherwise pile up.
-                    if let Job::Load { path, generation, .. } = &job {
-                        if !gens.is_current(path, *generation) {
-                            continue;
-                        }
-                    }
                     if msgs.send(run(job)).is_err() {
                         break;
                     }
@@ -1257,7 +1301,7 @@ pub fn highlight_file(_file: &FileDiff) -> HighlightedFile {
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib worker`
-Expected: 4 passed.
+Expected: 6 passed.
 
 **Step 5: Commit**
 
@@ -3582,7 +3626,7 @@ use branchdiff::app::{App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
-use branchdiff::worker::{Generations, Job, Msg, Pool};
+use branchdiff::worker::{Generations, Job, Loads, Msg, Pool};
 use branchdiff::{editor, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
@@ -3631,7 +3675,8 @@ fn main() -> Result<()> {
 
 struct Runtime {
     pool: Pool,
-    gens: Arc<Generations>,
+    gens: Generations,
+    loads: Loads,
     store: Store,
     common_dir: PathBuf,
     /// Opened on first copy, then kept alive because on Linux this process
@@ -3668,10 +3713,10 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
     spawn_input(key_tx, paused.clone());
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-    let gens = Arc::new(Generations::default());
     let mut rt = Runtime {
-        pool: Pool::new(threads, msg_tx.clone(), gens.clone()),
-        gens,
+        pool: Pool::new(threads, msg_tx.clone()),
+        gens: Generations::default(),
+        loads: Loads::default(),
         store: Store::new(&info.common_dir),
         common_dir: info.common_dir.clone(),
         clipboard: None,
@@ -3724,6 +3769,12 @@ fn on_event(app: &mut App, ev: Event) -> Vec<Effect> {
 }
 
 fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
+    // Before the stale check, so a dropped result still frees the worktree.
+    if let Msg::Loaded { path, .. } = &msg {
+        if let Some(job) = rt.loads.finished(path) {
+            rt.pool.submit(job);
+        }
+    }
     match msg {
         Msg::Loaded { ref path, generation, .. } if !rt.gens.is_current(path, generation) => Vec::new(),
         Msg::Worktrees(Ok(list)) => {
@@ -3764,8 +3815,9 @@ fn review_id(w: &git::Worktree) -> ReviewId {
 fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut DefaultTerminal) -> Result<()> {
     match effect {
         Effect::Load { path, base } => {
-            let generation = rt.gens.next(&path);
-            rt.pool.submit(Job::Load { path, base, generation });
+            if let Some(job) = rt.loads.request(&rt.gens, path, base) {
+                rt.pool.submit(job);
+            }
         }
         Effect::ReloadWorktrees => rt.pool.submit(Job::ListWorktrees { cwd: rt.repo.clone() }),
         Effect::ListBranches => rt.pool.submit(Job::ListBranches { cwd: rt.repo.clone() }),
@@ -4129,7 +4181,7 @@ git commit -m "chore: add CI, release builds and README"
 | Live worktree list | 9, 14, 16 |
 | Per-worktree position | 9 |
 | UI never waits on git | 6, 9, 16 |
-| Late results dropped | 6, 16 |
+| Late results dropped, one running load per worktree | 6, 16 |
 | Fork-point diff with uncommitted and untracked changes | 2, 4 |
 | Diffs held in memory, identified by base, HEAD and working tree | 5, 6, 9 |
 | Prefetching | 9 (every worktree loads when listed) |
