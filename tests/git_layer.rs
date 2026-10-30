@@ -74,3 +74,52 @@ fn fingerprint_is_stable_without_changes() {
     std::fs::write(repo.main.join("a.txt"), "dirty\n").unwrap();
     assert_eq!(git::fingerprint(&repo.main).unwrap(), git::fingerprint(&repo.main).unwrap());
 }
+
+#[test]
+fn merge_base_reports_unborn_branch() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    run(&wt, &["checkout", "-q", "--orphan", "lonely"]);
+    let err = git::merge_base(&wt, "develop").unwrap_err();
+    assert_eq!(err, GitError::NoCommits);
+    assert_eq!(err.to_string(), "this branch has no commits yet");
+}
+
+#[test]
+fn merge_base_with_head_as_base() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    let head = run(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(git::merge_base(&wt, "HEAD").unwrap(), head);
+    run(&wt, &["checkout", "-q", "--orphan", "lonely"]);
+    assert_eq!(git::merge_base(&wt, "HEAD"), Err(GitError::NoCommits));
+}
+
+#[test]
+fn merge_base_reports_missing_base_with_head_in_its_name() {
+    let repo = Repo::new();
+    assert_eq!(git::merge_base(&repo.main, "HEADER"), Err(GitError::BaseMissing("HEADER".to_string())));
+}
+
+#[test]
+fn branches_skips_symbolic_refs() {
+    let repo = Repo::new();
+    let parent = repo.main.parent().unwrap();
+    run(parent, &["clone", "-q", "main", "clone"]);
+    let branches = git::branches(&parent.join("clone")).unwrap();
+    assert!(branches.iter().any(|b| b == "origin/develop"), "{branches:?}");
+    assert!(!branches.iter().any(|b| b == "origin"), "{branches:?}");
+    assert!(!branches.iter().any(|b| b.ends_with("/HEAD")), "{branches:?}");
+}
+
+#[test]
+fn fingerprint_changes_when_renamed_file_is_edited_again() {
+    let repo = Repo::new();
+    run(&repo.main, &["mv", "a.txt", "b.txt"]);
+    std::fs::write(repo.main.join("b.txt"), "edit 1\n").unwrap();
+    let status = run(&repo.main, &["status", "--porcelain=v2"]);
+    assert!(status.starts_with("2 R"), "expected a rename record: {status}");
+    let first = git::fingerprint(&repo.main).unwrap();
+    std::fs::write(repo.main.join("b.txt"), "edit 22\n").unwrap();
+    assert_ne!(first, git::fingerprint(&repo.main).unwrap());
+}

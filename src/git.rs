@@ -12,6 +12,7 @@ pub enum GitError {
     NotARepo,
     BaseMissing(String),
     NoMergeBase,
+    NoCommits,
     Failed(String),
 }
 
@@ -22,6 +23,7 @@ impl fmt::Display for GitError {
             GitError::NotARepo => write!(f, "not inside a git repository"),
             GitError::BaseMissing(b) => write!(f, "base branch '{b}' not found"),
             GitError::NoMergeBase => write!(f, "no common history with the base branch"),
+            GitError::NoCommits => write!(f, "this branch has no commits yet"),
             GitError::Failed(e) => write!(f, "{e}"),
         }
     }
@@ -123,12 +125,13 @@ fn parse_worktrees(text: &str) -> Vec<Worktree> {
 
 pub fn merge_base(cwd: &Path, base: &str) -> Result<String, GitError> {
     let out = run(cwd, ["merge-base", base, "HEAD"])?;
-    match out.code {
-        Some(0) => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
-        Some(1) => Err(GitError::NoMergeBase),
-        Some(128) if out.stderr.contains("Not a valid object name") => {
-            Err(GitError::BaseMissing(base.to_string()))
-        }
+    let unresolved = out.stderr.rsplit_once("Not a valid object name ").map(|(_, name)| name);
+    match (out.code, unresolved) {
+        (Some(0), _) => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        (Some(1), _) => Err(GitError::NoMergeBase),
+        // Checked first so that a base of "HEAD" on an unborn branch lands here.
+        (Some(128), Some("HEAD")) => Err(GitError::NoCommits),
+        (Some(128), Some(name)) if name == base => Err(GitError::BaseMissing(base.to_string())),
         _ => Err(GitError::Failed(out.stderr)),
     }
 }
@@ -187,8 +190,10 @@ pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
 }
 
 pub fn branches(cwd: &Path) -> Result<Vec<String>, GitError> {
-    let text = ok_stdout(run(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"])?)?;
-    Ok(text.lines().map(String::from).collect())
+    let text = ok_stdout(run(cwd, ["for-each-ref", "--format=%(refname:short) %(symref)", "refs/heads", "refs/remotes"])?)?;
+    // A ref name cannot contain a space, so a line ending in one has an empty
+    // `symref`. Symbolic refs such as `origin/HEAD` are aliases, not branches.
+    Ok(text.lines().filter_map(|line| line.strip_suffix(' ')).map(String::from).collect())
 }
 
 /// Non-empty while a rebase or merge is in progress in this worktree.
