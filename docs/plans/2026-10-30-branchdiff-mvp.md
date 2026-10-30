@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 **Status of this plan's code:** Git commands and output formats were probed against git 2.46, and the dependency set and the ratatui, notify and syntect calls were compiled. The rest of the code here has not been compiled. Treat it as the intended design and fix small API mismatches as you go, keeping the tests' intent.
 
-**Completed tasks:** the code on this branch supersedes this document for Tasks 1 to 3. Reviews changed `git.rs` and `diff.rs` after these sections were written.
+**Completed tasks:** the code on this branch supersedes this document for any task already done. Reviews changed `git.rs` and `diff.rs` after those sections were written.
 
 ---
 
@@ -2972,7 +2972,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let Some(file) = app.current_file() else { return };
     if file.binary {
-        f.render_widget(Paragraph::new("Binary file not shown").block(block("Diff", focused)), area);
+        f.render_widget(Paragraph::new("Binary or very large file not shown").block(block("Diff", focused)), area);
         return;
     }
     let highlight = s.highlights.get(&s.file);
@@ -3156,12 +3156,12 @@ In `draw_diff`, next to the binary check, show a message for files with no hunks
 
 ```rust
     if file.hunks.is_empty() {
-        f.render_widget(Paragraph::new("No content changes").block(block("Diff", focused)), area);
+        f.render_widget(Paragraph::new("No text changes to show").block(block("Diff", focused)), area);
         return;
     }
 ```
 
-Add these tests to `tests/ui_snapshots.rs`: a tab-indented line renders with four spaces, a CRLF line renders with no stray characters and keeps its neighbours aligned in side-by-side view, and a file with no hunks shows `No content changes`.
+Add these tests to `tests/ui_snapshots.rs`: a tab-indented line renders with four spaces, a CRLF line renders with no stray characters and keeps its neighbours aligned in side-by-side view, and a file with no hunks shows `No text changes to show`.
 
 **Step 5: Review and accept snapshots**
 
