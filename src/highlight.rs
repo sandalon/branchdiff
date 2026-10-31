@@ -1,14 +1,17 @@
 use crate::diff::{FileDiff, LineKind};
 use ratatui::style::Color;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 pub const MAX_LINE_LEN: usize = 2_000;
-/// Syntect manages about 1,000 lines a second on real TypeScript, so this
-/// bounds how long one highlight can hold a worker.
 pub const MAX_FILE_LINES: usize = 5_000;
+/// Bounds how long one highlight can hold a worker, which nothing can interrupt
+/// once it runs. Real source takes about a second at `MAX_FILE_LINES`, but
+/// minified code in lines under `MAX_LINE_LEN` manages under 100 lines a second.
+const MAX_HIGHLIGHT_TIME: Duration = Duration::from_secs(5);
 
 pub type Span = (Color, String);
 
@@ -28,11 +31,16 @@ fn assets() -> &'static (SyntaxSet, Theme) {
 }
 
 pub fn highlight_file(file: &FileDiff) -> HighlightedFile {
+    highlight_within(file, MAX_HIGHLIGHT_TIME)
+}
+
+fn highlight_within(file: &FileDiff, budget: Duration) -> HighlightedFile {
     // Empty, not plain copies: the UI falls back to raw text, and copying every
     // line of a huge file would cost more than it saves.
     if file.hunks.iter().map(|h| h.lines.len()).sum::<usize>() > MAX_FILE_LINES {
         return HighlightedFile::default();
     }
+    let started = Instant::now();
     let (syntaxes, theme) = assets();
     // Names like `Makefile` and `.bashrc` are listed whole, and a directory
     // must not count towards an extension.
@@ -44,16 +52,18 @@ pub fn highlight_file(file: &FileDiff) -> HighlightedFile {
         // after it. Context is in both and shows as the new side has it.
         let mut old = syntax.map(|s| HighlightLines::new(s, theme));
         let mut new = syntax.map(|s| HighlightLines::new(s, theme));
-        hunk.lines.iter().map(|line| match line.kind {
-            LineKind::Removed => colour(&mut old, &line.text),
-            LineKind::Added => colour(&mut new, &line.text),
-            LineKind::Context => {
-                colour(&mut old, &line.text);
-                colour(&mut new, &line.text)
-            }
-        }).collect()
-    }).collect();
-    HighlightedFile { hunks }
+        hunk.lines.iter().map(|line| {
+            (started.elapsed() < budget).then(|| match line.kind {
+                LineKind::Removed => colour(&mut old, &line.text),
+                LineKind::Added => colour(&mut new, &line.text),
+                LineKind::Context => {
+                    colour(&mut old, &line.text);
+                    colour(&mut new, &line.text)
+                }
+            })
+        }).collect::<Option<_>>()
+    }).collect::<Option<_>>();
+    hunks.map(|hunks| HighlightedFile { hunks }).unwrap_or_default()
 }
 
 fn colour(state: &mut Option<HighlightLines>, text: &str) -> Vec<Span> {
@@ -161,6 +171,12 @@ mod tests {
         let background = assets().1.settings.background.unwrap();
         let hidden = Color::Rgb(background.r, background.g, background.b);
         assert_ne!(out.hunks[0][0][0].0, hidden);
+    }
+
+    #[test]
+    fn a_file_over_the_time_budget_stays_plain() {
+        let out = highlight_within(&file("a.rs", "fn main() {}"), Duration::ZERO);
+        assert!(out.hunks.is_empty());
     }
 
     #[test]
