@@ -3185,6 +3185,41 @@ fn commented_lines_are_marked_and_their_comment_is_shown() {
     assert!(out.contains(" * why"));
 }
 
+fn type_keys(a: &mut App, keys: &str) {
+    for c in keys.chars() {
+        a.handle_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+}
+
+#[test]
+fn the_finder_lists_the_match_that_enter_takes_first() {
+    let mut a = app();
+    type_keys(&mut a, "wcache");
+    let out = render(&mut a);
+    assert!(out.contains("Find worktree") && out.contains("> cache"));
+    assert!(!out.contains("│feat-auth"));
+    assert!(out.contains("│fix-cache"));
+}
+
+#[test]
+fn the_base_picker_shows_at_most_eight_branches() {
+    let mut a = app();
+    let branches: Vec<String> = (0..20).map(|i| format!("branch-{i:02}")).collect();
+    a.handle_msg(Msg::Branches(Ok(branches)));
+    let out = render_sized(&mut a, 80, 24);
+    assert!(out.contains("branch-07") && !out.contains("branch-08"));
+}
+
+#[test]
+fn prompts_render_at_tiny_sizes_without_panicking() {
+    let mut a = app();
+    a.handle_msg(Msg::Branches(Ok(vec!["main".into(), "develop".into()])));
+    type_keys(&mut a, "ma");
+    for (w, h) in [(1, 1), (4, 2), (10, 3), (20, 5)] {
+        render_sized(&mut a, w, h);
+    }
+}
+
 #[test]
 fn stale_badge_is_visible() {
     let mut a = app();
@@ -3493,10 +3528,10 @@ fn draw_input(f: &mut Frame, app: &App) {
         Input::ConfirmClear => ("Clear all comments for this worktree?", "y to clear, any other key cancels", Vec::new()),
         Input::Worktree { query } => ("Find worktree", query.as_str(), {
             let labels = app.worktree_labels();
-            crate::fuzzy::filter(query, &labels).into_iter().map(|i| labels[i].clone()).collect()
+            crate::fuzzy::filter(query, &labels).into_iter().take(8).map(|i| labels[i].clone()).collect()
         }),
         Input::Base { query, branches } => ("Base branch", query.as_str(), {
-            crate::fuzzy::filter(query, branches).into_iter().map(|i| branches[i].clone()).collect()
+            crate::fuzzy::filter(query, branches).into_iter().take(8).map(|i| branches[i].clone()).collect()
         }),
     };
     let area = centered(f.area(), 60, (options.len().min(8) as u16) + 3);
@@ -3577,7 +3612,7 @@ Check each screen by eye against the layout in the design doc, then accept.
 **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --test ui_snapshots`
-Expected: 13 passed.
+Expected: 16 passed.
 
 **Step 7: Commit**
 

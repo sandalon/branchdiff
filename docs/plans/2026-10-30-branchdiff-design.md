@@ -62,7 +62,7 @@ Worktree rows show lines added, a "changed" badge and a comment count. The diff 
 
 Each worktree remembers its selected file, scroll position and unexported comments, so switching back returns to the same place.
 
-When a worktree changes during review, it gets a "changed" badge. The diff does not redraw until the user refreshes, so nothing moves under the cursor.
+When a worktree changes during review, it gets a "changed" badge. The diff does not redraw until the user refreshes, so nothing moves under the cursor. The badge also shows after a base change, until that worktree's diff has reloaded.
 
 ### Keybindings
 
