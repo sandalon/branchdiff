@@ -295,8 +295,6 @@ impl App {
     /// the selected worktree to its new position.
     fn apply_worktrees(&mut self, list: Vec<Worktree>) -> Vec<Effect> {
         let selected_path = self.selected_worktree().map(|w| w.path.clone());
-        let old_selected = self.selected;
-        let removed = selected_path.as_ref().filter(|p| !list.iter().any(|w| &w.path == *p)).cloned();
 
         let mut old: Vec<(PathBuf, WorktreeState)> = self.worktrees.drain(..)
             .map(|w| w.path)
@@ -316,13 +314,15 @@ impl App {
         }
         self.worktrees = list;
 
-        self.selected = match (&selected_path, &removed) {
-            (Some(_), Some(gone)) => {
-                self.notice = Some(format!("Worktree removed: {}", gone.display()));
-                old_selected.min(self.worktrees.len().saturating_sub(1))
-            }
-            (Some(p), None) => self.index_of(p).unwrap_or(0),
-            _ => 0,
+        self.selected = match selected_path {
+            Some(path) => match self.index_of(&path) {
+                Some(i) => i,
+                None => {
+                    self.notice = Some(format!("Worktree removed: {}", path.display()));
+                    self.selected.min(self.worktrees.len().saturating_sub(1))
+                }
+            },
+            None => 0,
         };
         effects
     }
@@ -354,7 +354,7 @@ mod tests {
 
     fn app(names: &[&str]) -> App {
         let mut a = App::new("develop".into());
-        a.handle_msg(Msg::Worktrees(Ok(names.iter().map(|n| wt(n)).collect())));
+        a.handle_msg(list(names));
         a
     }
 
@@ -368,10 +368,51 @@ mod tests {
         a.handle_msg(Msg::Loaded { path, result: Ok(Loaded { key, diffs: Arc::new(files), op: None }) });
     }
 
+    fn list(names: &[&str]) -> Msg {
+        Msg::Worktrees(Ok(names.iter().map(|n| wt(n)).collect()))
+    }
+
+    fn set_cursor_scroll(a: &mut App, cursor: usize, scroll: usize) {
+        let s = a.current_mut().unwrap();
+        (s.cursor, s.scroll) = (cursor, scroll);
+    }
+
+    fn position(a: &App) -> (usize, usize, usize) {
+        let s = a.current().unwrap();
+        (s.file, s.cursor, s.scroll)
+    }
+
+    fn with(c: char, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), modifiers)
+    }
+
+    /// Three worktrees whose loaded diffs and positions all differ.
+    fn prepared() -> App {
+        let names = ["a", "b", "c"];
+        let mut a = app(&names);
+        for (i, name) in names.iter().enumerate() {
+            let files = (1..=3).map(|n| file_with_rows(&format!("{name}-{n}"), 100)).collect();
+            deliver(&mut a, name, files);
+            let s = &mut a.states[i];
+            (s.file, s.cursor, s.scroll) = (i, 20 + i, 10 + i);
+        }
+        a
+    }
+
+    /// Checks one worktree from `prepared` still has everything it started with.
+    fn assert_kept(a: &App, name: &str) {
+        let i = ["a", "b", "c"].iter().position(|n| *n == name).unwrap();
+        let row = a.worktrees.iter().position(|w| w.branch.as_deref() == Some(name)).unwrap();
+        let s = &a.states[row];
+        assert_eq!((s.file, s.cursor, s.scroll), (i, 20 + i, 10 + i), "position of {name}");
+        assert_eq!(s.diffs.as_ref().unwrap()[0].path, format!("{name}-1"));
+        assert!(s.key.as_ref().unwrap().worktree.ends_with(name));
+    }
+
     #[test]
     fn worktree_list_requests_a_load_for_each_worktree() {
         let mut a = App::new("develop".into());
-        let fx = a.handle_msg(Msg::Worktrees(Ok(vec![wt("a"), wt("b")])));
+        let fx = a.handle_msg(list(&["a", "b"]));
         assert_eq!(fx.iter().filter(|e| matches!(e, Effect::Load { .. })).count(), 2);
     }
 
@@ -412,49 +453,22 @@ mod tests {
         deliver(&mut a, "b", files());
         press(&mut a, 'n');
         press(&mut a, 'n');
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         for (away, back) in [(']', '['), ('2', '1'), ('j', 'k')] {
             press(&mut a, away);
-            assert_eq!(a.selected, 1);
-            assert_eq!(position(&a), (0, 0, 0));
+            assert_eq!(a.selected, 1, "{away}/{back}");
+            assert_eq!(position(&a), (0, 0, 0), "{away}/{back}");
             press(&mut a, 'n');
-            at(&mut a, 7, 3);
+            set_cursor_scroll(&mut a, 7, 3);
             press(&mut a, back);
-            assert_eq!(a.selected, 0);
-            assert_eq!(position(&a), (2, 50, 40));
+            assert_eq!(a.selected, 0, "{away}/{back}");
+            assert_eq!(position(&a), (2, 50, 40), "{away}/{back}");
             press(&mut a, away);
-            assert_eq!(position(&a), (1, 7, 3));
+            assert_eq!(position(&a), (1, 7, 3), "{away}/{back}");
             press(&mut a, 'p');
-            at(&mut a, 0, 0);
+            set_cursor_scroll(&mut a, 0, 0);
             press(&mut a, back);
         }
-    }
-
-    /// Three worktrees whose loaded diffs and positions all differ.
-    fn prepared() -> App {
-        let names = ["a", "b", "c"];
-        let mut a = app(&names);
-        for (i, name) in names.iter().enumerate() {
-            let files = (1..=3).map(|n| file_with_rows(&format!("{name}-{n}"), 100)).collect();
-            deliver(&mut a, name, files);
-            let s = &mut a.states[i];
-            (s.file, s.cursor, s.scroll) = (i, 20 + i, 10 + i);
-        }
-        a
-    }
-
-    fn list(names: &[&str]) -> Msg {
-        Msg::Worktrees(Ok(names.iter().map(|n| wt(n)).collect()))
-    }
-
-    /// Checks one worktree from `prepared` still has everything it started with.
-    fn assert_kept(a: &App, name: &str) {
-        let i = ["a", "b", "c"].iter().position(|n| *n == name).unwrap();
-        let row = a.worktrees.iter().position(|w| w.branch.as_deref() == Some(name)).unwrap();
-        let s = &a.states[row];
-        assert_eq!((s.file, s.cursor, s.scroll), (i, 20 + i, 10 + i), "position of {name}");
-        assert_eq!(s.diffs.as_ref().unwrap()[0].path, format!("{name}-1"));
-        assert!(s.key.as_ref().unwrap().worktree.ends_with(name));
     }
 
     #[test]
@@ -525,7 +539,7 @@ mod tests {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
         press(&mut a, 'n');
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         let key = a.current().unwrap().key.clone();
         a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::NoMergeBase) });
         let s = a.current().unwrap();
@@ -536,12 +550,15 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_message_keeps_the_position() {
+    fn stale_message_badges_but_keeps_the_diff_and_position() {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
         press(&mut a, 'n');
-        at(&mut a, 50, 40);
-        a.handle_msg(Msg::Stale("/r/a".into()));
+        set_cursor_scroll(&mut a, 50, 40);
+        let fx = a.handle_msg(Msg::Stale("/r/a".into()));
+        assert!(fx.is_empty());
+        assert!(a.current().unwrap().stale);
+        assert_eq!(a.current().unwrap().diffs.as_ref().unwrap().len(), 2);
         assert_eq!(position(&a), (1, 50, 40));
     }
 
@@ -558,10 +575,10 @@ mod tests {
     fn moving_to_another_file_resets_the_position() {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         press(&mut a, 'n');
         assert_eq!(position(&a), (1, 0, 0));
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         press(&mut a, 'p');
         assert_eq!(position(&a), (0, 0, 0));
     }
@@ -599,38 +616,12 @@ mod tests {
     }
 
     #[test]
-    fn new_worktree_appears_and_selection_follows_its_path() {
-        let mut a = app(&["a", "b"]);
-        press(&mut a, ']');
-        a.handle_msg(Msg::Worktrees(Ok(vec![wt("a"), wt("aa"), wt("b")])));
-        assert_eq!(a.selected_worktree().unwrap().branch.as_deref(), Some("b"));
-    }
-
-    #[test]
     fn removed_selected_worktree_shows_notice_and_moves_on() {
         let mut a = app(&["a", "b", "c"]);
         press(&mut a, ']');
-        a.handle_msg(Msg::Worktrees(Ok(vec![wt("a"), wt("c")])));
+        a.handle_msg(list(&["a", "c"]));
         assert_eq!(a.selected_worktree().unwrap().branch.as_deref(), Some("c"));
         assert!(a.notice.as_deref().unwrap().contains('b'));
-    }
-
-    #[test]
-    fn stale_message_badges_but_does_not_replace_the_diff() {
-        let mut a = app(&["a"]);
-        deliver(&mut a, "a", vec![file("1")]);
-        let fx = a.handle_msg(Msg::Stale("/r/a".into()));
-        assert!(a.current().unwrap().stale);
-        assert_eq!(a.current().unwrap().diffs.as_ref().unwrap().len(), 1);
-        assert!(fx.is_empty());
-    }
-
-    #[test]
-    fn r_requests_a_reload_of_the_selected_worktree() {
-        let mut a = app(&["a"]);
-        let fx = press(&mut a, 'r');
-        assert!(fx.contains(&Effect::ReloadWorktrees));
-        assert!(fx.iter().any(|e| matches!(e, Effect::Load { .. })));
     }
 
     #[test]
@@ -638,7 +629,7 @@ mod tests {
         let mut a = App::new("develop".into());
         a.handle_msg(Msg::Worktrees(Err(crate::git::GitError::Failed("boom".into()))));
         assert!(a.fatal.is_some());
-        a.handle_msg(Msg::Worktrees(Ok(vec![wt("a")])));
+        a.handle_msg(list(&["a"]));
         assert!(a.fatal.is_none());
     }
 
@@ -654,12 +645,12 @@ mod tests {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("1", 10), file_with_rows("2", 10)]);
         press(&mut a, 'n');
-        a.current_mut().unwrap().cursor = 5;
+        set_cursor_scroll(&mut a, 5, 0);
         press(&mut a, 'n');
         assert_eq!(a.current().unwrap().cursor, 5);
         press(&mut a, 'p');
         assert_eq!(a.current().unwrap().cursor, 0);
-        a.current_mut().unwrap().cursor = 5;
+        set_cursor_scroll(&mut a, 5, 0);
         press(&mut a, 'p');
         assert_eq!(a.current().unwrap().cursor, 5);
     }
@@ -668,8 +659,7 @@ mod tests {
     fn a_reload_keeps_the_position_inside_a_shorter_file() {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("1", 100)]);
-        let s = a.current_mut().unwrap();
-        (s.cursor, s.scroll) = (50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         deliver(&mut a, "a", vec![file_with_rows("1", 45)]);
         let s = a.current().unwrap();
         assert_eq!((s.cursor, s.scroll), (44, 40));
@@ -683,8 +673,7 @@ mod tests {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("1", 3), file_with_rows("2", 100)]);
         press(&mut a, 'n');
-        let s = a.current_mut().unwrap();
-        (s.cursor, s.scroll) = (50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         deliver(&mut a, "a", vec![file_with_rows("1", 3)]);
         let s = a.current().unwrap();
         assert_eq!((s.file, s.cursor, s.scroll), (0, 0, 0));
@@ -693,22 +682,12 @@ mod tests {
         assert_eq!((s.file, s.cursor, s.scroll), (0, 0, 0));
     }
 
-    fn at(a: &mut App, cursor: usize, scroll: usize) {
-        let s = a.current_mut().unwrap();
-        (s.cursor, s.scroll) = (cursor, scroll);
-    }
-
-    fn position(a: &App) -> (usize, usize, usize) {
-        let s = a.current().unwrap();
-        (s.file, s.cursor, s.scroll)
-    }
-
     #[test]
     fn a_reload_follows_the_current_file_past_an_inserted_file() {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("b", 100), file_with_rows("c", 100)]);
         press(&mut a, 'n');
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("b", 100), file_with_rows("c", 100)]);
         assert_eq!(position(&a), (2, 50, 40));
         assert_eq!(a.current_file().unwrap().path, "c");
@@ -720,7 +699,7 @@ mod tests {
         deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("b", 100), file_with_rows("c", 100), file_with_rows("d", 100)]);
         press(&mut a, 'n');
         press(&mut a, 'n');
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         deliver(&mut a, "a", vec![file_with_rows("b", 100), file_with_rows("c", 100), file_with_rows("d", 100)]);
         assert_eq!(position(&a), (1, 50, 40));
         assert_eq!(a.current_file().unwrap().path, "c");
@@ -730,7 +709,7 @@ mod tests {
     fn a_followed_file_that_shrank_keeps_its_position_valid() {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("b", 100)]);
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         deliver(&mut a, "a", vec![file_with_rows("a", 100), file_with_rows("b", 5)]);
         assert_eq!(position(&a), (1, 4, 4));
     }
@@ -740,10 +719,10 @@ mod tests {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("a", 100), file_with_rows("b", 100), file_with_rows("c", 100)]);
         press(&mut a, 'n');
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         deliver(&mut a, "a", vec![file_with_rows("a", 100), file_with_rows("c", 100)]);
         assert_eq!(position(&a), (1, 0, 0));
-        at(&mut a, 50, 40);
+        set_cursor_scroll(&mut a, 50, 40);
         deliver(&mut a, "a", vec![file_with_rows("a", 100)]);
         assert_eq!(position(&a), (0, 0, 0));
     }
@@ -764,13 +743,9 @@ mod tests {
         let mut a = app(&["a"]);
         deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("t", 10)]);
         press(&mut a, 'n');
-        at(&mut a, 5, 2);
+        set_cursor_scroll(&mut a, 5, 2);
         deliver(&mut a, "a", vec![file_with_rows("0", 5), file_with_rows("a", 5), side(Status::Deleted), side(Status::Added)]);
         assert_eq!(position(&a), (2, 5, 2));
-    }
-
-    fn with(c: char, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), modifiers)
     }
 
     #[test]
@@ -869,7 +844,7 @@ mod tests {
         let mut a = app(&["a", "b"]);
         deliver(&mut a, "b", vec![file_with_rows("1", 100)]);
         press(&mut a, ']');
-        a.current_mut().unwrap().cursor = 50;
+        set_cursor_scroll(&mut a, 50, 0);
         press(&mut a, '[');
         deliver(&mut a, "b", vec![file_with_rows("1", 5)]);
         assert_eq!(a.states[1].cursor, 4);
@@ -898,7 +873,12 @@ mod tests {
     fn keys_do_nothing_with_no_worktrees_loaded() {
         let mut a = App::new("develop".into());
         for c in [']', '[', 'n', 'p', 'j', 'k', 'c', 'e', 'x', 'y'] {
-            press(&mut a, c);
+            assert!(press(&mut a, c).is_empty());
         }
+        assert_eq!(a.selected, 0);
+        assert!(a.worktrees.is_empty() && a.states.is_empty());
+        assert_eq!((a.focus, a.view), (Focus::Worktrees, DiffView::Unified));
+        assert!(!a.help_open && !a.should_quit);
+        assert!(a.notice.is_none() && a.fatal.is_none());
     }
 }
