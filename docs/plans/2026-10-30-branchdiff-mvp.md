@@ -2758,30 +2758,11 @@ Add this to the main match:
             KeyCode::Char('b') => return vec![Effect::ListBranches],
 ```
 
-Replace `handle_input_key`:
+Add `Input::Worktree { query } | Input::Base { query, .. } => Some(query)` to `Input::text_mut`, so `handle_input_key` and `paste` both reach the new inputs. Enter already goes through `submit_input` once it's added below, so replace the `Enter` handling in `handle_input_key` with `KeyCode::Enter => return self.submit_input(),`.
+
+Add these methods:
 
 ```rust
-    fn handle_input_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        if matches!(self.input, Some(Input::ConfirmClear)) {
-            self.input = None;
-            return if key.code == KeyCode::Char('y') { self.clear_comments() } else { Vec::new() };
-        }
-        let Some(input) = self.input.as_mut() else { return Vec::new() };
-        let text = match input {
-            Input::Comment { text, .. } => text,
-            Input::Worktree { query } | Input::Base { query, .. } => query,
-            Input::ConfirmClear => return Vec::new(),
-        };
-        match key.code {
-            KeyCode::Char(c) => text.push(c),
-            KeyCode::Backspace => { text.pop(); }
-            KeyCode::Esc => self.input = None,
-            KeyCode::Enter => return self.submit_input(),
-            _ => {}
-        }
-        Vec::new()
-    }
-
     pub fn worktree_labels(&self) -> Vec<String> {
         self.worktrees.iter().map(worktree_label).collect()
     }
