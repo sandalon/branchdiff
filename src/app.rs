@@ -456,14 +456,14 @@ impl App {
                     return self.save_effect();
                 }
             }
-            Some(Input::Worktree { query }) if !query.trim().is_empty() => {
-                if let Some(&i) = crate::fuzzy::filter(&query, &self.worktree_labels()).first() {
+            Some(Input::Worktree { query }) => {
+                if let Some(i) = top_match(&query, &self.worktree_labels()) {
                     self.selected = i;
                 }
             }
-            Some(Input::Base { query, branches }) if !query.trim().is_empty() => {
-                if let Some(&i) = crate::fuzzy::filter(&query, &branches).first() {
-                    self.base = branches[i].clone();
+            Some(Input::Base { query, mut branches }) => {
+                if let Some(i) = top_match(&query, &branches) {
+                    self.base = branches.swap_remove(i);
                     return self.reload_all();
                 }
             }
@@ -599,6 +599,14 @@ impl App {
         file.status == Status::Deleted
             && !diffs.is_some_and(|d| d.iter().any(|f| f.path == file.path && f.status != Status::Deleted))
     }
+}
+
+/// What Enter takes in a filtering prompt. A blank query cancels.
+fn top_match(query: &str, items: &[String]) -> Option<usize> {
+    if query.trim().is_empty() {
+        return None;
+    }
+    crate::fuzzy::filter(query, items).first().copied()
 }
 
 pub fn worktree_label(w: &Worktree) -> String {
@@ -2067,5 +2075,16 @@ mod tests {
     fn a_detached_worktree_is_labelled_with_its_short_hash() {
         let w = Worktree { branch: None, head: "abcdef0123456789".into(), ..wt("a") };
         assert_eq!(worktree_label(&w), "(abcdef01)");
+    }
+
+    #[test]
+    fn a_failed_load_after_a_base_change_stays_stale() {
+        let mut a = prepared();
+        a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
+        press(&mut a, 'm');
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::NoMergeBase) });
+        assert!(a.states[0].error.is_some());
+        assert!(a.states[0].stale);
     }
 }
