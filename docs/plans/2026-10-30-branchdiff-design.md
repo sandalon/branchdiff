@@ -76,6 +76,8 @@ When a worktree changes during review, it gets a "changed" badge. The diff does 
 | `n` / `p` | Next or previous file |
 | `v` | Toggle unified and side-by-side diffs |
 | `c` | Comment on the current line |
+| `d` | Delete the comment on the current line |
+| `D` | Clear all comments for this worktree, after a confirmation |
 | `e` | Open the file and line in `$EDITOR` |
 | `x` | Mark a file as reviewed |
 | `y` | Copy comments to the clipboard as a Markdown prompt |
@@ -109,6 +111,8 @@ Comments and reviewed marks are stored as JSON under `<git-common-dir>/branchdif
 - Writes go to a temp file and are then renamed, so a crash cannot corrupt them.
 
 Each comment records its file, line and line text. A comment is flagged as outdated if that code changes. A reviewed mark resets if the file's contents change.
+
+Lines with comments get a marker in the diff, and the status bar shows the comment on the current line. `d` deletes it, and `D` clears the worktree's comments once the agent has handled them.
 
 Export produces a Markdown prompt that can be pasted into any agent, which avoids integrating with a specific one.
 
@@ -144,7 +148,7 @@ Export produces a Markdown prompt that can be pasted into any agent, which avoid
 
 - Live worktree list, runtime switching and per-worktree position
 - Unified and side-by-side diffs with syntax highlighting
-- Line comments, Markdown export and jump-to-editor
+- Line comments with diff markers and deletion, Markdown export and jump-to-editor
 - Reviewed marks and file watching with the "changed" badge
 - Runtime base branch switching and the `?` help overlay
 - Prebuilt binaries for macOS, Linux and Windows

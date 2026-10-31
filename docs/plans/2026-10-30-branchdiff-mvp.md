@@ -2172,6 +2172,67 @@ Add to the `tests` module in `src/app.rs`:
     }
 
     #[test]
+    fn d_deletes_only_the_comment_on_the_current_line() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "one");
+        type_comment(&mut a, "two");
+        a.states[0].review.comments.push(Comment {
+            path: "other.rs".into(), line: 1, side: Side::New, line_text: "x".into(), body: "keep".into(),
+        });
+        let fx = press(&mut a, 'd');
+        let bodies: Vec<_> = a.current().unwrap().review.comments.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["one", "keep"]);
+        assert!(matches!(fx.as_slice(), [Effect::SaveReview { .. }]));
+    }
+
+    #[test]
+    fn d_with_no_comment_here_changes_nothing_and_says_so() {
+        let mut a = app_on_line();
+        assert!(press(&mut a, 'd').is_empty());
+        assert!(a.notice.is_some());
+    }
+
+    #[test]
+    fn deleting_a_comment_recounts_outdated() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
+        assert_eq!(a.outdated_comments(), 1);
+        a.states[0].review.comments[0].line_text = "let x = 2;".into();
+        press(&mut a, 'd');
+        assert_eq!(a.outdated_comments(), 0);
+    }
+
+    #[test]
+    fn shift_d_clears_after_y_and_saves() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        press(&mut a, 'D');
+        assert!(matches!(a.input, Some(Input::ConfirmClear)));
+        assert!(a.current().unwrap().review.comments.len() == 1);
+        let fx = press(&mut a, 'y');
+        assert!(a.current().unwrap().review.comments.is_empty());
+        assert!(matches!(fx.as_slice(), [Effect::SaveReview { .. }]));
+    }
+
+    #[test]
+    fn any_other_key_cancels_a_clear() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        press(&mut a, 'D');
+        assert!(press(&mut a, 'q').is_empty());
+        assert!(a.input.is_none() && !a.should_quit);
+        assert_eq!(a.current().unwrap().review.comments.len(), 1);
+    }
+
+    #[test]
+    fn shift_d_with_no_comments_says_so() {
+        let mut a = app_on_line();
+        press(&mut a, 'D');
+        assert!(a.input.is_none() && a.notice.is_some());
+    }
+
+    #[test]
     fn x_again_clears_the_mark() {
         let mut a = app_on_line();
         press(&mut a, 'x');
@@ -2268,6 +2329,7 @@ Add to `App` the field `pub input: Option<Input>`, initialised to `None`, and th
 /// A text prompt. While set, keys go here rather than to hotkeys.
 pub enum Input {
     Comment { path: String, line: u32, side: Side, line_text: String, text: String },
+    ConfirmClear,
 }
 ```
 
@@ -2283,6 +2345,8 @@ Add these arms to the main `match key.code`:
 
 ```rust
             KeyCode::Char('c') => self.start_comment(),
+            KeyCode::Char('d') => return self.delete_comment(),
+            KeyCode::Char('D') => self.start_clear(),
             KeyCode::Char('x') => return self.toggle_reviewed(),
             KeyCode::Char('e') => return self.open_editor(),
             KeyCode::Char('y') => return self.export(Effect::CopyExport),
@@ -2314,16 +2378,16 @@ Add these methods:
             self.notice = Some("Move to a diff line to comment".into());
             return;
         };
-        let (no, side) = match (line.new_no, line.old_no) {
-            (Some(n), _) => (n, Side::New),
-            (None, Some(o)) => (o, Side::Old),
-            (None, None) => return,
-        };
+        let Some((no, side)) = line_position(line) else { return };
         let line_text = line.text.clone();
         self.input = Some(Input::Comment { path, line: no, side, line_text, text: String::new() });
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if matches!(self.input, Some(Input::ConfirmClear)) {
+            self.input = None;
+            return if key.code == KeyCode::Char('y') { self.clear_comments() } else { Vec::new() };
+        }
         let Some(Input::Comment { text, .. }) = self.input.as_mut() else { return Vec::new() };
         match key.code {
             KeyCode::Char(c) => text.push(c),
@@ -2343,6 +2407,48 @@ Add these methods:
             _ => {}
         }
         Vec::new()
+    }
+
+    /// The comment on the line under the cursor, newest first when there are several.
+    pub fn comment_at_cursor(&self) -> Option<&Comment> {
+        let path = &self.current_file()?.path;
+        let (line, side) = line_position(self.line_at_cursor()?)?;
+        self.current()?.review.comments.iter().rev()
+            .find(|c| &c.path == path && c.line == line && c.side == side)
+    }
+
+    /// Positions in the current file that have comments, for the diff's markers.
+    pub fn commented_lines(&self) -> HashSet<(u32, Side)> {
+        let (Some(s), Some(file)) = (self.current(), self.current_file()) else { return HashSet::new() };
+        s.review.comments.iter().filter(|c| c.path == file.path).map(|c| (c.line, c.side)).collect()
+    }
+
+    fn delete_comment(&mut self) -> Vec<Effect> {
+        let Some(comment) = self.comment_at_cursor().cloned() else {
+            self.notice = Some("No comment on this line".into());
+            return Vec::new();
+        };
+        let Some(s) = self.current_mut() else { return Vec::new() };
+        if let Some(i) = s.review.comments.iter().rposition(|c| *c == comment) {
+            s.review.comments.remove(i);
+        }
+        s.outdated = count_outdated(s);
+        self.save_effect()
+    }
+
+    fn start_clear(&mut self) {
+        if self.current().is_some_and(|s| !s.review.comments.is_empty()) {
+            self.input = Some(Input::ConfirmClear);
+        } else {
+            self.notice = Some("No comments to clear".into());
+        }
+    }
+
+    fn clear_comments(&mut self) -> Vec<Effect> {
+        let Some(s) = self.current_mut() else { return Vec::new() };
+        s.review.comments.clear();
+        s.outdated = 0;
+        self.save_effect()
     }
 
     /// Built when the edit happens, because later keys in the same batch can
@@ -2438,6 +2544,16 @@ pub fn coalesce_saves(effects: Vec<Effect>) -> Vec<Effect> {
     kept
 }
 
+/// Where a diff line sits for a comment: the new file's number, or the old
+/// file's for a removed line.
+pub fn line_position(line: &crate::diff::Line) -> Option<(u32, Side)> {
+    match (line.new_no, line.old_no) {
+        (Some(n), _) => Some((n, Side::New)),
+        (None, Some(o)) => Some((o, Side::Old)),
+        (None, None) => None,
+    }
+}
+
 /// Counts comments whose line text is no longer at that line in the diff.
 fn count_outdated(s: &WorktreeState) -> usize {
     let Some(diffs) = s.diffs.as_ref() else { return 0 };
@@ -2460,7 +2576,7 @@ fn count_outdated(s: &WorktreeState) -> usize {
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib app`
-Expected: 29 passed.
+Expected: 35 passed.
 
 **Step 5: Commit**
 
@@ -2613,6 +2729,7 @@ pub enum Input {
     Comment { path: String, line: u32, side: Side, line_text: String, text: String },
     Worktree { query: String },
     Base { query: String, branches: Vec<String> },
+    ConfirmClear,
 }
 ```
 
@@ -2627,10 +2744,15 @@ Replace `handle_input_key`:
 
 ```rust
     fn handle_input_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if matches!(self.input, Some(Input::ConfirmClear)) {
+            self.input = None;
+            return if key.code == KeyCode::Char('y') { self.clear_comments() } else { Vec::new() };
+        }
         let Some(input) = self.input.as_mut() else { return Vec::new() };
         let text = match input {
             Input::Comment { text, .. } => text,
             Input::Worktree { query } | Input::Base { query, .. } => query,
+            Input::ConfirmClear => return Vec::new(),
         };
         match key.code {
             KeyCode::Char(c) => text.push(c),
@@ -2942,7 +3064,7 @@ git commit -m "feat: highlight diffs on worker threads"
 `tests/ui_snapshots.rs`:
 
 ```rust
-use branchdiff::app::{App, Effect};
+use branchdiff::app::{App, Effect, Focus};
 use branchdiff::cache::CacheKey;
 use branchdiff::diff::{FileDiff, Hunk, Line, LineKind, Status};
 use branchdiff::git::{GitError, Worktree};
@@ -3029,6 +3151,23 @@ fn a_failed_worktree_list_is_shown() {
 }
 
 #[test]
+fn commented_lines_are_marked_and_their_comment_is_shown() {
+    let mut a = app();
+    a.focus = Focus::Diff;
+    for _ in 0..3 {
+        a.handle_key(KeyEvent::from(KeyCode::Char('j')));
+    }
+    a.handle_key(KeyEvent::from(KeyCode::Char('c')));
+    for c in "why".chars() {
+        a.handle_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    a.handle_key(KeyEvent::from(KeyCode::Enter));
+    let out = render(&mut a);
+    assert!(out.contains("*    2 +"));
+    assert!(out.contains(" * why"));
+}
+
+#[test]
 fn stale_badge_is_visible() {
     let mut a = app();
     a.handle_msg(Msg::Stale("/r/feat-auth".into()));
@@ -3053,13 +3192,15 @@ Expected: FAIL to compile, `ui::draw` not found.
 **Step 3: Implement `src/ui.rs`**
 
 ```rust
-use crate::app::{worktree_label, App, DiffView, Focus, Input};
-use crate::diff::{FileDiff, LineKind};
+use crate::app::{line_position, worktree_label, App, DiffView, Focus, Input};
+use crate::diff::{FileDiff, Line, LineKind};
+use crate::store::Side;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use std::collections::HashSet;
 
 const HELP: &[(&str, &str)] = &[
     ("[ / ]", "previous or next worktree"),
@@ -3070,6 +3211,7 @@ const HELP: &[(&str, &str)] = &[
     ("n / p", "next or previous file"),
     ("v", "unified or side-by-side diff"),
     ("c", "comment on the current line"),
+    ("d / D", "delete a comment, or clear all"),
     ("e", "open in $EDITOR"),
     ("x", "mark file as reviewed"),
     ("y / Y", "copy comments, or write to a file"),
@@ -3171,9 +3313,10 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let highlight = s.highlights.get(&s.file);
+    let commented = app.commented_lines();
     let rows = match app.view {
-        DiffView::Unified => unified_rows(file, highlight, s.cursor, s.scroll, visible),
-        DiffView::SideBySide => split_rows(file, s.cursor, s.scroll, visible, area.width.saturating_sub(2) as usize),
+        DiffView::Unified => unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible),
+        DiffView::SideBySide => split_rows(file, &commented, s.cursor, s.scroll, visible, area.width.saturating_sub(2) as usize),
     };
     f.render_widget(Paragraph::new(rows).block(block("Diff", focused)), area);
 }
@@ -3186,9 +3329,15 @@ fn line_style(kind: LineKind) -> Style {
     }
 }
 
+/// Gutter mark for a line that has a comment.
+fn comment_mark(commented: &HashSet<(u32, Side)>, line: &Line) -> &'static str {
+    if line_position(line).is_some_and(|p| commented.contains(&p)) { "*" } else { " " }
+}
+
 fn unified_rows<'a>(
     file: &'a FileDiff,
     highlight: Option<&'a crate::highlight::HighlightedFile>,
+    commented: &HashSet<(u32, Side)>,
     cursor: usize,
     scroll: usize,
     visible: usize,
@@ -3215,7 +3364,8 @@ fn unified_rows<'a>(
                     LineKind::Context => " ",
                 };
                 let number = line.new_no.or(line.old_no).unwrap_or(0);
-                let mut spans = vec![Span::raw(format!("{number:>5} {prefix}"))];
+                let mark = comment_mark(commented, line);
+                let mut spans = vec![Span::raw(format!("{mark}{number:>5} {prefix}"))];
                 match highlight.and_then(|h| h.hunks.get(hi)).and_then(|h| h.get(li)) {
                     Some(parts) => spans.extend(parts.iter().map(|(c, t)| Span::styled(t.as_str(), Style::new().fg(*c)))),
                     None => spans.push(Span::raw(line.text.as_str())),
@@ -3231,8 +3381,15 @@ fn unified_rows<'a>(
     rows
 }
 
-fn split_rows<'a>(file: &'a FileDiff, cursor: usize, scroll: usize, visible: usize, width: usize) -> Vec<TextLine<'a>> {
-    let side = width.saturating_sub(3) / 2;
+fn split_rows<'a>(
+    file: &'a FileDiff,
+    commented: &HashSet<(u32, Side)>,
+    cursor: usize,
+    scroll: usize,
+    visible: usize,
+    width: usize,
+) -> Vec<TextLine<'a>> {
+    let side = width.saturating_sub(4) / 2;
     let mut rows = Vec::with_capacity(visible);
     let mut row = 0;
     for hunk in &file.hunks {
@@ -3250,7 +3407,8 @@ fn split_rows<'a>(file: &'a FileDiff, cursor: usize, scroll: usize, visible: usi
             if row >= scroll {
                 let left = if line.old_no.is_some() { line.text.as_str() } else { "" };
                 let right = if line.new_no.is_some() { line.text.as_str() } else { "" };
-                let text = format!("{} │ {}", pad(left, side), pad(right, side));
+                let mark = comment_mark(commented, line);
+                let text = format!("{mark}{} │ {}", pad(left, side), pad(right, side));
                 rows.push(mark(TextLine::from(text).style(line_style(line.kind)), row == cursor));
             }
             row += 1;
@@ -3284,6 +3442,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         text = format!(" Could not list worktrees: {e}");
     } else if let Some(n) = &app.notice {
         text = format!(" {n}");
+    } else if let Some(c) = app.comment_at_cursor() {
+        text = format!(" * {}", c.body);
     } else if let (Some(w), Some(s)) = (app.selected_worktree(), app.current()) {
         let count = s.diffs.as_ref().map_or(0, |d| d.len());
         text.push_str(&format!("   {}   {count} files   {} comments", worktree_label(w), s.review.comments.len()));
@@ -3312,6 +3472,7 @@ fn draw_input(f: &mut Frame, app: &App) {
     let Some(input) = &app.input else { return };
     let (title, text, options) = match input {
         Input::Comment { text, .. } => ("Comment (Enter saves, Esc cancels)", text.as_str(), Vec::new()),
+        Input::ConfirmClear => ("Clear all comments for this worktree?", "y to clear, any other key cancels", Vec::new()),
         Input::Worktree { query } => ("Find worktree", query.as_str(), {
             let labels = app.worktree_labels();
             crate::fuzzy::filter(query, &labels).into_iter().map(|i| labels[i].clone()).collect()
@@ -3371,7 +3532,7 @@ Check each screen by eye against the layout in the design doc, then accept.
 **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --test ui_snapshots`
-Expected: 11 passed.
+Expected: 12 passed.
 
 **Step 7: Commit**
 
