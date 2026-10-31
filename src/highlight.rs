@@ -1,4 +1,4 @@
-use crate::diff::FileDiff;
+use crate::diff::{FileDiff, LineKind};
 use ratatui::style::Color;
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
@@ -40,25 +40,36 @@ pub fn highlight_file(file: &FileDiff) -> HighlightedFile {
     let ext = name.rsplit('.').next().unwrap_or("");
     let syntax = syntaxes.find_syntax_by_extension(name).or_else(|| syntaxes.find_syntax_by_extension(ext));
     let hunks = file.hunks.iter().map(|hunk| {
-        let mut state = syntax.map(|s| HighlightLines::new(s, theme));
-        hunk.lines.iter().map(|line| {
-            if line.text.len() > MAX_LINE_LEN {
-                return plain(&line.text);
-            }
-            let with_newline = format!("{}\n", line.text);
-            let spans = state.as_mut().and_then(|h| {
-                h.highlight_line(&with_newline, syntaxes).ok()
-            });
-            match spans {
-                Some(spans) => spans.iter().map(|(style, text)| {
-                    let c = style.foreground;
-                    (Color::Rgb(c.r, c.g, c.b), text.trim_end_matches('\n').to_string())
-                }).filter(|(_, t)| !t.is_empty()).collect(),
-                None => plain(&line.text),
+        // Each side is its own text, so a removed `/*` must not colour the lines
+        // after it. Context is in both and shows as the new side has it.
+        let mut old = syntax.map(|s| HighlightLines::new(s, theme));
+        let mut new = syntax.map(|s| HighlightLines::new(s, theme));
+        hunk.lines.iter().map(|line| match line.kind {
+            LineKind::Removed => colour(&mut old, &line.text),
+            LineKind::Added => colour(&mut new, &line.text),
+            LineKind::Context => {
+                colour(&mut old, &line.text);
+                colour(&mut new, &line.text)
             }
         }).collect()
     }).collect();
     HighlightedFile { hunks }
+}
+
+fn colour(state: &mut Option<HighlightLines>, text: &str) -> Vec<Span> {
+    if text.len() > MAX_LINE_LEN {
+        return plain(text);
+    }
+    let (syntaxes, theme) = assets();
+    let with_newline = format!("{text}\n");
+    let spans = state.as_mut().and_then(|h| h.highlight_line(&with_newline, syntaxes).ok());
+    match spans {
+        Some(spans) => spans.iter().map(|(style, text)| {
+            let c = style.foreground;
+            (Color::Rgb(c.r, c.g, c.b), text.trim_end_matches('\n').to_string())
+        }).filter(|(_, t)| !t.is_empty()).collect(),
+        None => plain(text),
+    }
 }
 
 fn plain(text: &str) -> Vec<Span> {
@@ -68,7 +79,7 @@ fn plain(text: &str) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{Hunk, Line, LineKind, Status};
+    use crate::diff::{Hunk, Line, Status};
 
     fn file(path: &str, text: &str) -> FileDiff {
         FileDiff {
@@ -115,6 +126,25 @@ mod tests {
         for (path, text) in files {
             assert!(highlight_file(&file(path, text)).hunks[0][0].len() > 1, "{path}");
         }
+    }
+
+    fn lines(path: &str, lines: &[(LineKind, &str)]) -> FileDiff {
+        let lines = lines.iter().map(|&(kind, text)| Line { kind, old_no: None, new_no: None, text: text.into() }).collect();
+        FileDiff { hunks: vec![Hunk { header: "@@".into(), lines }], ..file(path, "") }
+    }
+
+    #[test]
+    fn a_removed_comment_opener_does_not_colour_the_lines_after_it() {
+        let diff = lines("a.c", &[(LineKind::Removed, "/* old"), (LineKind::Added, "int b;"), (LineKind::Context, "int c;")]);
+        let out = highlight_file(&diff);
+        assert!(out.hunks[0][1].len() > 1);
+        assert!(out.hunks[0][2].len() > 1);
+    }
+
+    #[test]
+    fn an_added_comment_opener_colours_the_context_after_it() {
+        let diff = lines("a.c", &[(LineKind::Added, "/* new"), (LineKind::Context, "int c;")]);
+        assert_eq!(highlight_file(&diff).hunks[0][1].len(), 1);
     }
 
     #[test]
