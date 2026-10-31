@@ -33,7 +33,7 @@ Run `branchdiff` from anywhere inside a repo. It discovers worktrees with `git w
 
 The core rule is that **the UI thread never waits on git.**
 
-- **UI loop:** handles input and draws from in-memory state only. Every keypress gets an immediate response, even while data is loading.
+- **UI loop:** handles input and draws from in-memory state only. Every keypress gets an immediate response, even while data is loading. The one exception is saving a review, which is synchronous so that an edit is on disk before the next key is handled.
 - **Git workers:** a background thread pool runs git and sends results to the UI over channels. Each worktree has at most one load running. A request made during a load runs next, and the finished result is still shown unless the base branch changed in the meantime.
 - **File watcher:** watches each worktree, debounces bursts of edits, and marks the worktree as stale. It also watches `.git/worktrees`, so worktrees created or removed during a session update the list.
 

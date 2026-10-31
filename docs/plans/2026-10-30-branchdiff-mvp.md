@@ -2052,15 +2052,13 @@ git commit -m "feat: add app state with runtime worktree switching"
 ## Task 10: Comments, reviewed marks and export keys
 
 **Files:**
-- Modify: `src/app.rs`
+- Modify: `src/app.rs`, `src/store.rs` (derive `Hash` on `Side`, which `HashSet<(u32, Side)>` needs)
 
 **Step 1: Write the failing tests**
 
 Add to the `tests` module in `src/app.rs`:
 
 ```rust
-    use crate::diff::{Hunk, Line, LineKind};
-
     fn file_with_line(text: &str) -> FileDiff {
         FileDiff {
             path: "a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0,
@@ -2099,11 +2097,11 @@ Add to the `tests` module in `src/app.rs`:
     #[test]
     fn typing_in_a_comment_does_not_trigger_hotkeys() {
         let mut a = app_on_line();
-        type_comment(&mut a, "q?]v");
+        type_comment(&mut a, "q?]v1");
         assert!(!a.should_quit && !a.help_open);
         assert_eq!(a.selected, 0);
         assert_eq!(a.view, DiffView::Unified);
-        assert_eq!(a.current().unwrap().review.comments[0].body, "q?]v");
+        assert_eq!(a.current().unwrap().review.comments[0].body, "q?]v1");
     }
 
     #[test]
@@ -2333,7 +2331,7 @@ pub enum Input {
 }
 ```
 
-At the top of `handle_key`, directly after clearing the notice:
+In `handle_key`, immediately before the `switch_worktree` call, so text input is never read as a hotkey:
 
 ```rust
         if self.input.is_some() {
@@ -2506,7 +2504,17 @@ Add these methods:
     }
 ```
 
-Add `pub outdated: usize` to `WorktreeState`, and `s.outdated = count_outdated(s);` in the `Ok(l)` arm of `Msg::Loaded`, after `s.diffs` is set.
+When `apply_worktrees` finds the selected worktree was removed, cancel any open comment or clear prompt, since it no longer has a target and would otherwise act on the next worktree:
+
+```rust
+if matches!(self.input, Some(Input::Comment { .. } | Input::ConfirmClear)) {
+    self.input = None;
+}
+```
+
+Add a test for each prompt type: open it on worktree `a`, remove `a`, press Enter or `y`, and assert `b`'s review is unchanged and no save happens.
+
+Add `pub outdated: usize` to `WorktreeState`, and `s.outdated = count_outdated(s);` in the `Ok(l)` arm of `Msg::Loaded`, directly after `s.replace_diffs(l.diffs);`.
 
 Add these free functions and imports:
 
@@ -2514,7 +2522,7 @@ Add these free functions and imports:
 use crate::store::{fnv1a, Comment, ReviewId, Side};
 use std::collections::HashSet;
 
-/// Identifies a file's content cheaply, since this runs for visible files on
+/// Identifies a file's content cheaply, since this runs for every file on
 /// every frame. Files with no `content_id`, such as mode-only changes, pure
 /// renames and dirty submodules, fall back to hashing hunks.
 ///
@@ -2576,12 +2584,12 @@ fn count_outdated(s: &WorktreeState) -> usize {
 **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib app`
-Expected: 35 passed.
+Expected: all pass.
 
 **Step 5: Commit**
 
 ```bash
-git add src/app.rs
+git add src/app.rs src/store.rs
 git commit -m "feat: add comments, reviewed marks, export and editor actions"
 ```
 
@@ -2733,10 +2741,20 @@ pub enum Input {
 }
 ```
 
-Add the hotkeys to the main match:
+Add `w` to `switch_worktree`, so it works from any screen, including help:
 
 ```rust
-            KeyCode::Char('w') => self.input = Some(Input::Worktree { query: String::new() }),
+            KeyCode::Char('w') => {
+                self.help_open = false;
+                self.input = Some(Input::Worktree { query: String::new() });
+            }
+```
+
+Add a test that `w` opens the finder and closes help when help is open.
+
+Add this to the main match:
+
+```rust
             KeyCode::Char('b') => return vec![Effect::ListBranches],
 ```
 
@@ -3100,7 +3118,11 @@ fn app() -> App {
 }
 
 fn render(a: &mut App) -> String {
-    let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    render_sized(a, 80, 12)
+}
+
+fn render_sized(a: &mut App, width: u16, height: u16) -> String {
+    let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
     t.draw(|f| ui::draw(f, a)).unwrap();
     t.backend().to_string()
 }
@@ -3128,7 +3150,7 @@ fn loading_placeholder_for_a_worktree_with_no_data() {
 fn help_overlay_lists_every_hotkey() {
     let mut a = app();
     a.handle_key(KeyEvent::from(KeyCode::Char('?')));
-    let out = render(&mut a);
+    let out = render_sized(&mut a, 80, 24);
     for label in ["next worktree", "fuzzy", "comment", "reviewed", "base branch", "this help"] {
         assert!(out.to_lowercase().contains(label), "missing {label}");
     }
@@ -3364,8 +3386,8 @@ fn unified_rows<'a>(
                     LineKind::Context => " ",
                 };
                 let number = line.new_no.or(line.old_no).unwrap_or(0);
-                let mark = comment_mark(commented, line);
-                let mut spans = vec![Span::raw(format!("{mark}{number:>5} {prefix}"))];
+                let gutter = comment_mark(commented, line);
+                let mut spans = vec![Span::raw(format!("{gutter}{number:>5} {prefix}"))];
                 match highlight.and_then(|h| h.hunks.get(hi)).and_then(|h| h.get(li)) {
                     Some(parts) => spans.extend(parts.iter().map(|(c, t)| Span::styled(t.as_str(), Style::new().fg(*c)))),
                     None => spans.push(Span::raw(line.text.as_str())),
@@ -3407,8 +3429,8 @@ fn split_rows<'a>(
             if row >= scroll {
                 let left = if line.old_no.is_some() { line.text.as_str() } else { "" };
                 let right = if line.new_no.is_some() { line.text.as_str() } else { "" };
-                let mark = comment_mark(commented, line);
-                let text = format!("{mark}{} │ {}", pad(left, side), pad(right, side));
+                let gutter = comment_mark(commented, line);
+                let text = format!("{gutter}{} │ {}", pad(left, side), pad(right, side));
                 rows.push(mark(TextLine::from(text).style(line_style(line.kind)), row == cursor));
             }
             row += 1;
