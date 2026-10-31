@@ -1,10 +1,11 @@
 use crate::cache::{CacheKey, Diffs};
 use crate::diff::{FileDiff, Hunk, Status};
 use crate::git::{GitError, Worktree};
+use crate::highlight::HighlightedFile;
 use crate::store::{fnv1a, Comment, Review, ReviewId, Side};
 use crate::worker::Msg;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub enum Effect {
     CopyExport(String),
     WriteExport(String),
     OpenEditor { path: PathBuf, line: u32 },
+    Highlight { key: CacheKey, file_index: usize, diffs: Diffs },
 }
 
 /// A text prompt. While set, keys go here rather than to hotkeys.
@@ -56,6 +58,7 @@ pub struct WorktreeState {
     pub scroll: usize,
     pub review: Review,
     pub outdated: usize,
+    pub highlights: HashMap<usize, HighlightedFile>,
 }
 
 impl WorktreeState {
@@ -293,6 +296,17 @@ impl App {
         self.current()?.current_file()
     }
 
+    /// Requests colour for the current file if it does not have it yet.
+    pub fn highlight_effect(&self) -> Option<Effect> {
+        let s = self.current()?;
+        // A worktree with no changes has no file to highlight.
+        s.diffs.as_ref()?.get(s.file)?;
+        if s.highlights.contains_key(&s.file) {
+            return None;
+        }
+        Some(Effect::Highlight { key: s.key.clone()?, file_index: s.file, diffs: s.diffs.clone()? })
+    }
+
     pub fn handle_msg(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Worktrees(Ok(list)) => {
@@ -308,6 +322,9 @@ impl App {
                     let s = &mut self.states[i];
                     match result {
                         Ok(l) => {
+                            if s.key.as_ref() != Some(&l.key) {
+                                s.highlights.clear();
+                            }
                             s.key = Some(l.key);
                             s.replace_diffs(l.diffs);
                             s.outdated = count_outdated(s);
@@ -346,7 +363,12 @@ impl App {
                 self.notice = Some(e.to_string());
                 Vec::new()
             }
-            Msg::Highlighted { .. } => Vec::new(),
+            Msg::Highlighted { key, file_index, lines } => {
+                if let Some(s) = self.states.iter_mut().find(|s| s.key.as_ref() == Some(&key)) {
+                    s.highlights.insert(file_index, lines);
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -908,6 +930,32 @@ mod tests {
         assert_eq!(s.key, Some(key));
         deliver(&mut a, "a", vec![file("1")]);
         assert_eq!(a.current().unwrap().op, None);
+    }
+
+    #[test]
+    fn nothing_is_highlighted_for_an_empty_diff() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![]);
+        assert_eq!(a.highlight_effect(), None);
+    }
+
+    #[test]
+    fn a_reload_keeps_colours_only_while_the_key_is_unchanged() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file("1")]);
+        assert!(a.highlight_effect().is_some());
+        let key = a.current().unwrap().key.clone().unwrap();
+        a.handle_msg(Msg::Highlighted { key: key.clone(), file_index: 0, lines: Default::default() });
+        assert_eq!(a.highlight_effect(), None);
+
+        deliver(&mut a, "a", vec![file("1")]);
+        assert!(a.current().unwrap().highlights.contains_key(&0));
+
+        let changed = CacheKey { fingerprint: 2, ..key };
+        let loaded = Loaded { key: changed, diffs: Arc::new(vec![file("1")]), op: None };
+        a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Ok(loaded) });
+        assert!(a.current().unwrap().highlights.is_empty());
+        assert!(a.highlight_effect().is_some());
     }
 
     #[test]
