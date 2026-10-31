@@ -1420,3 +1420,11 @@ fn a_failed_load_after_a_base_change_stays_stale() {
     assert!(a.states[0].error.is_some());
     assert!(a.states[0].stale);
 }
+
+#[test]
+fn a_watch_limit_tells_the_user_the_badge_may_be_incomplete() {
+    let mut a = app(&["a"]);
+    let fx = a.handle_msg(Msg::WatchLimit);
+    assert!(fx.is_empty());
+    assert_eq!(a.notice.as_deref(), Some("File watching limit reached, the changed badge may be incomplete"));
+}

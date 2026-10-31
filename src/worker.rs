@@ -38,6 +38,7 @@ pub enum Msg {
     Highlighted { key: CacheKey, file_index: usize, lines: crate::highlight::HighlightedFile },
     Stale(PathBuf),
     WorktreesChanged,
+    WatchLimit,
 }
 
 struct Running {

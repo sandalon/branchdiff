@@ -359,6 +359,10 @@ impl App {
                 Vec::new()
             }
             Msg::WorktreesChanged => vec![Effect::ReloadWorktrees],
+            Msg::WatchLimit => {
+                self.notice = Some("File watching limit reached, the changed badge may be incomplete".into());
+                Vec::new()
+            }
             Msg::Branches(Ok(branches)) => {
                 // A late reply must not wipe a half-written comment.
                 if self.input.is_none() {

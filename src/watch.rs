@@ -13,6 +13,8 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 /// How often pending work is looked at. Nothing wakes the thread when none is.
 const TICK: Duration = Duration::from_millis(50);
 const IDLE: Duration = Duration::from_secs(3600);
+/// Agents can write steadily, which would otherwise hold back a report for good.
+const MAX_WAIT: Duration = Duration::from_secs(2);
 
 /// The files git rewrites when a worktree's state changes: staging, moving to a
 /// branch, and every commit or reset, which may leave the other two untouched.
@@ -91,10 +93,16 @@ fn linked_name(root: &Path) -> Option<OsString> {
     Path::new(dir).file_name().map(OsString::from)
 }
 
-/// Reports a key once no new event has arrived for the debounce window.
+struct Pending {
+    first: Instant,
+    last: Instant,
+}
+
+/// Reports a key once no new event has arrived for the debounce window, or
+/// once it has been pending for `MAX_WAIT`, whichever comes first.
 pub struct Debouncer {
     window: Duration,
-    pending: HashMap<PathBuf, Instant>,
+    pending: HashMap<PathBuf, Pending>,
 }
 
 impl Debouncer {
@@ -103,7 +111,7 @@ impl Debouncer {
     }
 
     pub fn record(&mut self, key: PathBuf, now: Instant) {
-        self.pending.insert(key, now);
+        self.pending.entry(key).or_insert(Pending { first: now, last: now }).last = now;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -113,13 +121,46 @@ impl Debouncer {
     pub fn due(&mut self, now: Instant) -> Vec<PathBuf> {
         let window = self.window;
         let due: Vec<PathBuf> = self.pending.iter()
-            .filter(|(_, t)| now.duration_since(**t) >= window)
+            .filter(|(_, p)| now.duration_since(p.last) >= window || now.duration_since(p.first) >= MAX_WAIT)
             .map(|(k, _)| k.clone())
             .collect();
         for k in &due {
             self.pending.remove(k);
         }
         due
+    }
+}
+
+fn is_watch_limit(error: &notify::Error) -> bool {
+    matches!(error.kind, notify::ErrorKind::MaxFilesWatch)
+}
+
+/// Tells the user about the watch limit, once, however often it is hit: a root
+/// that hit it is retried on every `SetWorktrees`.
+struct WatchLimit {
+    msgs: Sender<Msg>,
+    reported: bool,
+}
+
+impl WatchLimit {
+    fn new(msgs: Sender<Msg>) -> Self {
+        Self { msgs, reported: false }
+    }
+
+    fn note(&mut self, error: &notify::Error) {
+        if is_watch_limit(error) && !self.reported {
+            self.reported = true;
+            let _ = self.msgs.send(Msg::WatchLimit);
+        }
+    }
+}
+
+/// The OS dropped events, so a change anywhere may have gone unseen.
+fn roots_to_rescan(event: &Event, watched: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    if event.need_rescan() {
+        watched.iter().cloned().collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -134,10 +175,18 @@ pub fn spawn(common_dir: PathBuf, msgs: Sender<Msg>) -> notify::Result<Sender<Co
     // Recursive, because `worktrees` may not exist yet, is deleted along with the
     // last linked worktree, and holds their index files. A bare repository has
     // no worktree of its own to cover it.
-    watcher.watch(&common_dir, RecursiveMode::Recursive)?;
+    let mut limit = WatchLimit::new(msgs.clone());
+    if let Err(e) = watcher.watch(&common_dir, RecursiveMode::Recursive) {
+        // The caller treats an error as having no watcher, which would hide the
+        // limit, and whatever was watched before it was reached still works.
+        if !is_watch_limit(&e) {
+            return Err(e);
+        }
+        limit.note(&e);
+    }
     let worktrees_dir = common_dir.join("worktrees");
 
-    thread::spawn(move || run(watcher, worktrees_dir, fs_rx, cmd_rx, msgs));
+    thread::spawn(move || run(watcher, worktrees_dir, fs_rx, cmd_rx, msgs, limit));
     Ok(cmd_tx)
 }
 
@@ -151,14 +200,20 @@ struct Worktrees {
 }
 
 impl Worktrees {
-    fn set(&mut self, watcher: &mut RecommendedWatcher, next: Vec<PathBuf>) {
+    fn set(&mut self, watcher: &mut RecommendedWatcher, next: Vec<PathBuf>, limit: &mut WatchLimit) {
         let gone: Vec<_> = self.watched.iter().filter(|r| !next.contains(r)).cloned().collect();
         for root in gone {
             self.forget(watcher, &root);
         }
         for root in &next {
-            if !self.watched.contains(root) && watcher.watch(root, RecursiveMode::Recursive).is_ok() {
-                self.watched.insert(root.clone());
+            if self.watched.contains(root) {
+                continue;
+            }
+            match watcher.watch(root, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    self.watched.insert(root.clone());
+                }
+                Err(e) => limit.note(&e),
             }
         }
         self.linked = next.iter().filter_map(|r| Some((linked_name(r)?, r.clone()))).collect();
@@ -195,6 +250,7 @@ fn run(
     fs_rx: Receiver<notify::Result<Event>>,
     cmd_rx: Receiver<Command>,
     msgs: Sender<Msg>,
+    mut limit: WatchLimit,
 ) {
     let mut worktrees = Worktrees::default();
     // Asked about in batches, because each batch costs a process. A write to an
@@ -209,12 +265,20 @@ fn run(
         let idle = unchecked.is_empty() && bursts.is_empty() && list_changed.is_empty();
         select! {
             recv(cmd_rx) -> cmd => match cmd {
-                Ok(Command::SetWorktrees(next)) => worktrees.set(&mut watcher, next),
+                Ok(Command::SetWorktrees(next)) => worktrees.set(&mut watcher, next, &mut limit),
                 Err(_) => return,
             },
             recv(fs_rx) -> event => {
                 let Ok(event) = event else { return };
                 let now = Instant::now();
+                match &event {
+                    Ok(event) => {
+                        for root in roots_to_rescan(event, &worktrees.watched) {
+                            bursts.record(root, now);
+                        }
+                    }
+                    Err(e) => limit.note(e),
+                }
                 for event in event.iter().filter(|e| is_change(&e.kind)) {
                     for path in &event.paths {
                         match classify(path, &worktrees_dir, &worktrees.roots, &worktrees.linked) {
@@ -264,6 +328,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::Flag;
     use std::path::Path;
 
     fn roots() -> Vec<PathBuf> {
@@ -310,6 +375,80 @@ mod tests {
         assert!(d.due(t0 + Duration::from_millis(250)).is_empty());
         assert_eq!(d.due(t0 + Duration::from_millis(301)), vec![PathBuf::from("/r/a")]);
         assert!(d.due(t0 + Duration::from_millis(600)).is_empty());
+    }
+
+    #[test]
+    fn steady_events_report_at_the_maximum_wait() {
+        let mut d = Debouncer::new(Duration::from_millis(200));
+        let t0 = Instant::now();
+        for ms in (0..2000).step_by(100) {
+            let at = t0 + Duration::from_millis(ms);
+            d.record("/r/a".into(), at);
+            assert!(d.due(at).is_empty(), "{ms}");
+        }
+        let at = t0 + MAX_WAIT;
+        d.record("/r/a".into(), at);
+        assert_eq!(d.due(at), vec![PathBuf::from("/r/a")]);
+    }
+
+    #[test]
+    fn the_maximum_wait_restarts_after_a_report() {
+        let mut d = Debouncer::new(Duration::from_millis(200));
+        let t0 = Instant::now();
+        d.record("/r/a".into(), t0);
+        d.record("/r/a".into(), t0 + MAX_WAIT);
+        assert_eq!(d.due(t0 + MAX_WAIT).len(), 1);
+        let next = t0 + MAX_WAIT + Duration::from_millis(100);
+        d.record("/r/a".into(), next);
+        assert!(d.due(next).is_empty());
+    }
+
+    #[test]
+    fn the_maximum_wait_is_per_key() {
+        let mut d = Debouncer::new(Duration::from_millis(200));
+        let t0 = Instant::now();
+        d.record("/r/old".into(), t0);
+        let at = t0 + MAX_WAIT;
+        d.record("/r/old".into(), at);
+        d.record("/r/new".into(), at);
+        assert_eq!(d.due(at), vec![PathBuf::from("/r/old")]);
+    }
+
+    #[test]
+    fn only_the_inotify_limit_counts_as_the_watch_limit() {
+        assert!(is_watch_limit(&notify::Error::new(notify::ErrorKind::MaxFilesWatch)));
+        assert!(!is_watch_limit(&notify::Error::path_not_found()));
+        assert!(!is_watch_limit(&notify::Error::watch_not_found()));
+        assert!(!is_watch_limit(&notify::Error::generic("no")));
+    }
+
+    #[test]
+    fn the_watch_limit_is_reported_once() {
+        let (tx, rx) = unbounded();
+        let mut limit = WatchLimit::new(tx);
+        limit.note(&notify::Error::path_not_found());
+        assert_eq!(rx.try_iter().count(), 0, "not the limit");
+        limit.note(&notify::Error::new(notify::ErrorKind::MaxFilesWatch));
+        assert!(matches!(rx.try_recv(), Ok(Msg::WatchLimit)));
+        limit.note(&notify::Error::new(notify::ErrorKind::MaxFilesWatch));
+        assert_eq!(rx.try_iter().count(), 0, "already reported");
+    }
+
+    #[test]
+    fn dropped_events_mark_every_watched_root() {
+        let watched = HashSet::from([PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
+        let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        let mut roots = roots_to_rescan(&rescan, &watched);
+        roots.sort();
+        assert_eq!(roots, vec![PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
+    }
+
+    #[test]
+    fn ordinary_events_mark_nothing_wholesale() {
+        let watched = HashSet::from([PathBuf::from("/r/a")]);
+        assert!(roots_to_rescan(&Event::new(EventKind::Other), &watched).is_empty());
+        let edit = Event::new(EventKind::Remove(RemoveKind::File)).add_path("/r/a/x".into());
+        assert!(roots_to_rescan(&edit, &watched).is_empty());
     }
 
     #[test]
