@@ -4076,6 +4076,10 @@ fn on_event(app: &mut App, ev: Event) -> Vec<Effect> {
 }
 
 fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
+    let mut changed_during_load = None;
+    if let Msg::Stale(path) = &msg {
+        rt.loads.mark_changed(path);
+    }
     if let Msg::Loaded { path, .. } = &msg {
         let done = rt.loads.finished(path);
         if let Some(job) = done.next {
@@ -4084,8 +4088,11 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
         if done.superseded {
             return Vec::new();
         }
+        if done.changed {
+            changed_during_load = Some(path.clone());
+        }
     }
-    match msg {
+    let effects = match msg {
         Msg::Worktrees(Ok(list)) => {
             if let Some(tx) = &rt.watch {
                 let _ = tx.send(watch::Command::SetWorktrees(list.iter().map(|w| w.path.clone()).collect()));
@@ -4116,7 +4123,12 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
             app.handle_msg(msg)
         }
         other => app.handle_msg(other),
+    };
+    // A loaded result clears the badge, so restore it for edits it can't include.
+    if let Some(path) = changed_during_load {
+        app.handle_msg(Msg::Stale(path));
     }
+    effects
 }
 
 fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -4195,6 +4207,8 @@ Add this method to `App` in `src/app.rs`, with a test that replacing a review re
         }
     }
 ```
+
+Add change tracking to `Loads` in `src/worker.rs`, with tests: `pub fn mark_changed(&mut self, path: &Path)` records that a worktree changed while its load runs, and does nothing if no load is running. `Finished` gains `pub changed: bool`, which is true only when a change was marked and no waiting load follows, because a waiting load starts after the change and includes it. Promoting a waiting job clears the mark.
 
 Two behaviours to preserve while wiring this up:
 
