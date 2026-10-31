@@ -428,9 +428,6 @@ impl App {
     /// Adds pasted text to the open prompt. Pastes arrive whole, so a newline
     /// in one can't submit the prompt or run the rest as hotkeys.
     pub fn paste(&mut self, text: &str) {
-        if self.help_open {
-            return;
-        }
         if let Some(open) = self.input.as_mut().and_then(Input::text_mut) {
             open.push_str(&single_line(text));
         }
@@ -552,9 +549,9 @@ fn single_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut after_break = false;
     for c in text.chars() {
-        let is_break = matches!(c, '\r' | '\n');
+        let is_break = matches!(c, '\r' | '\n' | '\u{2028}' | '\u{2029}');
         if !(is_break && after_break) {
-            out.push(if c.is_control() && c != '\t' { ' ' } else { c });
+            out.push(if is_break || (c.is_control() && c != '\t') { ' ' } else { c });
         }
         after_break = is_break;
     }
@@ -1582,6 +1579,8 @@ mod tests {
         assert_eq!(pasted("a\r\nb"), "a b");
         assert_eq!(pasted("a\r\n\r\n\nb"), "a b");
         assert_eq!(pasted("a\rb\nc"), "a b c");
+        assert_eq!(pasted("a\u{2028}b\u{2029}c"), "a b c");
+        assert_eq!(pasted("a\u{2028}\u{2029}\r\nb"), "a b");
         assert_eq!(pasted("a\u{1b}[2Jb\u{7f}\u{85}"), "a [2Jb  ");
         assert_eq!(pasted("a\tb é日本"), "a\tb é日本");
     }
@@ -1604,14 +1603,6 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_while_help_is_open_changes_nothing() {
-        let mut a = comment_prompt_with("kept");
-        a.help_open = true;
-        a.paste("more");
-        assert!(matches!(&a.input, Some(Input::Comment { text, .. }) if text == "kept"));
-    }
-
-    #[test]
     fn a_paste_does_not_answer_the_clear_prompt() {
         let mut a = app_on_line();
         type_comment(&mut a, "fix");
@@ -1619,5 +1610,138 @@ mod tests {
         a.paste("y");
         assert!(matches!(a.input, Some(Input::ConfirmClear)));
         assert_eq!(a.current().unwrap().review.comments.len(), 1);
+    }
+
+    fn note(path: &str, line: u32, side: Side, line_text: &str) -> Comment {
+        Comment { path: path.into(), line, side, line_text: line_text.into(), body: "note".into() }
+    }
+
+    #[test]
+    fn a_save_from_a_later_worktree_holds_its_own_id_and_review() {
+        let mut a = app(&["a", "b"]);
+        deliver(&mut a, "a", vec![file_with_line("x")]);
+        deliver(&mut a, "b", vec![file_with_line("y")]);
+        press(&mut a, 'x');
+        press(&mut a, ']');
+        a.focus = Focus::Diff;
+        press(&mut a, 'j');
+        let fx = type_comment(&mut a, "fix");
+        assert_eq!(a.states[1].review.comments.len(), 1);
+        assert_ne!(a.states[0].review, a.states[1].review);
+        assert_eq!(fx, vec![Effect::SaveReview { id: ReviewId::Branch("b".into()), review: a.states[1].review.clone() }]);
+    }
+
+    #[test]
+    fn adding_a_comment_recounts_outdated() {
+        let mut a = app_on_line();
+        press(&mut a, 'c');
+        press(&mut a, 'z');
+        deliver(&mut a, "a", vec![file_with_line("changed while typing")]);
+        assert_eq!(a.outdated_comments(), 0);
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.outdated_comments(), 1);
+    }
+
+    #[test]
+    fn clearing_comments_resets_outdated() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
+        assert_eq!(a.outdated_comments(), 1);
+        press(&mut a, 'D');
+        press(&mut a, 'y');
+        assert_eq!(a.outdated_comments(), 0);
+    }
+
+    #[test]
+    fn a_comment_on_a_typechanges_second_entry_is_current() {
+        let gone = FileDiff { status: Status::Deleted, hunks: vec![hunk("@@ -1 +0,0 @@", vec![removed(1)])], ..file("t") };
+        let there = FileDiff { path: "t".into(), status: Status::Added, ..file_with_line("new") };
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![gone, there]);
+        press(&mut a, 'n');
+        a.focus = Focus::Diff;
+        press(&mut a, 'j');
+        type_comment(&mut a, "fix");
+        assert_eq!(a.outdated_comments(), 0);
+    }
+
+    #[test]
+    fn a_removed_line_comment_does_not_match_a_line_still_in_the_new_file() {
+        let mut a = app(&["a"]);
+        a.states[0].review.comments.push(note("a.rs", 5, Side::Old, "x"));
+        let f = FileDiff { hunks: vec![hunk("@@ -5 +7 @@", vec![context(5, 7)])], ..file("a.rs") };
+        deliver(&mut a, "a", vec![f]);
+        assert_eq!(a.outdated_comments(), 1);
+    }
+
+    #[test]
+    fn capital_y_cancels_a_clear() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        press(&mut a, 'D');
+        assert!(a.handle_key(with('Y', KeyModifiers::SHIFT)).is_empty());
+        assert!(a.input.is_none());
+        assert_eq!(a.current().unwrap().review.comments.len(), 1);
+    }
+
+    #[test]
+    fn a_clear_leaves_reviewed_marks_alone() {
+        let mut a = app_on_line();
+        press(&mut a, 'x');
+        type_comment(&mut a, "fix");
+        press(&mut a, 'D');
+        press(&mut a, 'y');
+        assert!(a.is_reviewed(0));
+    }
+
+    #[test]
+    fn a_comment_body_is_kept_exactly() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "  pad  ");
+        assert_eq!(a.current().unwrap().review.comments[0].body, "  pad  ");
+    }
+
+    #[test]
+    fn commented_lines_covers_only_the_current_file() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        a.states[0].review.comments.push(note("other.rs", 9, Side::New, "x"));
+        assert_eq!(a.commented_lines(), HashSet::from([(1, Side::New)]));
+    }
+
+    #[test]
+    fn comment_at_cursor_respects_the_side() {
+        let mut a = app_on_line();
+        a.states[0].review.comments.push(note("a.rs", 1, Side::Old, "gone"));
+        assert!(a.comment_at_cursor().is_none());
+        assert!(press(&mut a, 'd').is_empty());
+        assert_eq!(a.current().unwrap().review.comments.len(), 1);
+    }
+
+    #[test]
+    fn export_names_the_branch_rather_than_the_head() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        assert!(matches!(press(&mut a, 'y').as_slice(),
+            [Effect::CopyExport(md)] if md.starts_with("## Review of `a` against `develop`")));
+    }
+
+    #[test]
+    fn content_hash_differs_when_only_a_lines_kind_differs() {
+        let added = numbered(LineKind::Added, None, Some(1));
+        let gone = numbered(LineKind::Removed, Some(1), None);
+        let with_line = |l| FileDiff { hunks: vec![hunk("@@", vec![l])], ..file("a") };
+        assert_ne!(content_hash(&with_line(added)), content_hash(&with_line(gone)));
+    }
+
+    #[test]
+    fn e_opens_the_full_path_in_the_selected_worktree() {
+        let mut a = app(&["a", "b"]);
+        deliver(&mut a, "b", vec![file_with_line("x")]);
+        press(&mut a, ']');
+        a.focus = Focus::Diff;
+        press(&mut a, 'j');
+        assert_eq!(press(&mut a, 'e'), vec![Effect::OpenEditor { path: "/r/b/a.rs".into(), line: 1 }]);
     }
 }
