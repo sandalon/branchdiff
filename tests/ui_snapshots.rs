@@ -344,10 +344,15 @@ fn the_selected_file_stays_visible_among_thousands_with_its_own_reviewed_mark() 
 
 #[test]
 fn messages_wrap_in_the_narrow_diff_area() {
+    // 60 columns leaves 26 cells inside the diff area.
     let mut a = app_with(Vec::new());
-    assert!(render(&mut a).contains("branch"));
+    assert!(render_sized(&mut a, 60, 12).contains("branch"));
     let mut a = app_with(vec![FileDiff { binary: true, hunks: Vec::new(), ..sample_file() }]);
-    assert!(render(&mut a).contains("not shown"));
+    assert!(render_sized(&mut a, 60, 12).contains("not shown"));
+    let mut a = app();
+    let long = format!("{} the-last-words", "error ".repeat(30));
+    a.handle_msg(Msg::Loaded { path: "/r/feat-auth".into(), result: Err(GitError::Failed(long)) });
+    assert!(render(&mut a).contains("the-last-words"));
 }
 
 #[test]
@@ -681,5 +686,129 @@ fn highlighted_spans_keep_their_colours_on_added_and_removed_rows() {
         let buffer = render_buffer(&mut a, 120, 12);
         assert_eq!(cell_of(&buffer, "Z").fg, Color::Red);
         assert_eq!(cell_of(&buffer, "Q").fg, Color::Green);
+    }
+}
+
+const HEART: &str = "❤\u{fe0f}";
+
+#[test]
+fn a_name_of_emoji_sequences_leaves_room_for_its_badges() {
+    let mut a = App::new("develop".into());
+    let name = format!("{}-end", HEART.repeat(30));
+    a.handle_msg(Msg::Worktrees(Ok(vec![Worktree { path: "/r/w".into(), head: "h".into(), branch: Some(name) }])));
+    a.handle_msg(Msg::Stale("/r/w".into()));
+    for width in [80, 120, 200] {
+        let out = render_sized(&mut a, width, 12);
+        assert!(out.contains("-end +0 ●"), "{out}");
+    }
+}
+
+#[test]
+fn a_prompt_of_emoji_sequences_shows_its_end() {
+    let mut a = app();
+    a.focus = Focus::Diff;
+    type_keys(&mut a, "jc");
+    a.paste(&"⚠\u{fe0f}".repeat(60));
+    a.paste("END");
+    let out = render_sized(&mut a, 80, 24);
+    assert!(out.contains("END"), "{out}");
+}
+
+#[test]
+fn finder_rows_keep_the_end_of_names_that_share_a_prefix() {
+    let shared = format!("feature/{}", "shared-prefix-".repeat(8));
+    let [alpha, beta] = [format!("{shared}alpha"), format!("{shared}beta")];
+    let mut a = App::new("develop".into());
+    let list = [&alpha, &beta].map(|n| Worktree { path: format!("/r/{n}").into(), head: "h".into(), branch: Some(n.clone()) });
+    a.handle_msg(Msg::Worktrees(Ok(list.to_vec())));
+    type_keys(&mut a, "wfeature");
+    let out = render_sized(&mut a, 80, 24);
+    assert!(out.contains("│…") && out.contains("shared-prefix-alpha"), "{out}");
+    assert!(out.contains("shared-prefix-beta"), "{out}");
+}
+
+#[test]
+fn base_picker_rows_keep_the_end_of_names_that_share_a_prefix() {
+    let shared = format!("release/{}", "shared-prefix-".repeat(8));
+    let mut a = app();
+    a.handle_msg(Msg::Branches(Ok(vec![format!("{shared}alpha"), format!("{shared}beta")])));
+    let out = render_sized(&mut a, 80, 24);
+    assert!(out.contains("shared-prefix-alpha") && out.contains("shared-prefix-beta"), "{out}");
+}
+
+#[test]
+fn a_long_base_branch_leaves_the_worktree_name_and_counts_in_the_status_bar() {
+    let mut a = app();
+    a.base = "release/a-rather-long-base-branch-name-for-testing/1.0".into();
+    let line = status_line(&render(&mut a));
+    assert!(line.contains("base: …"), "{line}");
+    assert!(line.contains("/1.0"), "{line}");
+    assert!(line.contains("   feat-auth   1 file   0 comments"), "{line}");
+}
+
+#[test]
+fn a_path_with_control_characters_stays_on_one_row() {
+    let path = |p: &str| FileDiff { path: p.into(), ..sample_file() };
+    let mut a = app_with(vec![path("a.rs"), path("b\nc\td.rs"), path("e.rs")]);
+    a.focus = Focus::Files;
+    press(&mut a, 'j', 2);
+    let out = render(&mut a);
+    assert_eq!(row_of(&out, "a.rs"), Some(1), "{out}");
+    assert_eq!(row_of(&out, "b c d.rs"), Some(2), "{out}");
+    assert_eq!(row_of(&out, "e.rs"), Some(3), "{out}");
+    let buffer = render_buffer(&mut a, 80, 12);
+    assert!(buffer[(17, 3)].modifier.contains(Modifier::REVERSED), "{out}");
+}
+
+#[test]
+fn the_diff_cursor_stays_on_screen_when_moved_past_the_window() {
+    let lines: Vec<String> = (1..=40).map(|i| format!("line{i}")).collect();
+    let texts: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut a = app_with(vec![file_of(&texts)]);
+    a.focus = Focus::Diff;
+    press(&mut a, 'j', 30);
+    let buffer = render_buffer(&mut a, 80, 12);
+    assert_eq!(a.current().unwrap().scroll, 22);
+    let row: String = (33..79).map(|x| buffer[(x, 9)].symbol()).collect();
+    assert!(row.contains("line30"), "{row}");
+    assert!(buffer[(33, 9)].modifier.contains(Modifier::REVERSED), "{row}");
+}
+
+#[test]
+fn the_highlight_is_on_the_selected_file_in_a_scrolled_list() {
+    let mut a = app_with(numbered_files(40));
+    a.focus = Focus::Files;
+    press(&mut a, 'j', 20);
+    render(&mut a);
+    press(&mut a, 'k', 4);
+    let buffer = render_buffer(&mut a, 80, 12);
+    let selected: Vec<u16> = (1..10).filter(|&y| buffer[(17, y)].modifier.contains(Modifier::REVERSED)).collect();
+    assert_eq!(selected, [5]);
+    let row: String = (17..31).map(|x| buffer[(x, 5)].symbol()).collect();
+    assert!(row.contains("f016.rs"), "{row}");
+}
+
+#[test]
+fn a_tab_in_a_highlighted_unified_span_is_expanded() {
+    let mut a = app_with(vec![file_of(&["\tbody"])]);
+    let hunks = vec![vec![vec![(Color::Red, "\t".to_string()), (Color::Green, "body".to_string())]]];
+    a.handle_msg(Msg::Highlighted { key: key(), file_index: 0, lines: HighlightedFile { hunks } });
+    assert!(render(&mut a).contains("+    body"));
+}
+
+#[test]
+fn the_help_hint_is_whole_or_absent_beside_a_notice_or_a_comment() {
+    let mut noticed = app();
+    noticed.notice = Some("Something happened".into());
+    let mut commented = app();
+    commented.focus = Focus::Diff;
+    type_keys(&mut commented, "jcwhy");
+    commented.handle_key(KeyEvent::from(KeyCode::Enter));
+    assert!(render_sized(&mut commented, 80, 12).contains(" * why   ? help"));
+    for a in [&mut noticed, &mut commented] {
+        for width in 3..60 {
+            let line = status_line(&render_sized(a, width, 12));
+            assert!(line.contains("? help") || !line.contains('?'), "{line}");
+        }
     }
 }

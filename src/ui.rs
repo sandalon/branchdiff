@@ -19,6 +19,8 @@ const SYMBOL: usize = 2;
 const FILE_PREFIX: usize = 3;
 /// Cells a worktree name keeps before anything less important gives way.
 const MIN_NAME: usize = 4;
+/// Cells a base branch keeps, so that a usual name like `develop` stays whole.
+const MIN_BASE: usize = 16;
 const GAP: &str = "   ";
 const HELP_HINT: &str = "   ? help";
 /// Text on the dark added and removed backgrounds, which must not take a light
@@ -210,7 +212,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(rows).block(block("Diff", focused)), area);
 }
 
-/// Wrapped, because the diff area is only 28 cells wide on an 80-column screen.
+/// Wrapped, because git's messages can be far wider than the diff area.
 fn message<'a>(text: impl Into<ratatui::text::Text<'a>>) -> Paragraph<'a> {
     Paragraph::new(text).wrap(Wrap { trim: false })
 }
@@ -366,7 +368,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     } else {
         status_summary(app, width)
     };
-    if text.width() + HELP_HINT.width() <= width {
+    if drawn_width(&text) + HELP_HINT.width() <= width {
         text.push_str(HELP_HINT);
     }
     f.render_widget(Paragraph::new(text), area);
@@ -375,22 +377,26 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 /// Warnings first, since the end is what a narrow screen cuts. A long branch
 /// name shortens so that the counts after it and the help hint still fit.
 fn status_summary(app: &App, width: usize) -> String {
-    let base = format!("base: {}", app.base);
     let (Some(w), Some(s)) = (app.selected_worktree(), app.current()) else {
-        return format!(" {base}");
+        return format!(" base: {}", app.base);
     };
-    let mut head = Vec::new();
-    if let Some(op) = s.op { head.push(format!("! {op} in progress")); }
-    if s.stale { head.push("● changed".to_string()); }
+    let mut warnings = String::new();
+    if let Some(op) = s.op { warnings.push_str(&format!("! {op} in progress{GAP}")); }
+    if s.stale { warnings.push_str(&format!("● changed{GAP}")); }
     let outdated = app.outdated_comments();
-    if outdated > 0 { head.push(format!("({outdated} outdated)")); }
-    head.push(base);
-    let head = head.join(GAP);
+    if outdated > 0 { warnings.push_str(&format!("({outdated} outdated){GAP}")); }
     let counts = format!("{}{GAP}{}", plural(app.file_count(), "file"), plural(s.review.comments.len(), "comment"));
 
-    let spare = width.saturating_sub(1 + head.width() + GAP.len() * 2 + counts.width());
-    let room = if spare >= MIN_NAME + HELP_HINT.width() { spare - HELP_HINT.width() } else { spare.max(MIN_NAME) };
-    format!(" {head}{GAP}{}{GAP}{counts}", elide(&worktree_label(w), room))
+    // What's left for the two names, which share it.
+    let fixed = 1 + warnings.width() + "base: ".len() + GAP.len() * 2 + counts.width();
+    let spare = width.saturating_sub(fixed);
+    let hint = HELP_HINT.width();
+    let room = if spare >= MIN_NAME * 2 + hint { spare - hint } else { spare };
+    let label = worktree_label(w);
+    let base_room = room.saturating_sub(drawn_width(&label).min(room / 2)).max(MIN_BASE);
+    let base = elide(&app.base, base_room);
+    let label_room = room.saturating_sub(drawn_width(&base)).max(MIN_NAME);
+    format!(" {warnings}base: {base}{GAP}{}{GAP}{counts}", elide(&label, label_room))
 }
 
 fn plural(count: usize, noun: &str) -> String {
@@ -402,27 +408,44 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
 }
 
-/// The end of `text` that fits in `width` cells.
-fn tail(text: &str, width: usize) -> &str {
-    let mut used = 0;
-    for (i, c) in text.char_indices().rev() {
-        used += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if used > width {
-            return &text[i + c.len_utf8()..];
-        }
-    }
-    text
+/// Cells `text` takes when drawn. By grapheme, as ratatui draws, because an
+/// emoji sequence's width isn't the sum of its characters.
+fn drawn_width(text: &str) -> usize {
+    Span::raw(text).styled_graphemes(Style::new()).map(|g| g.symbol.width()).sum()
 }
 
-/// `text` if it fits in `width` cells, otherwise its end after an ellipsis. The
-/// end of a path or branch name is usually the part that tells it from others.
+/// The end of `text` that fits in `width` cells.
+fn tail(text: &str, width: usize) -> String {
+    let span = Span::raw(text);
+    let graphemes: Vec<_> = span.styled_graphemes(Style::new()).collect();
+    let mut used = 0;
+    let mut start = graphemes.len();
+    for (i, g) in graphemes.iter().enumerate().rev() {
+        used += g.symbol.width();
+        if used > width {
+            break;
+        }
+        start = i;
+    }
+    graphemes[start..].iter().map(|g| g.symbol).collect()
+}
+
+/// `text` as one row: control characters become spaces, since git allows tabs
+/// and newlines in paths, and a list row must stay one line. If it doesn't fit
+/// in `width` cells, its end after an ellipsis, because the end of a path or
+/// branch name is usually the part that tells it from others.
 fn elide(text: &str, width: usize) -> Cow<'_, str> {
-    if text.width() <= width {
+    let line = if text.contains(char::is_control) {
+        Cow::Owned(text.replace(char::is_control, " "))
+    } else {
         Cow::Borrowed(text)
+    };
+    if drawn_width(&line) <= width {
+        line
     } else if width == 0 {
         Cow::Borrowed("")
     } else {
-        Cow::Owned(format!("…{}", tail(text, width - 1)))
+        Cow::Owned(format!("…{}", tail(&line, width - 1)))
     }
 }
 
@@ -447,11 +470,12 @@ fn draw_input(f: &mut Frame, app: &App) {
         }),
     };
     let area = centered(f.area(), 60, (options.len().min(8) as u16) + 3);
+    let room = area.width.saturating_sub(BORDERS as u16) as usize;
     let shown = display_text(text);
     // Two for the border and two for "> ".
     let shown = tail(&shown, area.width.saturating_sub(4) as usize);
     let mut rows = vec![TextLine::from(format!("> {shown}"))];
-    rows.extend(options.into_iter().take(8).map(TextLine::from));
+    rows.extend(options.iter().take(8).map(|o| TextLine::from(elide(o, room).into_owned())));
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(rows).block(block(title, true)), area);
 }
@@ -475,6 +499,20 @@ mod tests {
         assert_eq!(list_offset(9, 19, 30, 20), 0, "window grew");
         assert_eq!(list_offset(0, 0, 5, 0), 0, "empty list");
         assert_eq!(list_offset(2, 3, 0, 5), 2, "no rows");
+    }
+
+    #[test]
+    fn tail_and_elide_measure_as_drawn() {
+        let heart = "❤\u{fe0f}";
+        assert_eq!(tail(&format!("{heart}a"), 2), "a");
+        assert_eq!(tail(&format!("{heart}a"), 3), format!("{heart}a"));
+        assert_eq!(elide(&heart.repeat(4), 7), format!("…{}", heart.repeat(3)));
+    }
+
+    #[test]
+    fn elide_makes_one_line_of_control_characters() {
+        assert_eq!(elide("a\nb\tc", 9), "a b c");
+        assert_eq!(elide("long\nname", 6), "… name");
     }
 
     #[test]
