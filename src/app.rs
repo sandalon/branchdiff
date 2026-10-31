@@ -88,6 +88,14 @@ pub struct App {
     pub should_quit: bool,
 }
 
+/// Answers whether `modifiers` mark a shortcut rather than typed text.
+/// crossterm's Windows parser reports AltGr as Ctrl+Alt and keeps the printed
+/// character, and layouts such as German need AltGr for `[` and `]`.
+fn is_shortcut(modifiers: KeyModifiers, windows: bool) -> bool {
+    let shortcut = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    modifiers.intersects(shortcut) && !(windows && modifiers.contains(shortcut))
+}
+
 impl App {
     pub fn new(base: String) -> Self {
         Self {
@@ -125,7 +133,7 @@ impl App {
             self.should_quit = true;
             return Vec::new();
         }
-        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        if is_shortcut(key.modifiers, cfg!(windows)) {
             return Vec::new();
         }
         // Holding a movement key would otherwise wipe a notice before it's read.
@@ -792,6 +800,34 @@ mod tests {
             assert!(!a.should_quit);
             assert_eq!(a.notice.as_deref(), Some("kept"));
         }
+    }
+
+    #[test]
+    fn altgr_counts_as_text_only_on_windows() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert!(!is_shortcut(altgr, true));
+        assert!(!is_shortcut(altgr | KeyModifiers::SHIFT, true));
+        assert!(is_shortcut(altgr, false));
+        for windows in [true, false] {
+            assert!(is_shortcut(KeyModifiers::CONTROL, windows));
+            assert!(is_shortcut(KeyModifiers::ALT, windows));
+            assert!(!is_shortcut(KeyModifiers::SHIFT, windows));
+            assert!(!is_shortcut(KeyModifiers::NONE, windows));
+        }
+    }
+
+    #[test]
+    fn handle_key_applies_the_altgr_rule_for_this_platform() {
+        let mut a = app(&["a", "b"]);
+        a.handle_key(with(']', KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(a.selected, usize::from(cfg!(windows)));
+    }
+
+    #[test]
+    fn ctrl_c_needs_control_alone() {
+        let mut a = app(&["a"]);
+        a.handle_key(with('c', KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert!(!a.should_quit);
     }
 
     #[test]
