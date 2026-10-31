@@ -13,7 +13,7 @@ const MAX_ENCODED_LEN: usize = 200;
 
 /// Which file version `Comment::line` counts in. A replaced line has the
 /// same number on both sides, so the number alone is ambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side { Old, New }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

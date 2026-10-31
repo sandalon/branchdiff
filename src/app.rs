@@ -1,9 +1,10 @@
 use crate::cache::{CacheKey, Diffs};
 use crate::diff::FileDiff;
 use crate::git::{GitError, Worktree};
-use crate::store::Review;
+use crate::store::{fnv1a, Comment, Review, ReviewId, Side};
 use crate::worker::Msg;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,16 @@ pub enum DiffView { Unified, SideBySide }
 pub enum Effect {
     Load { path: PathBuf, base: String },
     ReloadWorktrees,
+    SaveReview { id: ReviewId, review: Review },
+    CopyExport(String),
+    WriteExport(String),
+    OpenEditor { path: PathBuf, line: u32 },
+}
+
+/// A text prompt. While set, keys go here rather than to hotkeys.
+pub enum Input {
+    Comment { path: String, line: u32, side: Side, line_text: String, text: String },
+    ConfirmClear,
 }
 
 /// Everything remembered for one worktree across switches.
@@ -30,6 +41,7 @@ pub struct WorktreeState {
     pub cursor: usize,
     pub scroll: usize,
     pub review: Review,
+    pub outdated: usize,
 }
 
 impl WorktreeState {
@@ -83,6 +95,7 @@ pub struct App {
     pub focus: Focus,
     pub view: DiffView,
     pub help_open: bool,
+    pub input: Option<Input>,
     pub notice: Option<String>,
     pub fatal: Option<GitError>,
     pub should_quit: bool,
@@ -106,6 +119,7 @@ impl App {
             focus: Focus::Worktrees,
             view: DiffView::Unified,
             help_open: false,
+            input: None,
             notice: None,
             fatal: None,
             should_quit: false,
@@ -140,8 +154,11 @@ impl App {
         if !matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down) {
             self.notice = None;
         }
-        // Switching works from any screen. Text input has to be checked before
-        // this, because these keys are text there.
+        // Checked before switching, because `]` and digits are text here.
+        if self.input.is_some() {
+            return self.handle_input_key(key);
+        }
+        // Switching works from any screen.
         if self.switch_worktree(key.code) {
             return Vec::new();
         }
@@ -172,6 +189,13 @@ impl App {
                 };
             }
             KeyCode::Char('r') => return self.reload_selected(),
+            KeyCode::Char('c') => self.start_comment(),
+            KeyCode::Char('d') => return self.delete_comment(),
+            KeyCode::Char('D') => self.start_clear(),
+            KeyCode::Char('x') => return self.toggle_reviewed(),
+            KeyCode::Char('e') => return self.open_editor(),
+            KeyCode::Char('y') => return self.export(Effect::CopyExport),
+            KeyCode::Char('Y') => return self.export(Effect::WriteExport),
             _ => {}
         }
         Vec::new()
@@ -267,6 +291,7 @@ impl App {
                         Ok(l) => {
                             s.key = Some(l.key);
                             s.replace_diffs(l.diffs);
+                            s.outdated = count_outdated(s);
                             s.op = l.op;
                             s.error = None;
                             s.stale = false;
@@ -319,6 +344,10 @@ impl App {
                 Some(i) => i,
                 None => {
                     self.notice = Some(format!("Worktree removed: {}", path.display()));
+                    // It has no target now, and would act on the next worktree.
+                    if matches!(self.input, Some(Input::Comment { .. } | Input::ConfirmClear)) {
+                        self.input = None;
+                    }
                     self.selected.min(self.worktrees.len().saturating_sub(1))
                 }
             },
@@ -326,6 +355,212 @@ impl App {
         };
         effects
     }
+
+    /// The diff line under the cursor. `None` on a hunk header.
+    pub fn line_at_cursor(&self) -> Option<&crate::diff::Line> {
+        let mut row = self.current()?.cursor;
+        for hunk in &self.current_file()?.hunks {
+            if row == 0 {
+                return None;
+            }
+            row -= 1;
+            if row < hunk.lines.len() {
+                return hunk.lines.get(row);
+            }
+            row -= hunk.lines.len();
+        }
+        None
+    }
+
+    fn start_comment(&mut self) {
+        let Some(path) = self.current_file().map(|f| f.path.clone()) else { return };
+        let Some(line) = self.line_at_cursor() else {
+            self.notice = Some("Move to a diff line to comment".into());
+            return;
+        };
+        let Some((no, side)) = line_position(line) else { return };
+        let line_text = line.text.clone();
+        self.input = Some(Input::Comment { path, line: no, side, line_text, text: String::new() });
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if matches!(self.input, Some(Input::ConfirmClear)) {
+            self.input = None;
+            return if key.code == KeyCode::Char('y') { self.clear_comments() } else { Vec::new() };
+        }
+        let Some(Input::Comment { text, .. }) = self.input.as_mut() else { return Vec::new() };
+        match key.code {
+            KeyCode::Char(c) => text.push(c),
+            KeyCode::Backspace => { text.pop(); }
+            KeyCode::Esc => self.input = None,
+            KeyCode::Enter => {
+                if let Some(Input::Comment { path, line, side, line_text, text }) = self.input.take() {
+                    if !text.trim().is_empty() {
+                        if let Some(s) = self.current_mut() {
+                            s.review.comments.push(Comment { path, line, side, line_text, body: text });
+                            s.outdated = count_outdated(s);
+                            return self.save_effect();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// The comment on the line under the cursor, newest first when there are several.
+    pub fn comment_at_cursor(&self) -> Option<&Comment> {
+        let path = &self.current_file()?.path;
+        let (line, side) = line_position(self.line_at_cursor()?)?;
+        self.current()?.review.comments.iter().rev()
+            .find(|c| &c.path == path && c.line == line && c.side == side)
+    }
+
+    /// Positions in the current file that have comments, for the diff's markers.
+    pub fn commented_lines(&self) -> HashSet<(u32, Side)> {
+        let (Some(s), Some(file)) = (self.current(), self.current_file()) else { return HashSet::new() };
+        s.review.comments.iter().filter(|c| c.path == file.path).map(|c| (c.line, c.side)).collect()
+    }
+
+    fn delete_comment(&mut self) -> Vec<Effect> {
+        let Some(comment) = self.comment_at_cursor().cloned() else {
+            self.notice = Some("No comment on this line".into());
+            return Vec::new();
+        };
+        let Some(s) = self.current_mut() else { return Vec::new() };
+        if let Some(i) = s.review.comments.iter().rposition(|c| *c == comment) {
+            s.review.comments.remove(i);
+        }
+        s.outdated = count_outdated(s);
+        self.save_effect()
+    }
+
+    fn start_clear(&mut self) {
+        if self.current().is_some_and(|s| !s.review.comments.is_empty()) {
+            self.input = Some(Input::ConfirmClear);
+        } else {
+            self.notice = Some("No comments to clear".into());
+        }
+    }
+
+    fn clear_comments(&mut self) -> Vec<Effect> {
+        let Some(s) = self.current_mut() else { return Vec::new() };
+        s.review.comments.clear();
+        s.outdated = 0;
+        self.save_effect()
+    }
+
+    /// Built when the edit happens, because later keys in the same batch can
+    /// change the selection before `main` performs this.
+    fn save_effect(&self) -> Vec<Effect> {
+        match (self.selected_worktree(), self.current()) {
+            (Some(w), Some(s)) => vec![Effect::SaveReview { id: ReviewId::of(w), review: s.review.clone() }],
+            _ => Vec::new(),
+        }
+    }
+
+    fn toggle_reviewed(&mut self) -> Vec<Effect> {
+        let Some((path, hash)) = self.current_file().map(|f| (f.path.clone(), content_hash(f))) else {
+            return Vec::new();
+        };
+        let Some(s) = self.current_mut() else { return Vec::new() };
+        // Compare hashes: a mark left over from older content shows as unreviewed.
+        if s.review.reviewed.get(&path) == Some(&hash) {
+            s.review.reviewed.remove(&path);
+        } else {
+            s.review.reviewed.insert(path, hash);
+        }
+        self.save_effect()
+    }
+
+    pub fn is_reviewed(&self, index: usize) -> bool {
+        let Some(s) = self.current() else { return false };
+        let Some(f) = s.diffs.as_ref().and_then(|d| d.get(index)) else { return false };
+        s.review.reviewed.get(&f.path) == Some(&content_hash(f))
+    }
+
+    /// Counted on load and when comments change, because this runs every frame.
+    pub fn outdated_comments(&self) -> usize {
+        self.current().map_or(0, |s| s.outdated)
+    }
+
+    fn export(&mut self, effect: fn(String) -> Effect) -> Vec<Effect> {
+        let Some(w) = self.selected_worktree() else { return Vec::new() };
+        let branch = w.branch.clone().unwrap_or_else(|| w.head.clone());
+        let Some(s) = self.current() else { return Vec::new() };
+        let md = crate::export::render(&branch, &self.base, &s.review.comments);
+        if md.is_empty() {
+            self.notice = Some("No comments to export".into());
+            return Vec::new();
+        }
+        vec![effect(md)]
+    }
+
+    fn open_editor(&mut self) -> Vec<Effect> {
+        let Some(root) = self.selected_worktree().map(|w| w.path.clone()) else { return Vec::new() };
+        let Some(file) = self.current_file() else { return Vec::new() };
+        let path = root.join(&file.path);
+        let line = self.line_at_cursor().and_then(|l| l.new_no).unwrap_or(1);
+        vec![Effect::OpenEditor { path, line }]
+    }
+}
+
+/// Identifies a file's content cheaply, since this runs for every file on
+/// every frame. Files with no `content_id`, such as mode-only changes, pure
+/// renames and dirty submodules, fall back to hashing hunks.
+///
+/// Saved in reviews, so it uses `fnv1a`, which is stable across Rust releases.
+fn content_hash(file: &crate::diff::FileDiff) -> u64 {
+    if let Some(id) = &file.content_id {
+        return fnv1a(id.as_bytes());
+    }
+    let mut bytes = Vec::new();
+    for line in file.hunks.iter().flat_map(|h| &h.lines) {
+        bytes.push(line.kind as u8);
+        bytes.extend_from_slice(line.text.as_bytes());
+        bytes.push(b'\n');
+    }
+    fnv1a(&bytes)
+}
+
+/// Keeps the last save per review, since each one costs an fsync and holding
+/// `x` would otherwise queue saves faster than they finish.
+pub fn coalesce_saves(effects: Vec<Effect>) -> Vec<Effect> {
+    let mut seen = HashSet::new();
+    let mut kept: Vec<Effect> = effects.into_iter().rev().filter(|e| match e {
+        Effect::SaveReview { id, .. } => seen.insert(id.clone()),
+        _ => true,
+    }).collect();
+    kept.reverse();
+    kept
+}
+
+/// Where a diff line sits for a comment: the new file's number, or the old
+/// file's for a removed line.
+pub fn line_position(line: &crate::diff::Line) -> Option<(u32, Side)> {
+    match (line.new_no, line.old_no) {
+        (Some(n), _) => Some((n, Side::New)),
+        (None, Some(o)) => Some((o, Side::Old)),
+        (None, None) => None,
+    }
+}
+
+/// Counts comments whose line text is no longer at that line in the diff.
+fn count_outdated(s: &WorktreeState) -> usize {
+    let Some(diffs) = s.diffs.as_ref() else { return 0 };
+    s.review.comments.iter().filter(|c| {
+        // Filter rather than find: a typechange gives two entries with one path.
+        let current = diffs.iter()
+            .filter(|f| f.path == c.path)
+            .flat_map(|f| f.hunks.iter().flat_map(|h| &h.lines))
+            .find(|l| match c.side {
+                Side::New => l.new_no == Some(c.line),
+                Side::Old => l.new_no.is_none() && l.old_no == Some(c.line),
+            })
+            .map(|l| l.text.as_str());
+        c.is_outdated(current)
+    }).count()
 }
 
 #[cfg(test)]
@@ -880,5 +1115,274 @@ mod tests {
         assert_eq!((a.focus, a.view), (Focus::Worktrees, DiffView::Unified));
         assert!(!a.help_open && !a.should_quit);
         assert!(a.notice.is_none() && a.fatal.is_none());
+    }
+
+    fn file_with_line(text: &str) -> FileDiff {
+        FileDiff {
+            path: "a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1 @@".into(),
+                lines: vec![Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: text.into() }],
+            }],
+        }
+    }
+
+    fn app_on_line() -> App {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_line("let x = 1;")]);
+        a.focus = Focus::Diff;
+        press(&mut a, 'j'); // Row 0 is the hunk header, so row 1 is the line.
+        a
+    }
+
+    fn type_comment(a: &mut App, text: &str) -> Vec<Effect> {
+        press(a, 'c');
+        for ch in text.chars() {
+            press(a, ch);
+        }
+        a.handle_key(KeyEvent::from(KeyCode::Enter))
+    }
+
+    #[test]
+    fn c_then_enter_saves_a_comment_on_the_current_line() {
+        let mut a = app_on_line();
+        let fx = type_comment(&mut a, "fix this");
+        let c = &a.current().unwrap().review.comments[0];
+        assert_eq!((c.line, c.line_text.as_str(), c.body.as_str()), (1, "let x = 1;", "fix this"));
+        assert!(matches!(fx.as_slice(), [Effect::SaveReview { .. }]));
+    }
+
+    #[test]
+    fn typing_in_a_comment_does_not_trigger_hotkeys() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "q?]v1");
+        assert!(!a.should_quit && !a.help_open);
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.view, DiffView::Unified);
+        assert_eq!(a.current().unwrap().review.comments[0].body, "q?]v1");
+    }
+
+    #[test]
+    fn esc_cancels_a_comment() {
+        let mut a = app_on_line();
+        press(&mut a, 'c');
+        press(&mut a, 'x');
+        a.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(a.input.is_none());
+        assert!(a.current().unwrap().review.comments.is_empty());
+    }
+
+    #[test]
+    fn empty_comment_is_not_saved() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "");
+        assert!(a.current().unwrap().review.comments.is_empty());
+    }
+
+    #[test]
+    fn comment_on_a_hunk_header_is_refused() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_line("x")]);
+        a.focus = Focus::Diff;
+        press(&mut a, 'c');
+        assert!(a.input.is_none());
+    }
+
+    #[test]
+    fn x_marks_reviewed_and_a_changed_file_resets() {
+        let mut a = app_on_line();
+        press(&mut a, 'x');
+        assert!(a.is_reviewed(0));
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
+        assert!(!a.is_reviewed(0));
+    }
+
+    #[test]
+    fn one_x_marks_a_file_whose_old_mark_went_stale() {
+        let mut a = app_on_line();
+        press(&mut a, 'x');
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
+        assert!(!a.is_reviewed(0));
+        press(&mut a, 'x');
+        assert!(a.is_reviewed(0));
+    }
+
+    #[test]
+    fn a_save_records_the_review_it_was_made_for() {
+        let mut a = app(&["a", "b"]);
+        deliver(&mut a, "a", vec![file_with_line("x")]);
+        let fx = press(&mut a, 'x');
+        press(&mut a, ']');
+        assert!(matches!(&fx[0], Effect::SaveReview { id: ReviewId::Branch(b), review }
+            if b == "a" && review.reviewed.len() == 1));
+    }
+
+    #[test]
+    fn only_the_last_save_per_review_is_kept() {
+        let save = |name: &str, marks: usize| Effect::SaveReview {
+            id: ReviewId::Branch(name.into()),
+            review: Review { comments: vec![], reviewed: (0..marks).map(|i| (i.to_string(), 0)).collect() },
+        };
+        let kept = coalesce_saves(vec![save("a", 1), save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
+        assert_eq!(kept, vec![save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
+    }
+
+    #[test]
+    fn d_deletes_only_the_comment_on_the_current_line() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "one");
+        type_comment(&mut a, "two");
+        a.states[0].review.comments.push(Comment {
+            path: "other.rs".into(), line: 1, side: Side::New, line_text: "x".into(), body: "keep".into(),
+        });
+        let fx = press(&mut a, 'd');
+        let bodies: Vec<_> = a.current().unwrap().review.comments.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["one", "keep"]);
+        assert!(matches!(fx.as_slice(), [Effect::SaveReview { .. }]));
+    }
+
+    #[test]
+    fn d_with_no_comment_here_changes_nothing_and_says_so() {
+        let mut a = app_on_line();
+        assert!(press(&mut a, 'd').is_empty());
+        assert!(a.notice.is_some());
+    }
+
+    #[test]
+    fn deleting_a_comment_recounts_outdated() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
+        assert_eq!(a.outdated_comments(), 1);
+        a.states[0].review.comments[0].line_text = "let x = 2;".into();
+        press(&mut a, 'd');
+        assert_eq!(a.outdated_comments(), 0);
+    }
+
+    #[test]
+    fn shift_d_clears_after_y_and_saves() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        press(&mut a, 'D');
+        assert!(matches!(a.input, Some(Input::ConfirmClear)));
+        assert!(a.current().unwrap().review.comments.len() == 1);
+        let fx = press(&mut a, 'y');
+        assert!(a.current().unwrap().review.comments.is_empty());
+        assert!(matches!(fx.as_slice(), [Effect::SaveReview { .. }]));
+    }
+
+    #[test]
+    fn any_other_key_cancels_a_clear() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        press(&mut a, 'D');
+        assert!(press(&mut a, 'q').is_empty());
+        assert!(a.input.is_none() && !a.should_quit);
+        assert_eq!(a.current().unwrap().review.comments.len(), 1);
+    }
+
+    #[test]
+    fn shift_d_with_no_comments_says_so() {
+        let mut a = app_on_line();
+        press(&mut a, 'D');
+        assert!(a.input.is_none() && a.notice.is_some());
+    }
+
+    #[test]
+    fn x_again_clears_the_mark() {
+        let mut a = app_on_line();
+        press(&mut a, 'x');
+        press(&mut a, 'x');
+        assert!(!a.is_reviewed(0));
+    }
+
+    #[test]
+    fn comment_is_outdated_after_its_line_changes() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        assert_eq!(a.outdated_comments(), 0);
+        deliver(&mut a, "a", vec![file_with_line("let x = 2;")]);
+        assert_eq!(a.outdated_comments(), 1);
+    }
+
+    #[test]
+    fn comment_on_a_replaced_line_is_not_outdated() {
+        let mut replaced = file_with_line("TWO");
+        replaced.hunks[0].lines = vec![
+            Line { kind: LineKind::Removed, old_no: Some(1), new_no: None, text: "two".into() },
+            Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: "TWO".into() },
+        ];
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![replaced]);
+        a.focus = Focus::Diff;
+        press(&mut a, 'j');
+        press(&mut a, 'j');
+        type_comment(&mut a, "fix");
+        assert_eq!(a.current().unwrap().review.comments[0].side, crate::store::Side::New);
+        assert_eq!(a.outdated_comments(), 0);
+    }
+
+    #[test]
+    fn changing_a_binary_file_resets_its_reviewed_mark() {
+        let binary = |id: &str| FileDiff {
+            path: "b.dat".into(), old_path: None, status: Status::Modified, binary: true,
+            content_id: Some(id.into()), added: 0, removed: 0, hunks: vec![],
+        };
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![binary("1..2")]);
+        press(&mut a, 'x');
+        assert!(a.is_reviewed(0));
+        deliver(&mut a, "a", vec![binary("1..3")]);
+        assert!(!a.is_reviewed(0));
+    }
+
+    #[test]
+    fn y_copies_and_shift_y_writes_the_export() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        assert!(matches!(press(&mut a, 'y').as_slice(), [Effect::CopyExport(md)] if md.contains("fix")));
+        assert!(matches!(press(&mut a, 'Y').as_slice(), [Effect::WriteExport(md)] if md.contains("fix")));
+    }
+
+    #[test]
+    fn export_with_no_comments_shows_a_notice() {
+        let mut a = app_on_line();
+        assert!(press(&mut a, 'y').is_empty());
+        assert!(a.notice.is_some());
+    }
+
+    #[test]
+    fn e_opens_the_editor_at_the_current_line() {
+        let mut a = app_on_line();
+        assert!(matches!(press(&mut a, 'e').as_slice(), [Effect::OpenEditor { line: 1, .. }]));
+    }
+
+    #[test]
+    fn removing_the_worktree_cancels_an_open_comment() {
+        let mut a = app(&["a", "b"]);
+        deliver(&mut a, "a", vec![file_with_line("x")]);
+        a.focus = Focus::Diff;
+        press(&mut a, 'j');
+        press(&mut a, 'c');
+        press(&mut a, 'h');
+        a.handle_msg(list(&["b"]));
+        assert!(a.input.is_none());
+        assert!(a.handle_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+        assert_eq!(a.current().unwrap().review, Review::default());
+    }
+
+    #[test]
+    fn removing_the_worktree_cancels_an_open_clear() {
+        let mut a = app(&["a", "b"]);
+        let note = Comment { path: "a.rs".into(), line: 1, side: Side::New, line_text: "x".into(), body: "keep".into() };
+        a.states[0].review.comments.push(note.clone());
+        a.states[1].review.comments.push(note);
+        press(&mut a, 'D');
+        a.handle_msg(list(&["b"]));
+        assert!(a.input.is_none());
+        // Back on hotkeys, `y` copies b's comments rather than clearing them.
+        let fx = press(&mut a, 'y');
+        assert!(!fx.iter().any(|e| matches!(e, Effect::SaveReview { .. })));
+        assert_eq!(a.current().unwrap().review.comments.len(), 1);
     }
 }
