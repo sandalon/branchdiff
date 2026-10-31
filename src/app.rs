@@ -17,6 +17,7 @@ pub enum DiffView { Unified, SideBySide }
 pub enum Effect {
     Load { path: PathBuf, base: String },
     ReloadWorktrees,
+    ListBranches,
     SaveReview { id: ReviewId, review: Review },
     CopyExport(String),
     WriteExport(String),
@@ -26,6 +27,8 @@ pub enum Effect {
 /// A text prompt. While set, keys go here rather than to hotkeys.
 pub enum Input {
     Comment { path: String, line: u32, side: Side, line_text: String, text: String },
+    Worktree { query: String },
+    Base { query: String, branches: Vec<String> },
     ConfirmClear,
 }
 
@@ -34,6 +37,7 @@ impl Input {
     fn text_mut(&mut self) -> Option<&mut String> {
         match self {
             Self::Comment { text, .. } => Some(text),
+            Self::Worktree { query } | Self::Base { query, .. } => Some(query),
             Self::ConfirmClear => None,
         }
     }
@@ -198,6 +202,7 @@ impl App {
                     DiffView::SideBySide => DiffView::Unified,
                 };
             }
+            KeyCode::Char('b') => return vec![Effect::ListBranches],
             KeyCode::Char('r') => return self.reload_selected(),
             KeyCode::Char('c') => self.start_comment(),
             KeyCode::Char('d') => return self.delete_comment(),
@@ -221,6 +226,10 @@ impl App {
                 if i < self.worktrees.len() {
                     self.selected = i;
                 }
+            }
+            KeyCode::Char('w') => {
+                self.help_open = false;
+                self.input = Some(Input::Worktree { query: String::new() });
             }
             _ => return false,
         }
@@ -306,7 +315,14 @@ impl App {
                             s.error = None;
                             s.stale = false;
                         }
-                        Err(e) => s.error = Some(e),
+                        Err(e) => {
+                            // A result for an older base can arrive after the base has changed.
+                            let missing = matches!(&e, GitError::BaseMissing(b) if *b == self.base);
+                            s.error = Some(e);
+                            if missing && self.input.is_none() {
+                                return vec![Effect::ListBranches];
+                            }
+                        }
                     }
                 }
                 Vec::new()
@@ -318,7 +334,19 @@ impl App {
                 Vec::new()
             }
             Msg::WorktreesChanged => vec![Effect::ReloadWorktrees],
-            Msg::Branches(_) | Msg::Highlighted { .. } => Vec::new(),
+            Msg::Branches(Ok(branches)) => {
+                // A late reply must not wipe a half-written comment.
+                if self.input.is_none() {
+                    self.help_open = false;
+                    self.input = Some(Input::Base { query: String::new(), branches });
+                }
+                Vec::new()
+            }
+            Msg::Branches(Err(e)) => {
+                self.notice = Some(e.to_string());
+                Vec::new()
+            }
+            Msg::Highlighted { .. } => Vec::new(),
         }
     }
 
@@ -409,20 +437,51 @@ impl App {
             KeyCode::Char(c) => text.push(c),
             KeyCode::Backspace => { text.pop(); }
             KeyCode::Esc => self.input = None,
-            KeyCode::Enter => {
-                if let Some(Input::Comment { path, line, side, line_text, text }) = self.input.take() {
-                    if !text.trim().is_empty() {
-                        if let Some(s) = self.current_mut() {
-                            s.review.comments.push(Comment { path, line, side, line_text, body: text });
-                            s.outdated = count_outdated(s);
-                            return self.save_effect();
-                        }
-                    }
+            KeyCode::Enter => return self.submit_input(),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    pub fn worktree_labels(&self) -> Vec<String> {
+        self.worktrees.iter().map(worktree_label).collect()
+    }
+
+    fn submit_input(&mut self) -> Vec<Effect> {
+        match self.input.take() {
+            Some(Input::Comment { path, line, side, line_text, text }) if !text.trim().is_empty() => {
+                if let Some(s) = self.current_mut() {
+                    s.review.comments.push(Comment { path, line, side, line_text, body: text });
+                    s.outdated = count_outdated(s);
+                    return self.save_effect();
+                }
+            }
+            Some(Input::Worktree { query }) => {
+                if let Some(&i) = crate::fuzzy::filter(&query, &self.worktree_labels()).first() {
+                    self.selected = i;
+                }
+            }
+            Some(Input::Base { query, branches }) => {
+                if let Some(&i) = crate::fuzzy::filter(&query, &branches).first() {
+                    self.base = branches[i].clone();
+                    return self.reload_all();
                 }
             }
             _ => {}
         }
         Vec::new()
+    }
+
+    fn reload_all(&mut self) -> Vec<Effect> {
+        // Each diff is against the old base until its load lands.
+        for s in &mut self.states {
+            s.stale = true;
+        }
+        let selected = self.selected_worktree().map(|w| w.path.clone());
+        let mut paths: Vec<PathBuf> = self.worktrees.iter().map(|w| w.path.clone()).collect();
+        // The worktree on screen first, since the pool runs jobs in order.
+        paths.sort_by_key(|p| Some(p) != selected.as_ref());
+        paths.into_iter().map(|path| Effect::Load { path, base: self.base.clone() }).collect()
     }
 
     /// Adds pasted text to the open prompt. Pastes arrive whole, so a newline
@@ -540,6 +599,13 @@ impl App {
         file.status == Status::Deleted
             && !diffs.is_some_and(|d| d.iter().any(|f| f.path == file.path && f.status != Status::Deleted))
     }
+}
+
+pub fn worktree_label(w: &Worktree) -> String {
+    w.branch.clone().unwrap_or_else(|| {
+        let short: String = w.head.chars().take(8).collect();
+        format!("({short})")
+    })
 }
 
 /// Makes pasted text fit a one-line prompt: a run of line breaks becomes one
@@ -1743,5 +1809,99 @@ mod tests {
         a.focus = Focus::Diff;
         press(&mut a, 'j');
         assert_eq!(press(&mut a, 'e'), vec![Effect::OpenEditor { path: "/r/b/a.rs".into(), line: 1 }]);
+    }
+
+    #[test]
+    fn w_finds_and_selects_a_worktree() {
+        let mut a = app(&["feat-auth", "fix-cache"]);
+        press(&mut a, 'w');
+        for c in "cache".chars() {
+            press(&mut a, c);
+        }
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.selected, 1);
+        assert!(a.input.is_none());
+    }
+
+    #[test]
+    fn w_opens_the_finder_and_closes_help() {
+        let mut a = app(&["a", "b"]);
+        press(&mut a, '?');
+        press(&mut a, 'w');
+        assert!(matches!(a.input, Some(Input::Worktree { .. })));
+        assert!(!a.help_open);
+    }
+
+    #[test]
+    fn b_changes_the_base_and_reloads_every_worktree() {
+        let mut a = app(&["a", "b"]);
+        let fx = press(&mut a, 'b');
+        assert!(matches!(fx.as_slice(), [Effect::ListBranches]));
+        a.handle_msg(Msg::Branches(Ok(vec!["develop".into(), "main".into()])));
+        for c in "main".chars() {
+            press(&mut a, c);
+        }
+        let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.base, "main");
+        assert_eq!(fx.iter().filter(|e| matches!(e, Effect::Load { .. })).count(), 2);
+    }
+
+    #[test]
+    fn a_base_change_reloads_the_selected_worktree_first() {
+        let mut a = app(&["a", "b", "c"]);
+        press(&mut a, '3');
+        press(&mut a, 'b');
+        a.handle_msg(Msg::Branches(Ok(vec!["develop".into(), "main".into()])));
+        for c in "main".chars() {
+            press(&mut a, c);
+        }
+        let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&fx[0], Effect::Load { path, .. } if path.ends_with("c")));
+    }
+
+    #[test]
+    fn a_late_branch_list_keeps_an_open_comment() {
+        let mut a = app_on_line();
+        press(&mut a, 'c');
+        press(&mut a, 'x');
+        a.handle_msg(Msg::Branches(Ok(vec!["develop".into()])));
+        assert!(matches!(a.input, Some(Input::Comment { .. })));
+    }
+
+    #[test]
+    fn missing_base_opens_the_base_picker() {
+        let mut a = app(&["a"]);
+        let path: std::path::PathBuf = "/r/a".into();
+        let fx = a.handle_msg(Msg::Loaded { path, result: Err(crate::git::GitError::BaseMissing("develop".into())) });
+        assert!(matches!(fx.as_slice(), [Effect::ListBranches]));
+    }
+
+    #[test]
+    fn a_missing_older_base_does_not_reopen_the_picker() {
+        let mut a = app(&["a"]);
+        a.base = "main".into();
+        let fx = a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::BaseMissing("develop".into())) });
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn one_worktree_failing_leaves_the_others_usable() {
+        let mut a = app(&["a", "b"]);
+        a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::NoMergeBase) });
+        deliver(&mut a, "b", vec![file("1")]);
+        assert!(a.states[0].error.is_some());
+        press(&mut a, ']');
+        assert_eq!(a.file_count(), 1);
+    }
+
+    #[test]
+    fn a_base_change_flags_each_old_diff_until_its_load_lands() {
+        let mut a = prepared();
+        press(&mut a, 'b');
+        a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(a.states.iter().all(|s| s.stale));
+        deliver(&mut a, "a", vec![file("1")]);
+        assert!(!a.states[0].stale && a.states[1].stale);
     }
 }
