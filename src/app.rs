@@ -3,7 +3,7 @@ use crate::diff::FileDiff;
 use crate::git::{GitError, Worktree};
 use crate::store::Review;
 use crate::worker::Msg;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,31 @@ impl WorktreeState {
     /// Rows in the current file: one per hunk header plus one per line.
     fn row_count(&self) -> usize {
         self.current_file().map_or(0, |f| f.hunks.iter().map(|h| 1 + h.lines.len()).sum())
+    }
+
+    /// Installs a reloaded diff, staying on the same file. If that file has
+    /// gone, the index stays and the position starts at the top of whatever
+    /// file is there now.
+    fn replace_diffs(&mut self, diffs: Diffs) {
+        let old = self.diffs.replace(diffs);
+        if let Some(previous) = old.as_ref().and_then(|d| d.get(self.file)) {
+            match self.find_file(previous) {
+                Some(i) => self.file = i,
+                None => {
+                    self.cursor = 0;
+                    self.scroll = 0;
+                }
+            }
+        }
+        self.clamp_position();
+    }
+
+    /// A typechange gives two entries with one path, so the status decides
+    /// between them. A file whose status changed still matches by path.
+    fn find_file(&self, wanted: &FileDiff) -> Option<usize> {
+        let diffs = self.diffs.as_ref()?;
+        diffs.iter().position(|f| f.path == wanted.path && f.status == wanted.status)
+            .or_else(|| diffs.iter().position(|f| f.path == wanted.path))
     }
 
     /// Pulls the position back inside a diff that has just been replaced.
@@ -96,7 +121,17 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        self.notice = None;
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return Vec::new();
+        }
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return Vec::new();
+        }
+        // Holding a movement key would otherwise wipe a notice before it's read.
+        if !matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down) {
+            self.notice = None;
+        }
         if self.help_open {
             if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
                 self.help_open = false;
@@ -171,7 +206,10 @@ impl App {
 
     fn move_vertical(&mut self, delta: isize) {
         match self.focus {
-            Focus::Worktrees => self.step_worktree(delta),
+            Focus::Worktrees => {
+                let max = self.worktrees.len().saturating_sub(1);
+                self.selected = (self.selected as isize + delta).clamp(0, max as isize) as usize;
+            }
             Focus::Files => self.step_file(delta),
             Focus::Diff => {
                 let max = self.diff_row_count().saturating_sub(1);
@@ -207,8 +245,7 @@ impl App {
                     match result {
                         Ok(l) => {
                             s.key = Some(l.key);
-                            s.diffs = Some(l.diffs);
-                            s.clamp_position();
+                            s.replace_diffs(l.diffs);
                             s.op = l.op;
                             s.error = None;
                             s.stale = false;
@@ -277,7 +314,7 @@ mod tests {
     use crate::diff::{FileDiff, Hunk, Line, LineKind, Status};
     use crate::git::Worktree;
     use crate::worker::{Loaded, Msg};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Arc;
 
     fn wt(name: &str) -> Worktree {
@@ -446,10 +483,153 @@ mod tests {
         (s.cursor, s.scroll) = (50, 40);
         deliver(&mut a, "a", vec![file_with_rows("1", 3)]);
         let s = a.current().unwrap();
-        assert_eq!((s.file, s.cursor, s.scroll), (0, 2, 2));
+        assert_eq!((s.file, s.cursor, s.scroll), (0, 0, 0));
         deliver(&mut a, "a", vec![]);
         let s = a.current().unwrap();
         assert_eq!((s.file, s.cursor, s.scroll), (0, 0, 0));
+    }
+
+    fn at(a: &mut App, cursor: usize, scroll: usize) {
+        let s = a.current_mut().unwrap();
+        (s.cursor, s.scroll) = (cursor, scroll);
+    }
+
+    fn position(a: &App) -> (usize, usize, usize) {
+        let s = a.current().unwrap();
+        (s.file, s.cursor, s.scroll)
+    }
+
+    #[test]
+    fn a_reload_follows_the_current_file_past_an_inserted_file() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("b", 100), file_with_rows("c", 100)]);
+        press(&mut a, 'n');
+        at(&mut a, 50, 40);
+        deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("b", 100), file_with_rows("c", 100)]);
+        assert_eq!(position(&a), (2, 50, 40));
+        assert_eq!(a.current_file().unwrap().path, "c");
+    }
+
+    #[test]
+    fn a_reload_follows_the_current_file_past_a_removed_file() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("b", 100), file_with_rows("c", 100), file_with_rows("d", 100)]);
+        press(&mut a, 'n');
+        press(&mut a, 'n');
+        at(&mut a, 50, 40);
+        deliver(&mut a, "a", vec![file_with_rows("b", 100), file_with_rows("c", 100), file_with_rows("d", 100)]);
+        assert_eq!(position(&a), (1, 50, 40));
+        assert_eq!(a.current_file().unwrap().path, "c");
+    }
+
+    #[test]
+    fn a_followed_file_that_shrank_keeps_its_position_valid() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("b", 100)]);
+        at(&mut a, 50, 40);
+        deliver(&mut a, "a", vec![file_with_rows("a", 100), file_with_rows("b", 5)]);
+        assert_eq!(position(&a), (1, 4, 4));
+    }
+
+    #[test]
+    fn a_reload_without_the_current_file_keeps_the_index_and_resets_the_position() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("a", 100), file_with_rows("b", 100), file_with_rows("c", 100)]);
+        press(&mut a, 'n');
+        at(&mut a, 50, 40);
+        deliver(&mut a, "a", vec![file_with_rows("a", 100), file_with_rows("c", 100)]);
+        assert_eq!(position(&a), (1, 0, 0));
+        at(&mut a, 50, 40);
+        deliver(&mut a, "a", vec![file_with_rows("a", 100)]);
+        assert_eq!(position(&a), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_typechange_follows_the_entry_with_the_same_status() {
+        let side = |status| FileDiff { status, ..file_with_rows("t", 10) };
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![side(Status::Deleted), side(Status::Added)]);
+        press(&mut a, 'n');
+        deliver(&mut a, "a", vec![file_with_rows("a", 5), side(Status::Deleted), side(Status::Added)]);
+        assert_eq!(a.current().unwrap().file, 2);
+    }
+
+    #[test]
+    fn a_file_that_changed_status_falls_back_to_the_first_path_match() {
+        let side = |status| FileDiff { status, ..file_with_rows("t", 10) };
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("t", 10)]);
+        press(&mut a, 'n');
+        at(&mut a, 5, 2);
+        deliver(&mut a, "a", vec![file_with_rows("0", 5), file_with_rows("a", 5), side(Status::Deleted), side(Status::Added)]);
+        assert_eq!(position(&a), (2, 5, 2));
+    }
+
+    fn with(c: char, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), modifiers)
+    }
+
+    #[test]
+    fn ctrl_c_quits() {
+        let mut a = app(&["a"]);
+        assert!(a.handle_key(with('c', KeyModifiers::CONTROL)).is_empty());
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_while_help_is_open() {
+        let mut a = app(&["a"]);
+        press(&mut a, '?');
+        a.handle_key(with('c', KeyModifiers::CONTROL));
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn ctrl_and_alt_keys_change_nothing() {
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let mut a = app(&["a", "b"]);
+            a.notice = Some("kept".into());
+            for c in ['j', ']', '2', 'q', 'r'] {
+                assert!(a.handle_key(with(c, modifiers)).is_empty());
+            }
+            assert_eq!(a.selected, 0);
+            assert!(!a.should_quit);
+            assert_eq!(a.notice.as_deref(), Some("kept"));
+        }
+    }
+
+    #[test]
+    fn shift_still_works() {
+        let mut a = app(&["a"]);
+        a.handle_key(with('?', KeyModifiers::SHIFT));
+        assert!(a.help_open);
+    }
+
+    #[test]
+    fn j_and_k_stop_at_the_ends_of_the_worktree_list() {
+        let mut a = app(&["a", "b"]);
+        press(&mut a, 'k');
+        assert_eq!(a.selected, 0);
+        press(&mut a, 'j');
+        press(&mut a, 'j');
+        assert_eq!(a.selected, 1);
+        a.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(a.selected, 1);
+        press(&mut a, ']');
+        assert_eq!(a.selected, 0);
+    }
+
+    #[test]
+    fn moving_keeps_a_notice_and_other_keys_clear_it() {
+        let mut a = app(&["a"]);
+        a.notice = Some("kept".into());
+        press(&mut a, 'j');
+        press(&mut a, 'k');
+        a.handle_key(KeyEvent::from(KeyCode::Down));
+        a.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(a.notice.as_deref(), Some("kept"));
+        press(&mut a, 'v');
+        assert!(a.notice.is_none());
     }
 
     #[test]
