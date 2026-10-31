@@ -34,8 +34,11 @@ pub fn highlight_file(file: &FileDiff) -> HighlightedFile {
         return HighlightedFile::default();
     }
     let (syntaxes, theme) = assets();
-    let ext = file.path.rsplit('.').next().unwrap_or("");
-    let syntax = syntaxes.find_syntax_by_extension(ext);
+    // Names like `Makefile` and `.bashrc` are listed whole, and a directory
+    // must not count towards an extension.
+    let name = file.path.rsplit('/').next().unwrap_or("");
+    let ext = name.rsplit('.').next().unwrap_or("");
+    let syntax = syntaxes.find_syntax_by_extension(name).or_else(|| syntaxes.find_syntax_by_extension(ext));
     let hunks = file.hunks.iter().map(|hunk| {
         let mut state = syntax.map(|s| HighlightLines::new(s, theme));
         hunk.lines.iter().map(|line| {
@@ -104,6 +107,14 @@ mod tests {
         let long = "x".repeat(MAX_LINE_LEN + 1);
         let out = highlight_file(&file("a.rs", &long));
         assert_eq!(out.hunks[0][0].len(), 1);
+    }
+
+    #[test]
+    fn finds_the_language_from_a_whole_file_name_in_any_directory() {
+        let files = [("src/Makefile", "a: b"), ("docker/Dockerfile", "FROM rust"), (".bashrc", "export A=1"), ("home/.bashrc", "export A=1")];
+        for (path, text) in files {
+            assert!(highlight_file(&file(path, text)).hunks[0][0].len() > 1, "{path}");
+        }
     }
 
     #[test]
