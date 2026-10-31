@@ -41,11 +41,14 @@ fn quote(line: &str) -> String {
 }
 
 /// A code span ends at the first backtick run as long as its delimiter, so the
-/// delimiter must be longer than any run inside. Markdown strips the padding.
+/// delimiter must be longer than any run inside. Markdown strips one space from
+/// each end, which is what the padding is for, and would otherwise strip the
+/// text's own.
 fn code_span(text: &str) -> String {
     let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let ticks = "`".repeat(longest_run + 1);
-    let pad = if text.starts_with('`') || text.ends_with('`') { " " } else { "" };
+    let spaced = text.starts_with(' ') && text.ends_with(' ');
+    let pad = if text.starts_with('`') || text.ends_with('`') || spaced { " " } else { "" };
     format!("{ticks}{pad}{text}{pad}{ticks}")
 }
 
@@ -94,6 +97,8 @@ mod tests {
         assert!(quoted("let s = `a`;").contains(": ``let s = `a`;``\n"));
         assert!(quoted("a `` b ` c").contains(": ```a `` b ` c```\n"));
         assert!(quoted("`").contains(": `` ` ``\n"));
+        assert!(quoted("`a").contains(": `` `a ``\n"));
+        assert!(quoted("a`").contains(": `` a` ``\n"));
     }
 
     #[test]
@@ -104,10 +109,17 @@ mod tests {
     }
 
     #[test]
+    fn spaces_around_a_name_survive_markdown_stripping_them() {
+        let md = render("feat", "develop", &[c(" a ", 2, "x")]);
+        assert!(md.contains("### `  a  `\n"), "{md}");
+    }
+
+    #[test]
     fn says_what_the_line_numbers_count() {
         let md = render("feat", "develop", &[c("a.rs", 2, "x")]);
         assert!(md.contains("line number in the current file"));
         assert!(md.contains("from before this branch's changes"));
+        assert!(md.contains("if they disagree, trust the quote"));
     }
 
     #[test]
@@ -120,17 +132,24 @@ mod tests {
     }
 
     #[test]
+    fn line_order_outranks_side_across_different_lines() {
+        let removed = Comment { side: Side::Old, ..c("a.rs", 9, "removed later") };
+        let md = render("feat", "develop", &[removed, c("a.rs", 2, "added earlier")]);
+        assert!(md.find("added earlier").unwrap() < md.find("removed later").unwrap(), "{md}");
+    }
+
+    #[test]
     fn long_lines_are_cut_on_a_character_boundary() {
         let mut comment = c("a.rs", 2, "x");
-        comment.line_text = "語".repeat(MAX_QUOTED_CHARS + 1);
+        comment.line_text = "語".repeat(201);
         let md = render("feat", "develop", &[comment]);
-        assert!(md.contains(&format!("`{}…`", "語".repeat(MAX_QUOTED_CHARS))), "{md}");
+        assert!(md.contains(&format!("`{}…`", "語".repeat(200))), "{md}");
     }
 
     #[test]
     fn a_line_of_exactly_the_limit_is_quoted_whole() {
         let mut comment = c("a.rs", 2, "x");
-        comment.line_text = "x".repeat(MAX_QUOTED_CHARS);
+        comment.line_text = "x".repeat(200);
         assert!(!render("feat", "develop", &[comment]).contains('…'));
     }
 
