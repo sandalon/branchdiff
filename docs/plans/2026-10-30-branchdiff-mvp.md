@@ -4506,7 +4506,41 @@ fn keypress_to_redraw_is_within_budget() {
 **Step 2: Run them**
 
 Run: `cargo test --release --test perf -- --ignored`
-Expected: 2 passed. If `switching_to_a_cached_worktree_is_within_budget` fails, the likely cause is `draw_files` building 5,000 `ListItem`s each frame. Build only the visible window, as `unified_rows` does, then rerun.
+Expected: 2 passed. `draw_files` and `draw_worktrees` already build only the visible rows, so a failure lies elsewhere: look at per-row costs such as `is_reviewed`, or at `unified_rows`.
+
+Add a test that list length doesn't affect a frame. An absolute budget can't catch this, because building every row of 5,000 files still fits in 16 ms:
+
+```rust
+fn app_of(worktrees: usize, files: usize) -> App {
+    let mut a = App::new("develop".into());
+    let wts: Vec<Worktree> = (0..worktrees).map(|i| Worktree {
+        path: format!("/r/w{i}").into(), head: "h".into(), branch: Some(format!("w{i}")),
+    }).collect();
+    a.handle_msg(Msg::Worktrees(Ok(wts)));
+    let diffs: Arc<Vec<FileDiff>> = Arc::new((0..files).map(|f| FileDiff {
+        path: format!("src/module_{f}.rs"), old_path: None, status: Status::Modified, binary: false, content_id: Some(format!("{f}")),
+        added: 1, removed: 0, hunks: Vec::new(),
+    }).collect());
+    for i in 0..worktrees {
+        let path: std::path::PathBuf = format!("/r/w{i}").into();
+        let key = CacheKey { worktree: path.clone(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
+        a.handle_msg(Msg::Loaded { path, result: Ok(Loaded { key, diffs: diffs.clone(), op: None }) });
+    }
+    a
+}
+
+#[test]
+#[ignore]
+fn frame_time_does_not_grow_with_list_length() {
+    let frame = |worktrees, files| timed(&mut app_of(worktrees, files), KeyCode::Char('j'));
+    let (small, many_files, many_worktrees) = (frame(10, 500), frame(10, 50_000), frame(5_000, 500));
+    let limit = small * 5;
+    assert!(many_files < limit, "{small:?} grew to {many_files:?} with more files");
+    assert!(many_worktrees < limit, "{small:?} grew to {many_worktrees:?} with more worktrees");
+}
+```
+
+Confirm it fails with `take(visible)` removed from `draw_files`, and again from `draw_worktrees`.
 
 **Step 3: Add a startup check**
 
@@ -4644,7 +4678,7 @@ The Linux build depends on the system libc. `arboard` is built with `wayland-dat
 
 **Step 3: Write `README.md`**
 
-Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from the design doc, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, and that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside.
+Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from `HELP` in `src/ui.rs`, which adds `q` and `Esc` for prompts, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside, and that colours assume a dark background, so context rows can be hard to read on a light terminal.
 
 **Step 4: Verify the final state**
 
@@ -4652,12 +4686,12 @@ Run: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
 Expected: no warnings, all tests pass.
 
 Run: `cargo test --release --test perf -- --ignored`
-Expected: 3 passed.
+Expected: 4 passed.
 
 **Step 5: Commit**
 
 ```bash
-git add .github README.md
+git add .github README.md src tests benches
 git commit -m "chore: add CI, release builds and README"
 ```
 
