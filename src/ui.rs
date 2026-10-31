@@ -17,6 +17,12 @@ const BORDERS: usize = 2;
 const SYMBOL: usize = 2;
 /// Cells before a path in the file list: reviewed mark, status and a space.
 const FILE_PREFIX: usize = 3;
+/// Cells a side-by-side row spends on its comment mark and ` │ ` divider.
+const SPLIT_CHROME: usize = 4;
+/// Cells a prompt spends on `> `.
+const PROMPT_PREFIX: usize = 2;
+/// Rows a filtering prompt lists.
+const MAX_OPTIONS: usize = 8;
 /// Cells a worktree name keeps before anything less important gives way.
 const MIN_NAME: usize = 4;
 /// Cells a base branch keeps, so that a usual name like `develop` stays whole.
@@ -56,6 +62,8 @@ fn display_text(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// Draws a frame. It needs `app` mutably because it also updates the stored
+/// list offsets and diff scroll, which depend on the size of this frame.
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let side = (f.area().width / 5).clamp(16, 30);
@@ -63,6 +71,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(side), Constraint::Length(side), Constraint::Min(0),
     ]).areas(main);
 
+    // The three panes are the same height.
+    keep_selection_visible(app, (main.height as usize).saturating_sub(BORDERS));
     draw_worktrees(f, app, left);
     draw_files(f, app, files);
     draw_diff(f, app, diff);
@@ -76,18 +86,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if !app.truecolor {
         for cell in &mut f.buffer_mut().content {
-            cell.fg = fit_color(cell.fg, false);
-            cell.bg = fit_color(cell.bg, false);
+            cell.fg = fit_color(cell.fg);
+            cell.bg = fit_color(cell.bg);
         }
     }
 }
 
 /// Nearest 256-colour entry, for terminals that don't advertise truecolor.
-fn fit_color(color: Color, truecolor: bool) -> Color {
+fn fit_color(color: Color) -> Color {
     let Color::Rgb(r, g, b) = color else { return color };
-    if truecolor {
-        return color;
-    }
     let cube = |v: u8| if v < 48 { 0 } else if v < 115 { 1 } else { (v - 35) / 40 };
     Color::Indexed(16 + 36 * cube(r) + 6 * cube(g) + cube(b))
 }
@@ -111,9 +118,19 @@ fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> us
     offset.min(len.saturating_sub(visible))
 }
 
-fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
-    let visible = (area.height as usize).saturating_sub(BORDERS);
+/// Moves the stored offsets of the lists and the diff, for panes that show
+/// `visible` rows.
+fn keep_selection_visible(app: &mut App, visible: usize) {
     app.worktree_offset = list_offset(app.worktree_offset, app.selected, visible, app.worktrees.len());
+    let (files, rows) = (app.file_count(), app.diff_row_count());
+    if let Some(s) = app.current_mut() {
+        s.file_offset = list_offset(s.file_offset, s.file, visible, files);
+        s.scroll = list_offset(s.scroll, s.cursor, visible, rows);
+    }
+}
+
+fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
+    let visible = (area.height as usize).saturating_sub(BORDERS);
     let first = app.worktree_offset;
     let items: Vec<ListItem> = app.worktrees.iter().zip(&app.states).skip(first).take(visible).map(|(w, s)| {
         let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
@@ -142,17 +159,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
-    let visible = (area.height as usize).saturating_sub(BORDERS);
-    let len = app.file_count();
-    let Some(s) = app.current_mut() else {
+fn draw_files(f: &mut Frame, app: &App, area: Rect) {
+    let Some(s) = app.current() else {
         f.render_widget(block("Files", false), area);
         return;
     };
-    s.file_offset = list_offset(s.file_offset, s.file, visible, len);
-    let app = &*app;
-    let Some(s) = app.current() else { return };
     // Only the visible rows, since `is_reviewed` can hash a whole file.
+    let visible = (area.height as usize).saturating_sub(BORDERS);
     let first = s.file_offset;
     let room = (area.width as usize).saturating_sub(BORDERS + FILE_PREFIX);
     let files = s.diffs.as_ref().map_or(&[][..], |d| d.as_slice());
@@ -167,48 +180,36 @@ fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// Builds only the visible rows, so frame cost does not grow with diff size.
-fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
-    let visible = area.height.saturating_sub(2) as usize;
-    let width = area.width.saturating_sub(2) as usize;
-    let rows = app.diff_row_count();
-    let Some(s) = app.current_mut() else {
+/// Builds only the visible rows. Finding them still walks the lines of the
+/// hunks before them, so frame cost grows with the size of a hunk, not of a diff.
+fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Diff;
+    let Some(s) = app.current() else {
         // Git always lists a worktree, so an empty list hasn't arrived yet.
         let text = app.fatal.as_ref().map_or("Loading…".to_string(), |e| format!("Could not list worktrees: {e}"));
-        f.render_widget(message(text).block(block("Diff", app.focus == Focus::Diff)), area);
+        f.render_widget(message(text).block(block("Diff", focused)), area);
         return;
     };
-    s.scroll = list_offset(s.scroll, s.cursor, visible, rows);
-    let app = &*app;
-    let Some(s) = app.current() else { return };
-    let focused = app.focus == Focus::Diff;
-
-    let notice = match (&s.error, &s.diffs) {
-        (Some(e), _) => Some(e.to_string()),
-        (None, None) => Some("Loading…".to_string()),
-        (None, Some(d)) if d.is_empty() => Some("No changes against the base branch".to_string()),
-        _ => None,
+    let notice = match (&s.error, &s.diffs, app.current_file()) {
+        (Some(e), ..) => e.to_string(),
+        (None, None, _) => "Loading…".to_string(),
+        (None, _, None) => "No changes against the base branch".to_string(),
+        (None, _, Some(file)) if file.binary => "Binary or very large file not shown".to_string(),
+        (None, _, Some(file)) if file.hunks.is_empty() => "No text changes to show".to_string(),
+        (None, _, Some(file)) => {
+            let visible = (area.height as usize).saturating_sub(BORDERS);
+            let width = (area.width as usize).saturating_sub(BORDERS);
+            let highlight = s.highlights.get(&s.file);
+            let commented = app.commented_lines();
+            let rows = match app.view {
+                DiffView::Unified => unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
+                DiffView::SideBySide => split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
+            };
+            f.render_widget(Paragraph::new(rows).block(block("Diff", focused)), area);
+            return;
+        }
     };
-    if let Some(m) = notice {
-        f.render_widget(message(m).block(block("Diff", focused)), area);
-        return;
-    }
-    let Some(file) = app.current_file() else { return };
-    if file.binary {
-        f.render_widget(message("Binary or very large file not shown").block(block("Diff", focused)), area);
-        return;
-    }
-    if file.hunks.is_empty() {
-        f.render_widget(message("No text changes to show").block(block("Diff", focused)), area);
-        return;
-    }
-    let highlight = s.highlights.get(&s.file);
-    let commented = app.commented_lines();
-    let rows = match app.view {
-        DiffView::Unified => unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
-        DiffView::SideBySide => split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
-    };
-    f.render_widget(Paragraph::new(rows).block(block("Diff", focused)), area);
+    f.render_widget(message(notice).block(block("Diff", focused)), area);
 }
 
 /// Wrapped, because git's messages can be far wider than the diff area.
@@ -291,7 +292,7 @@ fn split_rows<'a>(
     visible: usize,
     width: usize,
 ) -> Vec<TextLine<'a>> {
-    let side = width.saturating_sub(4) / 2;
+    let side = width.saturating_sub(SPLIT_CHROME) / 2;
     let mut rows = Vec::with_capacity(visible);
     let mut row = 0;
     for (hi, hunk) in file.hunks.iter().enumerate() {
@@ -327,7 +328,7 @@ fn split_rows<'a>(
 
 /// Cuts text to `width` cells and pads to it, measuring as drawn so the divider
 /// stays aligned. A wide character that would straddle the edge is dropped.
-fn fit_spans<'a>(parts: &[(Color, &'a str)], width: usize) -> Vec<Span<'a>> {
+fn fit_spans(parts: &[(Color, &str)], width: usize) -> Vec<Span<'static>> {
     let mut used = 0;
     let mut out = Vec::new();
     for (color, text) in parts {
@@ -380,7 +381,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     } else {
         status_summary(app, width)
     };
-    if drawn_width(&text) + HELP_HINT.width() <= width {
+    if drawn_width(&text) + drawn_width(HELP_HINT) <= width {
         text.push_str(HELP_HINT);
     }
     f.render_widget(Paragraph::new(text), area);
@@ -400,9 +401,9 @@ fn status_summary(app: &App, width: usize) -> String {
     let counts = format!("{}{GAP}{}", plural(app.file_count(), "file"), plural(s.review.comments.len(), "comment"));
 
     // What's left for the two names, which share it.
-    let fixed = 1 + warnings.width() + "base: ".len() + GAP.len() * 2 + counts.width();
+    let fixed = 1 + drawn_width(&warnings) + drawn_width("base: ") + drawn_width(GAP) * 2 + drawn_width(&counts);
     let spare = width.saturating_sub(fixed);
-    let hint = HELP_HINT.width();
+    let hint = drawn_width(HELP_HINT);
     let label = worktree_label(w);
     let names = MIN_BASE.min(drawn_width(&app.base)) + MIN_NAME.min(drawn_width(&label));
     let room = if spare >= names + hint { spare - hint } else { spare };
@@ -463,10 +464,15 @@ fn elide(text: &str, width: usize) -> Cow<'_, str> {
 }
 
 fn draw_help(f: &mut Frame) {
-    let area = centered(f.area(), 50, HELP.len() as u16 + 2);
+    let area = centered(f.area(), 50, (HELP.len() + BORDERS) as u16);
     let rows: Vec<TextLine> = HELP.iter().map(|(k, d)| TextLine::from(format!(" {k:<7} {d}"))).collect();
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(rows).block(block("Help", true)), area);
+}
+
+/// The items a filtering prompt lists for `query`, best first.
+fn best_matches(query: &str, items: &[String]) -> Vec<String> {
+    crate::fuzzy::filter(query, items).into_iter().take(MAX_OPTIONS).map(|i| items[i].clone()).collect()
 }
 
 fn draw_input(f: &mut Frame, app: &App) {
@@ -474,21 +480,16 @@ fn draw_input(f: &mut Frame, app: &App) {
     let (title, text, options) = match input {
         Input::Comment { text, .. } => ("Comment (Enter saves, Esc cancels)", text.as_str(), Vec::new()),
         Input::ConfirmClear => ("Clear all comments for this worktree?", "y to clear, any other key cancels", Vec::new()),
-        Input::Worktree { query } => ("Find worktree", query.as_str(), {
-            let labels = app.worktree_labels();
-            crate::fuzzy::filter(query, &labels).into_iter().take(8).map(|i| labels[i].clone()).collect()
-        }),
-        Input::Base { query, branches } => ("Base branch", query.as_str(), {
-            crate::fuzzy::filter(query, branches).into_iter().take(8).map(|i| branches[i].clone()).collect()
-        }),
+        Input::Worktree { query } => ("Find worktree", query.as_str(), best_matches(query, &app.worktree_labels())),
+        Input::Base { query, branches } => ("Base branch", query.as_str(), best_matches(query, branches)),
     };
-    let area = centered(f.area(), 60, (options.len().min(8) as u16) + 3);
-    let room = area.width.saturating_sub(BORDERS as u16) as usize;
+    // One row for the text being typed.
+    let area = centered(f.area(), 60, (options.len() + 1 + BORDERS) as u16);
+    let room = (area.width as usize).saturating_sub(BORDERS);
     let shown = display_text(text);
-    // Two for the border and two for "> ".
-    let shown = tail(&shown, area.width.saturating_sub(4) as usize);
+    let shown = tail(&shown, room.saturating_sub(PROMPT_PREFIX));
     let mut rows = vec![TextLine::from(format!("> {shown}"))];
-    rows.extend(options.iter().take(8).map(|o| TextLine::from(elide(o, room).into_owned())));
+    rows.extend(options.iter().map(|o| TextLine::from(elide(o, room).into_owned())));
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(rows).block(block(title, true)), area);
 }
@@ -538,14 +539,13 @@ mod tests {
 
     #[test]
     fn fit_color_maps_to_the_256_colour_cube() {
-        assert_eq!(fit_color(Color::Rgb(0, 0, 0), false), Color::Indexed(16));
-        assert_eq!(fit_color(Color::Rgb(255, 255, 255), false), Color::Indexed(231));
-        assert_eq!(fit_color(Color::Rgb(135, 95, 175), false), Color::Indexed(97));
+        assert_eq!(fit_color(Color::Rgb(0, 0, 0)), Color::Indexed(16));
+        assert_eq!(fit_color(Color::Rgb(255, 255, 255)), Color::Indexed(231));
+        assert_eq!(fit_color(Color::Rgb(135, 95, 175)), Color::Indexed(97));
     }
 
     #[test]
-    fn fit_color_leaves_truecolor_and_named_colours_alone() {
-        assert_eq!(fit_color(Color::Rgb(1, 2, 3), true), Color::Rgb(1, 2, 3));
-        assert_eq!(fit_color(Color::Cyan, false), Color::Cyan);
+    fn fit_color_leaves_named_colours_alone() {
+        assert_eq!(fit_color(Color::Cyan), Color::Cyan);
     }
 }
