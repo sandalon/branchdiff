@@ -46,6 +46,8 @@ fn highlight_within(file: &FileDiff, budget: Duration) -> HighlightedFile {
     // must not count towards an extension.
     let name = file.path.rsplit('/').next().unwrap_or("");
     let ext = name.rsplit('.').next().unwrap_or("");
+    // The bundled set has no syntax listing `jsx`, and TSX is a superset of it.
+    let ext = if ext.eq_ignore_ascii_case("jsx") { "tsx" } else { ext };
     let syntax = syntaxes.find_syntax_by_extension(name).or_else(|| syntaxes.find_syntax_by_extension(ext));
     let hunks = file.hunks.iter().map(|hunk| {
         // Each side is its own text, so a removed `/*` must not colour the lines
@@ -177,6 +179,14 @@ mod tests {
     fn a_file_over_the_time_budget_stays_plain() {
         let out = highlight_within(&file("a.rs", "fn main() {}"), Duration::ZERO);
         assert!(out.hunks.is_empty());
+    }
+
+    #[test]
+    fn colours_jsx_with_the_tsx_syntax() {
+        let text = "const a = <div className=\"b\">hi</div>;";
+        let jsx = highlight_file(&file("src/a.jsx", text));
+        assert!(jsx.hunks[0][0].len() > 1);
+        assert_eq!(jsx.hunks[0][0], highlight_file(&file("src/a.tsx", text)).hunks[0][0]);
     }
 
     #[test]
