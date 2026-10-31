@@ -2,11 +2,10 @@
 source: tests/ui_snapshots.rs
 expression: out
 ---
-"┌Worktrees───────────────┐┌Files─────────────────┐┌Diff────────────────────────┐"
-"│▸ feat-auth +1          ││ M src/a.rs           ││@@ -1,2 +1,2 @@             │"
-"│  fix-cache +0          ││                      ││     1  fn load() {         │"
-"│              ┌Help────────────────────────────────────────────┐d();          │"
-"│              │ [ / ]   previous or next worktree              │try();        │"
+"┌Worktrees─────┐┌Files─────────┐┌Diff──────────────────────────────────────────┐"
+"│▸ feat-auth +1││ M src/a.rs   ││@@ -1,2 +1,2 @@                               │"
+"│  fix-cache +0┌Help────────────────────────────────────────────┐              │"
+"│              │ [ / ]   previous or next worktree              │              │"
 "│              │ 1-9     jump to a worktree                     │              │"
 "│              │ w       fuzzy find a worktree                  │              │"
 "│              │ Tab     move between areas                     │              │"
@@ -21,8 +20,9 @@ expression: out
 "│              │ r       refresh or retry                       │              │"
 "│              │ b       change the base branch                 │              │"
 "│              │ ?       open or close this help                │              │"
+"│              │ Esc     close help or a prompt                 │              │"
 "│              │ q       quit                                   │              │"
 "│              └────────────────────────────────────────────────┘              │"
-"│                        ││                      ││                            │"
-"└────────────────────────┘└──────────────────────┘└────────────────────────────┘"
-" base: develop   feat-auth   1 files   0 comments   ? help                      "
+"│              ││              ││                                              │"
+"└──────────────┘└──────────────┘└──────────────────────────────────────────────┘"
+" base: develop   feat-auth   1 file   0 comments   ? help                       "

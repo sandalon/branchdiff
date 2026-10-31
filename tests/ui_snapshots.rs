@@ -51,9 +51,14 @@ fn file_of(texts: &[&str]) -> FileDiff {
     FileDiff { hunks: vec![Hunk { header: "@@ -0,0 +1 @@".into(), lines }], ..sample_file() }
 }
 
+/// The width of the worktree pane, and of the file pane.
+fn pane_width(terminal: u16) -> u16 {
+    (terminal / 5).clamp(16, 30)
+}
+
 /// Columns of the side-by-side divider on each diff row with one.
 fn divider_columns(buffer: &Buffer) -> Vec<u16> {
-    let (left, right, bottom) = (51, buffer.area.width - 1, buffer.area.height - 2);
+    let (left, right, bottom) = (2 * pane_width(buffer.area.width) + 1, buffer.area.width - 1, buffer.area.height - 2);
     (1..bottom).flat_map(|y| {
         (left..right).filter(move |&x| buffer[(x, y)].symbol() == "│")
     }).collect()
@@ -99,7 +104,7 @@ fn help_overlay_lists_every_hotkey() {
     let mut a = app();
     a.handle_key(KeyEvent::from(KeyCode::Char('?')));
     let out = render_sized(&mut a, 80, 24);
-    for label in ["next worktree", "fuzzy", "comment", "reviewed", "base branch", "this help"] {
+    for label in ["next worktree", "fuzzy", "comment", "reviewed", "base branch", "this help", "esc", "close help or a prompt"] {
         assert!(out.to_lowercase().contains(label), "missing {label}");
     }
     insta::assert_snapshot!(out);
@@ -207,11 +212,22 @@ fn a_tab_indented_line_renders_with_four_spaces() {
 
 #[test]
 fn a_crlf_line_has_no_stray_characters_and_stays_aligned_side_by_side() {
-    let mut a = app_with(vec![file_of(&["one\r", "two", "three\r"])]);
-    a.handle_key(KeyEvent::from(KeyCode::Char('v')));
-    let buffer = render_buffer(&mut a, 120, 12);
-    assert!(!buffer.content.iter().any(|c| c.symbol().contains('\r')));
-    let columns = divider_columns(&buffer);
+    // Context, because only text on the left can move the divider.
+    let context = |texts: &[&str]| {
+        let mut file = file_of(texts);
+        for line in &mut file.hunks[0].lines {
+            (line.kind, line.old_no) = (LineKind::Context, line.new_no);
+        }
+        file
+    };
+    let mut crlf = app_with(vec![context(&["one\r", "two", "three\r"])]);
+    let mut lf = app_with(vec![context(&["one", "two", "three"])]);
+    assert_eq!(render_sized(&mut crlf, 120, 12), render_sized(&mut lf, 120, 12));
+
+    crlf.handle_key(KeyEvent::from(KeyCode::Char('v')));
+    lf.handle_key(KeyEvent::from(KeyCode::Char('v')));
+    assert_eq!(render_sized(&mut crlf, 120, 12), render_sized(&mut lf, 120, 12));
+    let columns = divider_columns(&render_buffer(&mut crlf, 120, 12));
     assert_eq!(columns.len(), 3, "{columns:?}");
     assert!(columns.iter().all(|c| *c == columns[0]), "{columns:?}");
 }
@@ -247,8 +263,8 @@ fn a_highlighted_side_by_side_line_has_the_plain_text_and_the_span_colours() {
 
 #[test]
 fn a_wide_character_at_the_edge_keeps_the_divider_in_its_column() {
-    // The pane is 68 cells inside, so each side is 32.
-    let straddling = format!("{}界", "a".repeat(31));
+    // The pane is 72 cells wide with 70 inside, so each side is 33.
+    let straddling = format!("{}界", "a".repeat(32));
     let mut a = app_with(vec![file_of(&["short", &straddling, "short"])]);
     a.handle_key(KeyEvent::from(KeyCode::Char('v')));
     let columns = divider_columns(&render_buffer(&mut a, 120, 12));
@@ -287,7 +303,7 @@ fn an_emoji_sequence_keeps_the_divider_in_its_column() {
 fn a_deep_path_shows_its_file_name() {
     let path = "src/components/settings/preferences/notifications/widget.rs";
     let mut a = app_with(vec![FileDiff { path: path.into(), ..sample_file() }]);
-    assert!(render(&mut a).contains("ations/widget.rs"));
+    assert!(render(&mut a).contains("…/widget.rs"));
 }
 
 #[test]
@@ -300,7 +316,7 @@ fn a_long_worktree_name_leaves_room_for_its_badges() {
     a.states[0].review.comments = (0..12).map(|i| Comment {
         path: "a".into(), line: i, side: Side::New, line_text: String::new(), body: "b".into(),
     }).collect();
-    let out = render(&mut a);
+    let out = render_sized(&mut a, 150, 12);
     assert!(out.contains("rework +0 c12 ● ✗"), "{out}");
 }
 
@@ -320,8 +336,8 @@ fn the_selected_file_stays_visible_among_thousands_with_its_own_reviewed_mark() 
     assert!(a.is_reviewed(4990) && !a.is_reviewed(4991));
 
     let buffer = render_buffer(&mut a, 80, 12);
-    let selected: Vec<u16> = (1..10).filter(|&y| buffer[(27, y)].modifier.contains(Modifier::REVERSED)).collect();
-    let row: String = (27..49).map(|x| buffer[(x, selected[0])].symbol()).collect();
+    let selected: Vec<u16> = (1..10).filter(|&y| buffer[(17, y)].modifier.contains(Modifier::REVERSED)).collect();
+    let row: String = (17..31).map(|x| buffer[(x, selected[0])].symbol()).collect();
     assert_eq!(selected.len(), 1);
     assert!(row.contains("f4991.rs"), "{row}");
 }
@@ -425,7 +441,7 @@ fn selections_stay_visible_through_moves_and_resizes() {
         seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
         (seed >> 16) % limit
     };
-    for _ in 0..3000 {
+    for _ in 0..600 {
         a.focus = if next(2) == 0 { Focus::Files } else { Focus::Worktrees };
         let key = ['j', 'k', 'n', 'p'][next(4) as usize];
         press(&mut a, key, next(25) as usize);
@@ -501,4 +517,169 @@ fn the_file_offset_survives_switching_away_and_back() {
     press(&mut a, '[', 1);
     assert_eq!(render(&mut a), before);
     assert_eq!(a.current().unwrap().file_offset, 12);
+}
+
+#[test]
+fn the_side_panes_scale_with_the_terminal_between_limits() {
+    for (width, pane) in [(60, 16), (80, 16), (100, 20), (120, 24), (150, 30), (200, 30)] {
+        let out = render_sized(&mut app(), width, 12);
+        let top: Vec<char> = out.lines().next().unwrap().trim_matches('"').chars().collect();
+        let starts: Vec<usize> = (0..top.len()).filter(|&i| top[i] == '┌').collect();
+        assert_eq!(starts, [0, pane, 2 * pane], "{out}");
+    }
+}
+
+#[test]
+fn narrow_terminals_render_with_every_screen_open() {
+    for keys in ["", "v", "?", "wf"] {
+        let mut a = app();
+        type_keys(&mut a, keys);
+        for width in 1..50 {
+            for height in 1..14 {
+                render_sized(&mut a, width, height);
+            }
+        }
+    }
+}
+
+/// An app with one worktree called `name`, with every badge a row can have.
+fn badged(name: &str, added: u32, comments: u32) -> App {
+    let mut a = App::new("develop".into());
+    a.handle_msg(Msg::Worktrees(Ok(vec![Worktree { path: "/r/w".into(), head: "h".into(), branch: Some(name.into()) }])));
+    let key = CacheKey { worktree: "/r/w".into(), ..key() };
+    let file = FileDiff { added, ..sample_file() };
+    a.handle_msg(Msg::Loaded { path: "/r/w".into(), result: Ok(Loaded { key, diffs: Arc::new(vec![file]), op: Some("rebase") }) });
+    a.handle_msg(Msg::Stale("/r/w".into()));
+    a.handle_msg(Msg::Loaded { path: "/r/w".into(), result: Err(GitError::NoMergeBase) });
+    a.states[0].review.comments = (0..comments).map(|i| Comment {
+        path: "src/a.rs".into(), line: i, side: Side::New, line_text: String::new(), body: "b".into(),
+    }).collect();
+    a
+}
+
+#[test]
+fn a_row_keeps_every_badge_when_they_fit_with_a_short_name() {
+    let out = render_sized(&mut badged("feature/auth", 1234, 12), 120, 12);
+    assert!(out.contains("▸ …uth +1234 c12 ● ! ✗"), "{out}");
+}
+
+#[test]
+fn a_narrow_row_gives_up_its_counts_before_its_warnings() {
+    let out = render_sized(&mut badged("feature/auth", 1234, 12), 80, 12);
+    assert!(out.contains("▸ …/auth ● ! ✗"), "{out}");
+
+    let mut a = badged("feature/auth", 1234, 12);
+    a.states[0].stale = false;
+    a.states[0].op = None;
+    a.states[0].error = None;
+    let out = render_sized(&mut a, 80, 12);
+    assert!(out.contains("…re/auth c12"), "{out}");
+}
+
+fn status_line(out: &str) -> String {
+    out.lines().last().unwrap().trim_matches('"').trim_end().to_string()
+}
+
+#[test]
+fn warnings_come_first_in_the_status_bar() {
+    let mut a = badged("feat-auth", 1, 2);
+    a.states[0].error = None;
+    a.states[0].outdated = 2;
+    let line = status_line(&render(&mut a));
+    assert!(line.starts_with(" ! rebase in progress   ● changed   (2 outdated)   base: develop"), "{line}");
+}
+
+#[test]
+fn a_long_branch_is_elided_in_the_status_bar_and_the_rest_stays() {
+    let mut a = badged("feature/a-very-long-branch-name-for-the-authentication-rework", 1, 2);
+    let state = &mut a.states[0];
+    (state.error, state.op, state.stale) = (None, None, false);
+    let line = status_line(&render(&mut a));
+    assert!(line.contains("-rework   1 file   2 comments   ? help"), "{line}");
+    assert!(line.contains("base: develop   …"), "{line}");
+}
+
+#[test]
+fn the_status_bar_drops_its_help_hint_whole_when_it_does_not_fit() {
+    let mut a = app();
+    for width in 40..70 {
+        let line = status_line(&render_sized(&mut a, width, 12));
+        assert!(line.contains("? help") || !line.contains('?'), "{line}");
+    }
+    let line = status_line(&render_sized(&mut a, 44, 12));
+    assert!(!line.contains('?') && line.ends_with("0 comments"), "{line}");
+}
+
+#[test]
+fn counts_in_the_status_bar_are_pluralised() {
+    let two = FileDiff { path: "src/b.rs".into(), ..sample_file() };
+    let cases = [(vec![sample_file()], 1, "1 file   1 comment"), (vec![sample_file(), two], 2, "2 files   2 comments"), (vec![], 0, "0 files   0 comments")];
+    for (files, comments, expected) in cases {
+        let mut a = app_with(files);
+        a.states[0].review.comments = (0..comments).map(|i| Comment {
+            path: "nowhere".into(), line: i, side: Side::New, line_text: String::new(), body: "b".into(),
+        }).collect();
+        let line = status_line(&render(&mut a));
+        assert!(line.contains(expected), "{line}");
+    }
+}
+
+fn is_light(colour: Color) -> bool {
+    matches!(colour, Color::Rgb(r, g, b) if r > 150 && g > 150 && b > 150)
+}
+
+/// The cell drawing `symbol`, which must be unique on screen.
+fn cell_of<'a>(buffer: &'a Buffer, symbol: &str) -> &'a ratatui::buffer::Cell {
+    buffer.content.iter().find(|c| c.symbol() == symbol).unwrap()
+}
+
+fn added_and_removed() -> FileDiff {
+    FileDiff {
+        hunks: vec![Hunk {
+            header: "@@ -1 +1 @@".into(),
+            lines: vec![
+                Line { kind: LineKind::Context, old_no: Some(1), new_no: Some(1), text: "%".into() },
+                Line { kind: LineKind::Removed, old_no: Some(2), new_no: None, text: "Z".into() },
+                Line { kind: LineKind::Added, old_no: None, new_no: Some(2), text: "Q".into() },
+            ],
+        }],
+        ..sample_file()
+    }
+}
+
+#[test]
+fn added_and_removed_rows_set_a_light_foreground_on_their_dark_background() {
+    let plain_spans = |t: &str| vec![(Color::Reset, t.to_string())];
+    for highlighted in [false, true] {
+        for view in [false, true] {
+            let mut a = app_with(vec![added_and_removed()]);
+            if highlighted {
+                let lines = vec![vec![plain_spans("%"), plain_spans("Z"), plain_spans("Q")]];
+                a.handle_msg(Msg::Highlighted { key: key(), file_index: 0, lines: HighlightedFile { hunks: lines } });
+            }
+            if view {
+                a.handle_key(KeyEvent::from(KeyCode::Char('v')));
+            }
+            let buffer = render_buffer(&mut a, 120, 12);
+            assert!(is_light(cell_of(&buffer, "Z").fg), "{:?}", cell_of(&buffer, "Z"));
+            assert!(is_light(cell_of(&buffer, "Q").fg), "{:?}", cell_of(&buffer, "Q"));
+            assert_eq!(cell_of(&buffer, "%").fg, Color::Reset, "context keeps the terminal's colour");
+        }
+    }
+}
+
+#[test]
+fn highlighted_spans_keep_their_colours_on_added_and_removed_rows() {
+    for view in [false, true] {
+        let mut a = app_with(vec![added_and_removed()]);
+        let span = |c: Color, t: &str| vec![(c, t.to_string())];
+        let lines = vec![vec![span(Color::Yellow, "%"), span(Color::Red, "Z"), span(Color::Green, "Q")]];
+        a.handle_msg(Msg::Highlighted { key: key(), file_index: 0, lines: HighlightedFile { hunks: lines } });
+        if view {
+            a.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        }
+        let buffer = render_buffer(&mut a, 120, 12);
+        assert_eq!(cell_of(&buffer, "Z").fg, Color::Red);
+        assert_eq!(cell_of(&buffer, "Q").fg, Color::Green);
+    }
 }

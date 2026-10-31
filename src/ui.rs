@@ -17,6 +17,13 @@ const BORDERS: usize = 2;
 const SYMBOL: usize = 2;
 /// Cells before a path in the file list: reviewed mark, status and a space.
 const FILE_PREFIX: usize = 3;
+/// Cells a worktree name keeps before anything less important gives way.
+const MIN_NAME: usize = 4;
+const GAP: &str = "   ";
+const HELP_HINT: &str = "   ? help";
+/// Text on the dark added and removed backgrounds, which must not take a light
+/// terminal's dark default. It's the foreground of the highlighting theme.
+const ROW_TEXT: Color = Color::Rgb(0xc0, 0xc5, 0xce);
 
 const HELP: &[(&str, &str)] = &[
     ("[ / ]", "previous or next worktree"),
@@ -34,6 +41,7 @@ const HELP: &[(&str, &str)] = &[
     ("r", "refresh or retry"),
     ("b", "change the base branch"),
     ("?", "open or close this help"),
+    ("Esc", "close help or a prompt"),
     ("q", "quit"),
 ];
 
@@ -48,8 +56,9 @@ fn display_text(s: &str) -> Cow<'_, str> {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
+    let side = (f.area().width / 5).clamp(16, 30);
     let [left, files, diff] = Layout::horizontal([
-        Constraint::Length(26), Constraint::Length(24), Constraint::Min(0),
+        Constraint::Length(side), Constraint::Length(side), Constraint::Min(0),
     ]).areas(main);
 
     draw_worktrees(f, app, left);
@@ -109,16 +118,22 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let first = app.worktree_offset;
     let items: Vec<ListItem> = app.worktrees.iter().zip(&app.states).skip(first).take(visible).map(|(w, s)| {
         let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
-        let mut badges = format!(" +{added}");
-        if !s.review.comments.is_empty() {
-            badges.push_str(&format!(" c{}", s.review.comments.len()));
-        }
-        if s.stale { badges.push_str(" ●"); }
-        if s.op.is_some() { badges.push_str(" !"); }
-        if s.error.is_some() { badges.push_str(" ✗"); }
-        // The name gives way, because a badge is what the row is there to show.
-        let room = (area.width as usize).saturating_sub(BORDERS + SYMBOL + badges.width());
-        ListItem::new(format!("{}{badges}", elide(&worktree_label(w), room)))
+        let comments = match s.review.comments.len() {
+            0 => String::new(),
+            n => format!(" c{n}"),
+        };
+        let mut warnings = String::new();
+        if s.stale { warnings.push_str(" ●"); }
+        if s.op.is_some() { warnings.push_str(" !"); }
+        if s.error.is_some() { warnings.push_str(" ✗"); }
+        // The name shortens first, then the counts go, least useful first, so
+        // the warnings stay. Only a pane under 10 cells wide can cut those.
+        let room = (area.width as usize).saturating_sub(BORDERS + SYMBOL);
+        let badges = [format!(" +{added}{comments}{warnings}"), format!("{comments}{warnings}")].into_iter()
+            .find(|b| b.width() + MIN_NAME <= room)
+            .unwrap_or(warnings);
+        let name = room.saturating_sub(badges.width());
+        ListItem::new(format!("{}{badges}", elide(&worktree_label(w), name)))
     }).collect();
     let mut state = ListState::default().with_selected(Some(app.selected.saturating_sub(first)));
     let list = List::new(items)
@@ -200,10 +215,15 @@ fn message<'a>(text: impl Into<ratatui::text::Text<'a>>) -> Paragraph<'a> {
     Paragraph::new(text).wrap(Wrap { trim: false })
 }
 
+/// A span's style. `Reset` means no colour of its own, so the row's shows.
+fn span_style(color: Color) -> Style {
+    if color == Color::Reset { Style::new() } else { Style::new().fg(color) }
+}
+
 fn line_style(kind: LineKind) -> Style {
     match kind {
-        LineKind::Added => Style::new().bg(Color::Rgb(16, 48, 24)),
-        LineKind::Removed => Style::new().bg(Color::Rgb(56, 16, 16)),
+        LineKind::Added => Style::new().fg(ROW_TEXT).bg(Color::Rgb(16, 48, 24)),
+        LineKind::Removed => Style::new().fg(ROW_TEXT).bg(Color::Rgb(56, 16, 16)),
         LineKind::Context => Style::new(),
     }
 }
@@ -246,7 +266,7 @@ fn unified_rows<'a>(
                 let gutter = comment_mark(commented, line);
                 let mut spans = vec![Span::raw(format!("{gutter}{number:>5} {prefix}"))];
                 match highlight.and_then(|h| h.hunks.get(hi)).and_then(|h| h.get(li)) {
-                    Some(parts) => spans.extend(parts.iter().map(|(c, t)| Span::styled(display_text(t), Style::new().fg(*c)))),
+                    Some(parts) => spans.extend(parts.iter().map(|(c, t)| Span::styled(display_text(t), span_style(*c)))),
                     None => spans.push(Span::raw(display_text(&line.text))),
                 }
                 rows.push(mark(TextLine::from(spans).style(line_style(line.kind)), row == cursor));
@@ -322,7 +342,7 @@ fn fit_spans<'a>(parts: &[(Color, &'a str)], width: usize) -> Vec<Span<'a>> {
             used += w;
             kept.push_str(grapheme.symbol);
         }
-        out.push(Span::styled(kept, Style::new().fg(*color)));
+        out.push(Span::styled(kept, span_style(*color)));
         if full {
             break;
         }
@@ -336,23 +356,45 @@ fn mark(line: TextLine<'_>, selected: bool) -> TextLine<'_> {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let mut text = format!(" base: {}", app.base);
-    if let Some(e) = &app.fatal {
-        text = format!(" Could not list worktrees: {e}");
+    let width = area.width as usize;
+    let mut text = if let Some(e) = &app.fatal {
+        format!(" Could not list worktrees: {e}")
     } else if let Some(n) = &app.notice {
-        text = format!(" {n}");
+        format!(" {n}")
     } else if let Some(c) = app.comment_at_cursor() {
-        text = format!(" * {}", display_text(&c.body));
-    } else if let (Some(w), Some(s)) = (app.selected_worktree(), app.current()) {
-        let count = s.diffs.as_ref().map_or(0, |d| d.len());
-        text.push_str(&format!("   {}   {count} files   {} comments", worktree_label(w), s.review.comments.len()));
-        let outdated = app.outdated_comments();
-        if outdated > 0 { text.push_str(&format!(" ({outdated} outdated)")); }
-        if s.stale { text.push_str("   ● changed"); }
-        if let Some(op) = s.op { text.push_str(&format!("   ! {op} in progress")); }
+        format!(" * {}", display_text(&c.body))
+    } else {
+        status_summary(app, width)
+    };
+    if text.width() + HELP_HINT.width() <= width {
+        text.push_str(HELP_HINT);
     }
-    text.push_str("   ? help");
     f.render_widget(Paragraph::new(text), area);
+}
+
+/// Warnings first, since the end is what a narrow screen cuts. A long branch
+/// name shortens so that the counts after it and the help hint still fit.
+fn status_summary(app: &App, width: usize) -> String {
+    let base = format!("base: {}", app.base);
+    let (Some(w), Some(s)) = (app.selected_worktree(), app.current()) else {
+        return format!(" {base}");
+    };
+    let mut head = Vec::new();
+    if let Some(op) = s.op { head.push(format!("! {op} in progress")); }
+    if s.stale { head.push("● changed".to_string()); }
+    let outdated = app.outdated_comments();
+    if outdated > 0 { head.push(format!("({outdated} outdated)")); }
+    head.push(base);
+    let head = head.join(GAP);
+    let counts = format!("{}{GAP}{}", plural(app.file_count(), "file"), plural(s.review.comments.len(), "comment"));
+
+    let spare = width.saturating_sub(1 + head.width() + GAP.len() * 2 + counts.width());
+    let room = if spare >= MIN_NAME + HELP_HINT.width() { spare - HELP_HINT.width() } else { spare.max(MIN_NAME) };
+    format!(" {head}{GAP}{}{GAP}{counts}", elide(&worktree_label(w), room))
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -417,6 +459,12 @@ fn draw_input(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_text_expands_tabs_and_removes_carriage_returns() {
+        assert_eq!(display_text("\ta\r"), "    a");
+        assert!(matches!(display_text("plain"), Cow::Borrowed("plain")));
+    }
 
     #[test]
     fn list_offset_moves_only_as_far_as_it_must() {
