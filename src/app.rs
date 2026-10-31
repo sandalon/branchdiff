@@ -54,6 +54,8 @@ pub struct WorktreeState {
     pub op: Option<&'static str>,
     pub stale: bool,
     pub file: usize,
+    /// First row shown in the file list. `ui` keeps it around `file`.
+    pub file_offset: usize,
     pub cursor: usize,
     pub scroll: usize,
     pub review: Review,
@@ -109,6 +111,8 @@ pub struct App {
     pub worktrees: Vec<Worktree>,
     pub states: Vec<WorktreeState>,
     pub selected: usize,
+    /// First row shown in the worktree list. `ui` keeps it around `selected`.
+    pub worktree_offset: usize,
     pub focus: Focus,
     pub view: DiffView,
     pub help_open: bool,
@@ -135,6 +139,7 @@ impl App {
             worktrees: Vec::new(),
             states: Vec::new(),
             selected: 0,
+            worktree_offset: 0,
             focus: Focus::Worktrees,
             view: DiffView::Unified,
             help_open: false,

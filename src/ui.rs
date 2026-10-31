@@ -86,8 +86,28 @@ fn block(title: &str, focused: bool) -> Block<'_> {
     Block::default().borders(Borders::ALL).border_style(style).title(title)
 }
 
-fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app.worktrees.iter().zip(&app.states).map(|(w, s)| {
+/// Moves `offset` just enough to bring `selected` inside `visible` rows.
+fn follow(offset: usize, selected: usize, visible: usize) -> usize {
+    if selected < offset {
+        selected
+    } else if visible > 0 && selected >= offset + visible {
+        selected + 1 - visible
+    } else {
+        offset
+    }
+}
+
+/// As `follow`, for a list of `len` rows, which also can't leave rows unused
+/// below its end after the list shrinks or the terminal grows.
+fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> usize {
+    follow(offset, selected, visible).min(len.saturating_sub(visible))
+}
+
+fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
+    let visible = (area.height as usize).saturating_sub(BORDERS);
+    app.worktree_offset = list_offset(app.worktree_offset, app.selected, visible, app.worktrees.len());
+    let first = app.worktree_offset;
+    let items: Vec<ListItem> = app.worktrees.iter().zip(&app.states).skip(first).take(visible).map(|(w, s)| {
         let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
         let mut badges = format!(" +{added}");
         if !s.review.comments.is_empty() {
@@ -100,7 +120,7 @@ fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
         let room = (area.width as usize).saturating_sub(BORDERS + SYMBOL + badges.width());
         ListItem::new(format!("{}{badges}", elide(&worktree_label(w), room)))
     }).collect();
-    let mut state = ListState::default().with_selected(Some(app.selected));
+    let mut state = ListState::default().with_selected(Some(app.selected.saturating_sub(first)));
     let list = List::new(items)
         .block(block("Worktrees", app.focus == Focus::Worktrees))
         .highlight_symbol("▸ ")
@@ -108,15 +128,18 @@ fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_files(f: &mut Frame, app: &App, area: Rect) {
-    let Some(s) = app.current() else {
+fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
+    let visible = (area.height as usize).saturating_sub(BORDERS);
+    let len = app.file_count();
+    let Some(s) = app.current_mut() else {
         f.render_widget(block("Files", false), area);
         return;
     };
-    // Only the visible rows, since `is_reviewed` can hash a whole file. The
-    // selected file sits on the last row, where `List` would scroll it to.
-    let visible = (area.height as usize).saturating_sub(BORDERS);
-    let first = (s.file + 1).saturating_sub(visible);
+    s.file_offset = list_offset(s.file_offset, s.file, visible, len);
+    let app = &*app;
+    let Some(s) = app.current() else { return };
+    // Only the visible rows, since `is_reviewed` can hash a whole file.
+    let first = s.file_offset;
     let room = (area.width as usize).saturating_sub(BORDERS + FILE_PREFIX);
     let files = s.diffs.as_ref().map_or(&[][..], |d| d.as_slice());
     let items: Vec<ListItem> = files.iter().enumerate().skip(first).take(visible).map(|(i, x)| {
@@ -139,11 +162,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(message(text).block(block("Diff", app.focus == Focus::Diff)), area);
         return;
     };
-    if s.cursor < s.scroll {
-        s.scroll = s.cursor;
-    } else if visible > 0 && s.cursor >= s.scroll + visible {
-        s.scroll = s.cursor + 1 - visible;
-    }
+    s.scroll = follow(s.scroll, s.cursor, visible);
     let app = &*app;
     let Some(s) = app.current() else { return };
     let focused = app.focus == Focus::Diff;
@@ -398,6 +417,17 @@ fn draw_input(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_offset_moves_only_as_far_as_it_must() {
+        assert_eq!(list_offset(5, 7, 5, 20), 5, "already inside");
+        assert_eq!(list_offset(5, 3, 5, 20), 3, "above the window");
+        assert_eq!(list_offset(5, 12, 5, 20), 8, "below the window");
+        assert_eq!(list_offset(15, 4, 5, 6), 1, "list shrank");
+        assert_eq!(list_offset(9, 19, 30, 20), 0, "window grew");
+        assert_eq!(list_offset(0, 0, 5, 0), 0, "empty list");
+        assert_eq!(list_offset(2, 3, 0, 5), 2, "no rows");
+    }
 
     #[test]
     fn elide_keeps_the_end_and_fits_the_width() {

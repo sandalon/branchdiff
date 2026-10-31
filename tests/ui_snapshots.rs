@@ -346,3 +346,159 @@ fn the_diff_area_says_loading_before_the_worktree_list_arrives() {
     let mut a = App::new("develop".into());
     assert!(render(&mut a).contains("Loading…"));
 }
+
+fn numbered_files(count: usize) -> Vec<FileDiff> {
+    (0..count).map(|i| FileDiff { path: format!("f{i:03}.rs"), ..sample_file() }).collect()
+}
+
+fn worktrees(count: usize) -> Vec<Worktree> {
+    (0..count).map(|i| {
+        let name = format!("wt-{i:03}");
+        Worktree { path: format!("/r/{name}").into(), head: "h".into(), branch: Some(name) }
+    }).collect()
+}
+
+/// The screen row holding `text`, if it's drawn.
+fn row_of(out: &str, text: &str) -> Option<usize> {
+    out.lines().position(|l| l.contains(text))
+}
+
+fn press(a: &mut App, key: char, times: usize) {
+    for _ in 0..times {
+        a.handle_key(KeyEvent::from(KeyCode::Char(key)));
+    }
+}
+
+#[test]
+fn moving_up_inside_the_file_window_does_not_scroll_it() {
+    let mut a = app_with(numbered_files(40));
+    a.focus = Focus::Files;
+    for _ in 0..15 {
+        press(&mut a, 'j', 1);
+        render(&mut a);
+    }
+    // Nine rows, so f015 on the last row leaves f007 at the top.
+    let before = render(&mut a);
+    assert_eq!(row_of(&before, "f007.rs"), Some(1), "{before}");
+    assert_eq!(row_of(&before, "f015.rs"), Some(9), "{before}");
+
+    press(&mut a, 'k', 1);
+    let after = render(&mut a);
+    assert_eq!(row_of(&after, "f007.rs"), Some(1), "{after}");
+    assert_eq!(row_of(&after, "f015.rs"), Some(9), "{after}");
+    assert_eq!(a.current().unwrap().file_offset, 7);
+
+    // At the top row, the next step up scrolls by one.
+    press(&mut a, 'k', 7);
+    render(&mut a);
+    press(&mut a, 'k', 1);
+    let top = render(&mut a);
+    assert_eq!(row_of(&top, "f006.rs"), Some(1), "{top}");
+    assert_eq!(a.current().unwrap().file_offset, 6);
+}
+
+#[test]
+fn moving_up_inside_the_worktree_window_does_not_scroll_it() {
+    let mut a = App::new("develop".into());
+    a.handle_msg(Msg::Worktrees(Ok(worktrees(40))));
+    for _ in 0..15 {
+        press(&mut a, 'j', 1);
+        render(&mut a);
+    }
+    press(&mut a, 'k', 1);
+    let out = render(&mut a);
+    assert_eq!(row_of(&out, "wt-007"), Some(1), "{out}");
+    assert_eq!(row_of(&out, "▸ wt-014"), Some(8), "{out}");
+    assert_eq!(a.worktree_offset, 7);
+}
+
+#[test]
+fn selections_stay_visible_through_moves_and_resizes() {
+    let mut a = App::new("develop".into());
+    a.handle_msg(Msg::Worktrees(Ok(worktrees(40))));
+    a.handle_msg(Msg::Loaded {
+        path: "/r/wt-000".into(),
+        result: Ok(Loaded { key: key(), diffs: Arc::new(numbered_files(300)), op: None }),
+    });
+    let mut seed = 7u32;
+    let mut next = |limit: u32| {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        (seed >> 16) % limit
+    };
+    for _ in 0..3000 {
+        a.focus = if next(2) == 0 { Focus::Files } else { Focus::Worktrees };
+        let key = ['j', 'k', 'n', 'p'][next(4) as usize];
+        press(&mut a, key, next(25) as usize);
+        // Only the first worktree has files, so keep coming back to it.
+        if next(3) == 0 {
+            press(&mut a, '1', 1);
+        }
+        let (width, height) = (60 + next(100) as u16, 4 + next(40) as u16);
+        let out = render_sized(&mut a, width, height);
+
+        let selected = format!("▸ wt-{:03}", a.selected);
+        assert!(out.contains(&selected), "{selected} missing at {width}x{height}\n{out}");
+        let (file, count) = (a.current().unwrap().file, a.file_count());
+        if count > 0 {
+            let path = format!("f{file:03}.rs");
+            assert!(out.contains(&path), "{path} missing at {width}x{height}\n{out}");
+        }
+    }
+}
+
+#[test]
+fn a_list_that_shrinks_leaves_a_valid_offset() {
+    let mut a = app_with(numbered_files(40));
+    a.focus = Focus::Files;
+    press(&mut a, 'j', 39);
+    render(&mut a);
+    assert_eq!(a.current().unwrap().file_offset, 31);
+
+    a.handle_msg(Msg::Loaded { path: "/r/feat-auth".into(), result: Ok(Loaded { key: key(), diffs: Arc::new(numbered_files(3)), op: None }) });
+    let out = render(&mut a);
+    assert_eq!(a.current().unwrap().file_offset, 0);
+    assert_eq!(row_of(&out, "f000.rs"), Some(1), "{out}");
+
+    let mut a = App::new("develop".into());
+    a.handle_msg(Msg::Worktrees(Ok(worktrees(40))));
+    press(&mut a, 'j', 39);
+    render(&mut a);
+    assert_eq!(a.worktree_offset, 31);
+    a.handle_msg(Msg::Worktrees(Ok(worktrees(40).split_off(38))));
+    let out = render(&mut a);
+    assert_eq!(a.worktree_offset, 0);
+    assert_eq!(row_of(&out, "wt-038"), Some(1), "{out}");
+}
+
+#[test]
+fn a_taller_terminal_shows_as_much_of_the_list_as_fits() {
+    let mut a = app_with(numbered_files(20));
+    a.focus = Focus::Files;
+    press(&mut a, 'j', 19);
+    render(&mut a);
+    assert_eq!(a.current().unwrap().file_offset, 11);
+
+    let out = render_sized(&mut a, 80, 16);
+    assert_eq!(a.current().unwrap().file_offset, 7);
+    assert_eq!(row_of(&out, "f019.rs"), Some(13), "{out}");
+}
+
+#[test]
+fn the_file_offset_survives_switching_away_and_back() {
+    let mut a = app_with(numbered_files(40));
+    let other = CacheKey { worktree: "/r/fix-cache".into(), ..key() };
+    a.handle_msg(Msg::Loaded { path: "/r/fix-cache".into(), result: Ok(Loaded { key: other, diffs: Arc::new(numbered_files(2)), op: None }) });
+    a.focus = Focus::Files;
+    press(&mut a, 'j', 20);
+    render(&mut a);
+    press(&mut a, 'k', 3);
+    let before = render(&mut a);
+    assert_eq!(a.current().unwrap().file_offset, 12);
+
+    press(&mut a, ']', 1);
+    render(&mut a);
+    assert_eq!(a.current().unwrap().file_offset, 0);
+    press(&mut a, '[', 1);
+    assert_eq!(render(&mut a), before);
+    assert_eq!(a.current().unwrap().file_offset, 12);
+}
