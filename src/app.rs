@@ -1957,4 +1957,115 @@ mod tests {
         assert_eq!(a.base, "main");
         assert_eq!(fx.len(), 2);
     }
+
+    fn base_missing(a: &mut App, name: &str) -> Vec<Effect> {
+        let path = format!("/r/{name}").into();
+        a.handle_msg(Msg::Loaded { path, result: Err(crate::git::GitError::BaseMissing("develop".into())) })
+    }
+
+    fn query(a: &App) -> Option<&str> {
+        match &a.input {
+            Some(Input::Worktree { query } | Input::Base { query, .. }) => Some(query),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_finder_takes_the_top_match() {
+        let mut a = app(&["x", "feat-a", "feat-b"]);
+        press(&mut a, 'w');
+        for c in "feat".chars() {
+            press(&mut a, c);
+        }
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.selected, 1);
+    }
+
+    #[test]
+    fn the_base_picker_takes_the_top_match() {
+        let mut a = app(&["a"]);
+        press(&mut a, 'b');
+        a.handle_msg(Msg::Branches(Ok(vec!["x".into(), "main-a".into(), "main-b".into()])));
+        for c in "main".chars() {
+            press(&mut a, c);
+        }
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.base, "main-a");
+    }
+
+    #[test]
+    fn a_late_branch_list_keeps_an_open_finder() {
+        let mut a = app(&["a"]);
+        press(&mut a, 'w');
+        press(&mut a, 'x');
+        a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
+        assert!(matches!(a.input, Some(Input::Worktree { .. })));
+        assert_eq!(query(&a), Some("x"));
+    }
+
+    #[test]
+    fn a_second_branch_list_keeps_an_open_picker() {
+        let mut a = app(&["a"]);
+        a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
+        press(&mut a, 'm');
+        a.handle_msg(Msg::Branches(Ok(vec!["other".into()])));
+        assert_eq!(query(&a), Some("m"));
+        assert!(matches!(&a.input, Some(Input::Base { branches, .. }) if branches == &["main"]));
+    }
+
+    #[test]
+    fn a_branch_list_closes_help_to_open_the_picker() {
+        let mut a = app(&["a"]);
+        press(&mut a, '?');
+        a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
+        assert!(!a.help_open);
+        assert!(matches!(a.input, Some(Input::Base { .. })));
+    }
+
+    #[test]
+    fn a_failed_branch_list_sets_a_notice() {
+        let mut a = app(&["a"]);
+        a.handle_msg(Msg::Branches(Err(crate::git::GitError::Failed("boom".into()))));
+        assert_eq!(a.notice.as_deref(), Some("boom"));
+        assert!(a.input.is_none());
+    }
+
+    #[test]
+    fn a_missing_base_stores_the_error() {
+        let mut a = app(&["a"]);
+        base_missing(&mut a, "a");
+        assert_eq!(a.states[0].error, Some(crate::git::GitError::BaseMissing("develop".into())));
+    }
+
+    #[test]
+    fn a_missing_base_leaves_an_open_prompt_and_stores_the_error() {
+        let mut finder = app(&["a"]);
+        press(&mut finder, 'w');
+        let mut comment = app_on_line();
+        press(&mut comment, 'c');
+        for (a, open) in [(&mut finder, "finder"), (&mut comment, "comment")] {
+            assert!(base_missing(a, "a").is_empty(), "{open}");
+            assert!(a.states[0].error.is_some(), "{open}");
+        }
+        assert!(matches!(finder.input, Some(Input::Worktree { .. })));
+        assert!(matches!(comment.input, Some(Input::Comment { .. })));
+    }
+
+    #[test]
+    fn every_load_after_a_base_change_uses_the_new_base() {
+        let mut a = app(&["a", "b"]);
+        a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
+        press(&mut a, 'm');
+        let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(fx, vec![
+            Effect::Load { path: "/r/a".into(), base: "main".into() },
+            Effect::Load { path: "/r/b".into(), base: "main".into() },
+        ]);
+    }
+
+    #[test]
+    fn a_detached_worktree_is_labelled_with_its_short_hash() {
+        let w = Worktree { branch: None, head: "abcdef0123456789".into(), ..wt("a") };
+        assert_eq!(worktree_label(&w), "(abcdef01)");
+    }
 }

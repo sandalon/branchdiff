@@ -12,8 +12,10 @@ pub fn filter(query: &str, items: &[String]) -> Vec<usize> {
     let mut scored: Vec<(usize, u32)> = items.iter().enumerate()
         .filter_map(|(i, s)| pattern.score(Utf32Str::new(s, &mut buf), &mut matcher).map(|score| (i, score)))
         .collect();
-    // On a tie the shorter name wins, or `feat` couldn't be reached past `feat-2`.
-    scored.sort_by_key(|&(i, score)| (std::cmp::Reverse(score), items[i].len(), i));
+    // The prompts can't move through the list, so any name that loses every
+    // query is out of reach. That's why an exact name comes first and, on a
+    // tie, the shorter name: otherwise `Main` hides `main`, and `feat-2` `feat`.
+    scored.sort_by_key(|&(i, score)| (items[i] != query, std::cmp::Reverse(score), items[i].len(), i));
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
@@ -37,5 +39,19 @@ mod tests {
     fn a_full_name_beats_a_longer_name_it_starts() {
         let items = vec!["feat-2".to_string(), "feat".to_string()];
         assert_eq!(filter("feat", &items), vec![1, 0]);
+    }
+
+    #[test]
+    fn a_better_match_ranks_above_a_shorter_earlier_one() {
+        let items = vec!["cxaxcxhxe".to_string(), "fix-the-cache-layer".to_string()];
+        assert_eq!(filter("cache", &items), vec![1, 0]);
+    }
+
+    #[test]
+    fn an_exact_name_beats_one_differing_only_in_case() {
+        let lower_last = vec!["Main".to_string(), "main".to_string()];
+        assert_eq!(filter("main", &lower_last), vec![1, 0]);
+        let lower_first = vec!["main".to_string(), "Main".to_string()];
+        assert_eq!(filter("main", &lower_first), vec![0, 1]);
     }
 }
