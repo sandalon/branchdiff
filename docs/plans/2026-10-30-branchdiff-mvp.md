@@ -3599,6 +3599,24 @@ fn tail(text: &str, width: usize) -> &str {
 
 Add a test that a long prompt shows its last typed character.
 
+Side-by-side diffs need colour too, because the design promises highlighted diffs in both views. Give `split_rows` the `highlight` argument and draw each side from the same spans `unified_rows` uses, cut to the side's width on a character boundary and padded to it, falling back to plain text when there are no spans. The row stays `gutter`, left side, ` │ `, right side, with the line's background. Add a test that a highlighted line in side-by-side view has the same text as the plain one and carries the span colours.
+
+Terminals without truecolor misread `Color::Rgb`, so add `pub truecolor: bool` to `App`, defaulting to `true`, and pass every RGB colour through one helper when drawing, covering syntax colours and the added and removed backgrounds:
+
+```rust
+/// Nearest 256-colour entry, for terminals that don't advertise truecolor.
+fn fit_color(color: Color, truecolor: bool) -> Color {
+    let Color::Rgb(r, g, b) = color else { return color };
+    if truecolor {
+        return color;
+    }
+    let cube = |v: u8| if v < 48 { 0 } else if v < 115 { 1 } else { (v - 35) / 40 };
+    Color::Indexed(16 + 36 * cube(r) + 6 * cube(g) + cube(b))
+}
+```
+
+Add a test that with `truecolor` false a rendered buffer holds no `Color::Rgb`, and a unit test of `fit_color` at black, white and a mid value.
+
 Add these tests to `tests/ui_snapshots.rs`: a tab-indented line renders with four spaces, a CRLF line renders with no stray characters and keeps its neighbours aligned in side-by-side view, and a file with no hunks shows `No text changes to show`.
 
 **Step 5: Review and accept snapshots**
@@ -3612,7 +3630,7 @@ Check each screen by eye against the layout in the design doc, then accept.
 **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --test ui_snapshots`
-Expected: 16 passed.
+Expected: all pass.
 
 **Step 7: Commit**
 
@@ -4052,6 +4070,13 @@ fn main() -> Result<()> {
 
 const MAX_HIGHLIGHTS: usize = 2;
 
+/// Terminals advertise this in `COLORTERM`. Windows Terminal doesn't, but sets
+/// `WT_SESSION`.
+fn supports_truecolor() -> bool {
+    let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+    colorterm.contains("truecolor") || colorterm.contains("24bit") || std::env::var_os("WT_SESSION").is_some()
+}
+
 /// Without this, a pasted newline arrives as Enter and the rest of the paste
 /// runs as hotkeys. Best effort, because some terminals don't support it.
 fn set_bracketed_paste(on: bool) {
@@ -4123,6 +4148,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
         highlighting: HashSet::new(),
     };
     let mut app = App::new(base);
+    app.truecolor = supports_truecolor();
     rt.pool.submit(Job::ListWorktrees { cwd: rt.repo.clone() });
 
     loop {
