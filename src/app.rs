@@ -1,5 +1,5 @@
 use crate::cache::{CacheKey, Diffs};
-use crate::diff::FileDiff;
+use crate::diff::{FileDiff, Hunk, Status};
 use crate::git::{GitError, Worktree};
 use crate::store::{fnv1a, Comment, Review, ReviewId, Side};
 use crate::worker::Msg;
@@ -27,6 +27,16 @@ pub enum Effect {
 pub enum Input {
     Comment { path: String, line: u32, side: Side, line_text: String, text: String },
     ConfirmClear,
+}
+
+impl Input {
+    /// The text that keys and pastes edit, if this prompt has any.
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Comment { text, .. } => Some(text),
+            Self::ConfirmClear => None,
+        }
+    }
 }
 
 /// Everything remembered for one worktree across switches.
@@ -358,14 +368,20 @@ impl App {
 
     /// The diff line under the cursor. `None` on a hunk header.
     pub fn line_at_cursor(&self) -> Option<&crate::diff::Line> {
+        let (hunk, index) = self.hunk_at_cursor()?;
+        hunk.lines.get(index?)
+    }
+
+    /// The hunk under the cursor and the line's index in it, `None` on its header.
+    fn hunk_at_cursor(&self) -> Option<(&Hunk, Option<usize>)> {
         let mut row = self.current()?.cursor;
         for hunk in &self.current_file()?.hunks {
             if row == 0 {
-                return None;
+                return Some((hunk, None));
             }
             row -= 1;
             if row < hunk.lines.len() {
-                return hunk.lines.get(row);
+                return Some((hunk, Some(row)));
             }
             row -= hunk.lines.len();
         }
@@ -388,7 +404,7 @@ impl App {
             self.input = None;
             return if key.code == KeyCode::Char('y') { self.clear_comments() } else { Vec::new() };
         }
-        let Some(Input::Comment { text, .. }) = self.input.as_mut() else { return Vec::new() };
+        let Some(text) = self.input.as_mut().and_then(Input::text_mut) else { return Vec::new() };
         match key.code {
             KeyCode::Char(c) => text.push(c),
             KeyCode::Backspace => { text.pop(); }
@@ -407,6 +423,17 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// Adds pasted text to the open prompt. Pastes arrive whole, so a newline
+    /// in one can't submit the prompt or run the rest as hotkeys.
+    pub fn paste(&mut self, text: &str) {
+        if self.help_open {
+            return;
+        }
+        if let Some(open) = self.input.as_mut().and_then(Input::text_mut) {
+            open.push_str(&single_line(text));
+        }
     }
 
     /// The comment on the line under the cursor, newest first when there are several.
@@ -501,9 +528,52 @@ impl App {
         let Some(root) = self.selected_worktree().map(|w| w.path.clone()) else { return Vec::new() };
         let Some(file) = self.current_file() else { return Vec::new() };
         let path = root.join(&file.path);
-        let line = self.line_at_cursor().and_then(|l| l.new_no).unwrap_or(1);
+        if self.is_gone(file) {
+            self.notice = Some("File was deleted on this branch".into());
+            return Vec::new();
+        }
+        let line = self.hunk_at_cursor().map_or(1, |(hunk, index)| nearest_new_line(hunk, index));
         vec![Effect::OpenEditor { path, line }]
     }
+
+    /// Answers whether opening `file` would create it. A typechange, or a
+    /// deleted file recreated as untracked, also has an entry for what's there.
+    fn is_gone(&self, file: &FileDiff) -> bool {
+        let diffs = self.current().and_then(|s| s.diffs.as_ref());
+        file.status == Status::Deleted
+            && !diffs.is_some_and(|d| d.iter().any(|f| f.path == file.path && f.status != Status::Deleted))
+    }
+}
+
+/// Makes pasted text fit a one-line prompt: a run of line breaks becomes one
+/// space, and so does every other control character but tab. Export writes
+/// comment bodies as they are, so a kept newline could start a Markdown heading.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut after_break = false;
+    for c in text.chars() {
+        let is_break = matches!(c, '\r' | '\n');
+        if !(is_break && after_break) {
+            out.push(if c.is_control() && c != '\t' { ' ' } else { c });
+        }
+        after_break = is_break;
+    }
+    out
+}
+
+/// The line to open for a position in `hunk`, since a removed line or a header
+/// has no line of its own in the new file. `index` is `None` on the header.
+fn nearest_new_line(hunk: &Hunk, index: Option<usize>) -> u32 {
+    let (before, after) = hunk.lines.split_at(index.unwrap_or(0));
+    after.iter().find_map(|l| l.new_no)
+        .or_else(|| before.iter().rev().find_map(|l| l.new_no))
+        .unwrap_or_else(|| new_side_start(&hunk.header))
+}
+
+/// The `c` in `@@ -a,b +c,d @@`. It's 0 when the new file has no lines at all.
+fn new_side_start(header: &str) -> u32 {
+    let start = header.split_once(" +").and_then(|(_, rest)| rest.split([',', ' ']).next());
+    start.and_then(|n| n.parse().ok()).unwrap_or(1).max(1)
 }
 
 /// Identifies a file's content cheaply, since this runs for every file on
@@ -1383,6 +1453,171 @@ mod tests {
         // Back on hotkeys, `y` copies b's comments rather than clearing them.
         let fx = press(&mut a, 'y');
         assert!(!fx.iter().any(|e| matches!(e, Effect::SaveReview { .. })));
+        assert_eq!(a.current().unwrap().review.comments.len(), 1);
+    }
+
+    fn numbered(kind: LineKind, old_no: Option<u32>, new_no: Option<u32>) -> Line {
+        Line { kind, old_no, new_no, text: "x".into() }
+    }
+
+    fn context(old: u32, new: u32) -> Line {
+        numbered(LineKind::Context, Some(old), Some(new))
+    }
+
+    fn removed(old: u32) -> Line {
+        numbered(LineKind::Removed, Some(old), None)
+    }
+
+    fn hunk(header: &str, lines: Vec<Line>) -> Hunk {
+        Hunk { header: header.into(), lines }
+    }
+
+    /// The line `e` opens with the cursor on `row`, or `None` if it opens nothing.
+    fn editor_line(f: FileDiff, row: usize) -> Option<u32> {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![f]);
+        set_cursor_scroll(&mut a, row, 0);
+        match press(&mut a, 'e').as_slice() {
+            [Effect::OpenEditor { line, .. }] => Some(*line),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn e_on_a_removed_line_opens_the_following_line() {
+        let f = FileDiff { hunks: vec![hunk("@@ -40,3 +40,2 @@", vec![context(40, 40), removed(41), context(42, 41)])], ..file("m.rs") };
+        assert_eq!(editor_line(f, 2), Some(41));
+    }
+
+    #[test]
+    fn e_on_a_hunk_header_opens_the_hunks_first_new_line() {
+        let f = FileDiff { hunks: vec![hunk("@@ -40,2 +42,1 @@", vec![removed(40), context(41, 42)])], ..file("m.rs") };
+        assert_eq!(editor_line(f, 0), Some(42));
+    }
+
+    #[test]
+    fn e_on_a_removed_block_ending_a_hunk_opens_the_line_before_it() {
+        let f = FileDiff { hunks: vec![hunk("@@ -40,4 +40,2 @@", vec![context(40, 40), context(41, 41), removed(42), removed(43)])], ..file("m.rs") };
+        assert_eq!(editor_line(f, 4), Some(41));
+    }
+
+    #[test]
+    fn e_in_a_hunk_of_only_removals_opens_its_new_side_start() {
+        let f = FileDiff {
+            hunks: vec![
+                hunk("@@ -1 +1 @@", vec![context(1, 1)]),
+                hunk("@@ -40,2 +39,0 @@ fn a(b: u8) -> u8 { b + 1 }", vec![removed(40), removed(41)]),
+            ],
+            ..file("m.rs")
+        };
+        assert_eq!(editor_line(f.clone(), 2), Some(39));
+        assert_eq!(editor_line(f, 3), Some(39));
+    }
+
+    #[test]
+    fn e_treats_a_new_side_start_of_zero_as_line_one() {
+        let f = FileDiff { hunks: vec![hunk("@@ -1,2 +0,0 @@", vec![removed(1), removed(2)])], ..file("m.rs") };
+        assert_eq!(editor_line(f, 1), Some(1));
+    }
+
+    #[test]
+    fn e_on_a_deleted_file_says_so_and_opens_nothing() {
+        let mut a = app(&["a"]);
+        let f = FileDiff { status: Status::Deleted, hunks: vec![hunk("@@ -1 +0,0 @@", vec![removed(1)])], ..file("gone.rs") };
+        deliver(&mut a, "a", vec![f]);
+        assert!(press(&mut a, 'e').is_empty());
+        assert!(a.notice.is_some());
+    }
+
+    #[test]
+    fn e_opens_the_deleted_side_of_a_path_that_still_exists() {
+        let mut a = app(&["a"]);
+        let gone = FileDiff { status: Status::Deleted, ..file("t") };
+        let there = FileDiff { status: Status::Added, ..file("t") };
+        deliver(&mut a, "a", vec![gone, there]);
+        assert!(matches!(press(&mut a, 'e').as_slice(), [Effect::OpenEditor { line: 1, .. }]));
+        assert!(a.notice.is_none());
+    }
+
+    #[test]
+    fn e_still_opens_untracked_and_binary_files() {
+        let untracked = FileDiff { status: Status::Untracked, ..file_with_line("x") };
+        assert_eq!(editor_line(untracked, 1), Some(1));
+        assert_eq!(editor_line(FileDiff { binary: true, ..file("b.dat") }, 0), Some(1));
+    }
+
+    fn comment_prompt_with(typed: &str) -> App {
+        let mut a = app_on_line();
+        press(&mut a, 'c');
+        for c in typed.chars() {
+            press(&mut a, c);
+        }
+        a
+    }
+
+    fn pasted(text: &str) -> String {
+        let mut a = comment_prompt_with("");
+        a.paste(text);
+        match &a.input {
+            Some(Input::Comment { text, .. }) => text.clone(),
+            _ => panic!("the prompt closed"),
+        }
+    }
+
+    #[test]
+    fn a_multi_line_paste_stays_in_one_comment_and_runs_no_hotkeys() {
+        let mut a = comment_prompt_with("see: ");
+        a.paste("q\nDy\r\nx]2");
+        assert!(a.input.is_some() && !a.should_quit && !a.help_open);
+        assert_eq!(a.selected, 0);
+        a.handle_key(KeyEvent::from(KeyCode::Enter));
+        let comments = &a.current().unwrap().review.comments;
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "see: q Dy x]2");
+        assert!(a.current().unwrap().review.reviewed.is_empty());
+    }
+
+    #[test]
+    fn a_paste_turns_line_breaks_and_controls_into_spaces_and_keeps_tabs() {
+        assert_eq!(pasted("a\r\nb"), "a b");
+        assert_eq!(pasted("a\r\n\r\n\nb"), "a b");
+        assert_eq!(pasted("a\rb\nc"), "a b c");
+        assert_eq!(pasted("a\u{1b}[2Jb\u{7f}\u{85}"), "a [2Jb  ");
+        assert_eq!(pasted("a\tb é日本"), "a\tb é日本");
+    }
+
+    #[test]
+    fn a_comment_of_only_pasted_newlines_is_not_saved() {
+        let mut a = comment_prompt_with("");
+        a.paste("\n\r\n");
+        assert!(a.handle_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+        assert!(a.current().unwrap().review.comments.is_empty());
+    }
+
+    #[test]
+    fn a_paste_with_no_prompt_open_changes_nothing() {
+        let mut a = app_on_line();
+        a.paste("q\nDy\nx]2?");
+        assert!(a.input.is_none() && !a.should_quit && !a.help_open);
+        assert_eq!(a.selected, 0);
+        assert_eq!(a.current().unwrap().review, Review::default());
+    }
+
+    #[test]
+    fn a_paste_while_help_is_open_changes_nothing() {
+        let mut a = comment_prompt_with("kept");
+        a.help_open = true;
+        a.paste("more");
+        assert!(matches!(&a.input, Some(Input::Comment { text, .. }) if text == "kept"));
+    }
+
+    #[test]
+    fn a_paste_does_not_answer_the_clear_prompt() {
+        let mut a = app_on_line();
+        type_comment(&mut a, "fix");
+        press(&mut a, 'D');
+        a.paste("y");
+        assert!(matches!(a.input, Some(Input::ConfirmClear)));
         assert_eq!(a.current().unwrap().review.comments.len(), 1);
     }
 }
