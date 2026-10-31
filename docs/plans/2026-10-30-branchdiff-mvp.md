@@ -2758,7 +2758,7 @@ Add this to the main match:
             KeyCode::Char('b') => return vec![Effect::ListBranches],
 ```
 
-Add `Input::Worktree { query } | Input::Base { query, .. } => Some(query)` to `Input::text_mut`, so `handle_input_key` and `paste` both reach the new inputs. Enter already goes through `submit_input` once it's added below, so replace the `Enter` handling in `handle_input_key` with `KeyCode::Enter => return self.submit_input(),`.
+Add `Input::Worktree { query } | Input::Base { query, .. } => Some(query)` to `Input::text_mut`, so `handle_input_key` and `paste` both reach the new inputs. Replace the whole `KeyCode::Enter` arm in `handle_input_key` with `KeyCode::Enter => return self.submit_input(),`. Its save logic moves into `submit_input` below.
 
 Add these methods:
 
@@ -3050,6 +3050,20 @@ Expected: all pass.
 git add Cargo.toml Cargo.lock src/highlight.rs src/app.rs
 git commit -m "feat: highlight diffs on worker threads"
 ```
+
+**Step 7: Move the app tests to their own file**
+
+`src/app.rs` is two-thirds tests. In one commit that changes no test, move the `tests` module to `src/app/tests.rs`, leaving `#[cfg(test)] mod tests;`. Dedent with `sed`, since the code isn't rustfmt-formatted yet.
+
+Run: `cargo test`
+Expected: the same test count as before the move.
+
+```bash
+git add src/app.rs src/app/tests.rs
+git commit -m "refactor: move app tests to their own file"
+```
+
+Then, in a separate commit, gather the helpers at the top of that file and share the repeated typing loop and the `a.focus = Focus::Diff; press 'j'` setup. Run the mutation checks again before deleting any test that looks redundant.
 
 ---
 
@@ -3523,6 +3537,33 @@ In `draw_diff`, next to the binary check, show a message for files with no hunks
     }
 ```
 
+The comment prompt must show the end of its text, because that's where typing happens. In `draw_input`, replace `let mut rows = vec![TextLine::from(format!("> {text}"))];` with:
+
+```rust
+    let shown = display_text(text);
+    // Two for the border and two for "> ".
+    let shown = tail(&shown, area.width.saturating_sub(4) as usize);
+    let mut rows = vec![TextLine::from(format!("> {shown}"))];
+```
+
+In `draw_status`, use `text = format!(" * {}", display_text(&c.body));`, and add:
+
+```rust
+/// The end of `text` that fits in `width` cells.
+fn tail(text: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in text.char_indices().rev() {
+        used += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used > width {
+            return &text[i + c.len_utf8()..];
+        }
+    }
+    text
+}
+```
+
+Add a test that a long prompt shows its last typed character.
+
 Add these tests to `tests/ui_snapshots.rs`: a tab-indented line renders with four spaces, a CRLF line renders with no stray characters and keeps its neighbours aligned in side-by-side view, and a file with no hunks shows `No text changes to show`.
 
 **Step 5: Review and accept snapshots**
@@ -3536,7 +3577,7 @@ Check each screen by eye against the layout in the design doc, then accept.
 **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --test ui_snapshots`
-Expected: 12 passed.
+Expected: 13 passed.
 
 **Step 7: Commit**
 
@@ -3989,6 +4030,7 @@ fn keep_terminal_on_worker_panic() {
     let ratatui_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().name() != Some(WORKER_THREAD) {
+            set_bracketed_paste(false);
             ratatui_hook(info);
         }
     }));
