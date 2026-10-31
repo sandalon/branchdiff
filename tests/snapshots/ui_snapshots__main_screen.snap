@@ -1,0 +1,16 @@
+---
+source: tests/ui_snapshots.rs
+expression: render(&mut app())
+---
+"┌Worktrees───────────────┐┌Files─────────────────┐┌Diff────────────────────────┐"
+"│▸ feat-auth +1          ││ M src/a.rs           ││@@ -1,2 +1,2 @@             │"
+"│  fix-cache +0          ││                      ││     1  fn load() {         │"
+"│                        ││                      ││     2 -    old();          │"
+"│                        ││                      ││     2 +    retry();        │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"└────────────────────────┘└──────────────────────┘└────────────────────────────┘"
+" base: develop   feat-auth   1 files   0 comments   ? help                      "

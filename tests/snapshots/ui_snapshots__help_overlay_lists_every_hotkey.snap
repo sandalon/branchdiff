@@ -1,0 +1,28 @@
+---
+source: tests/ui_snapshots.rs
+expression: out
+---
+"┌Worktrees───────────────┐┌Files─────────────────┐┌Diff────────────────────────┐"
+"│▸ feat-auth +1          ││ M src/a.rs           ││@@ -1,2 +1,2 @@             │"
+"│  fix-cache +0          ││                      ││     1  fn load() {         │"
+"│              ┌Help────────────────────────────────────────────┐d();          │"
+"│              │ [ / ]   previous or next worktree              │try();        │"
+"│              │ 1-9     jump to a worktree                     │              │"
+"│              │ w       fuzzy find a worktree                  │              │"
+"│              │ Tab     move between areas                     │              │"
+"│              │ j / k   move and scroll                        │              │"
+"│              │ n / p   next or previous file                  │              │"
+"│              │ v       unified or side-by-side diff           │              │"
+"│              │ c       comment on the current line            │              │"
+"│              │ d / D   delete a comment, or clear all         │              │"
+"│              │ e       open in $EDITOR                        │              │"
+"│              │ x       mark file as reviewed                  │              │"
+"│              │ y / Y   copy comments, or write to a file      │              │"
+"│              │ r       refresh or retry                       │              │"
+"│              │ b       change the base branch                 │              │"
+"│              │ ?       open or close this help                │              │"
+"│              │ q       quit                                   │              │"
+"│              └────────────────────────────────────────────────┘              │"
+"│                        ││                      ││                            │"
+"└────────────────────────┘└──────────────────────┘└────────────────────────────┘"
+" base: develop   feat-auth   1 files   0 comments   ? help                      "

@@ -116,6 +116,8 @@ pub struct App {
     pub notice: Option<String>,
     pub fatal: Option<GitError>,
     pub should_quit: bool,
+    /// Cleared on terminals without truecolor, so `ui` converts colours.
+    pub truecolor: bool,
 }
 
 /// Answers whether `modifiers` mark a shortcut rather than typed text.
@@ -140,6 +142,7 @@ impl App {
             notice: None,
             fatal: None,
             should_quit: false,
+            truecolor: true,
         }
     }
 

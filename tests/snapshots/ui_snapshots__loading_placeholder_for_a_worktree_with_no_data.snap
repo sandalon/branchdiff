@@ -1,0 +1,16 @@
+---
+source: tests/ui_snapshots.rs
+expression: render(&mut a)
+---
+"┌Worktrees───────────────┐┌Files─────────────────┐┌Diff────────────────────────┐"
+"│  feat-auth +1          ││                      ││Loading…                    │"
+"│▸ fix-cache +0          ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"│                        ││                      ││                            │"
+"└────────────────────────┘└──────────────────────┘└────────────────────────────┘"
+" base: develop   fix-cache   0 files   0 comments   ? help                      "
