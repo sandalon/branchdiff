@@ -456,12 +456,12 @@ impl App {
                     return self.save_effect();
                 }
             }
-            Some(Input::Worktree { query }) => {
+            Some(Input::Worktree { query }) if !query.trim().is_empty() => {
                 if let Some(&i) = crate::fuzzy::filter(&query, &self.worktree_labels()).first() {
                     self.selected = i;
                 }
             }
-            Some(Input::Base { query, branches }) => {
+            Some(Input::Base { query, branches }) if !query.trim().is_empty() => {
                 if let Some(&i) = crate::fuzzy::filter(&query, &branches).first() {
                     self.base = branches[i].clone();
                     return self.reload_all();
@@ -1899,9 +1899,62 @@ mod tests {
         let mut a = prepared();
         press(&mut a, 'b');
         a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
+        press(&mut a, 'm');
         a.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(a.states.iter().all(|s| s.stale));
         deliver(&mut a, "a", vec![file("1")]);
         assert!(!a.states[0].stale && a.states[1].stale);
+    }
+
+    /// Opens the finder on the last of three worktrees and enters `query`.
+    fn submit_finder(query: &str) -> (App, Vec<Effect>) {
+        let mut a = app(&["a", "b", "c"]);
+        press(&mut a, '3');
+        press(&mut a, 'w');
+        for c in query.chars() {
+            press(&mut a, c);
+        }
+        let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        (a, fx)
+    }
+
+    /// Opens the base picker and enters `query`.
+    fn submit_base(query: &str) -> (App, Vec<Effect>) {
+        let mut a = app(&["a", "b"]);
+        press(&mut a, 'b');
+        a.handle_msg(Msg::Branches(Ok(vec!["alpha".into(), "main".into()])));
+        for c in query.chars() {
+            press(&mut a, c);
+        }
+        let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+        (a, fx)
+    }
+
+    #[test]
+    fn enter_on_an_empty_query_keeps_the_selected_worktree() {
+        for query in ["", "   "] {
+            let (a, fx) = submit_finder(query);
+            assert_eq!(a.selected, 2, "{query:?}");
+            assert!(a.input.is_none() && fx.is_empty(), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn enter_on_an_empty_query_keeps_the_base_and_reloads_nothing() {
+        for query in ["", "   "] {
+            let (a, fx) = submit_base(query);
+            assert_eq!(a.base, "develop", "{query:?}");
+            assert!(a.input.is_none() && fx.is_empty(), "{query:?}");
+            assert!(a.states.iter().all(|s| !s.stale), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn enter_on_a_matching_query_still_chooses_it() {
+        let (a, _) = submit_finder("a");
+        assert_eq!(a.selected, 0);
+        let (a, fx) = submit_base("main");
+        assert_eq!(a.base, "main");
+        assert_eq!(fx.len(), 2);
     }
 }
