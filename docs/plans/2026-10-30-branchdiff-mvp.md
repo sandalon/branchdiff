@@ -3944,7 +3944,7 @@ use branchdiff::worker::{Job, Loads, Msg, Pool, WORKER_THREAD};
 use branchdiff::{editor, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::DefaultTerminal;
@@ -3985,12 +3985,21 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     keep_terminal_on_worker_panic();
+    set_bracketed_paste(true);
     let result = run(&mut terminal, info, base);
+    set_bracketed_paste(false);
     ratatui::restore();
     result
 }
 
 const MAX_HIGHLIGHTS: usize = 2;
+
+/// Without this, a pasted newline arrives as Enter and the rest of the paste
+/// runs as hotkeys. Best effort, because some terminals don't support it.
+fn set_bracketed_paste(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = if on { execute!(out, EnableBracketedPaste) } else { execute!(out, DisableBracketedPaste) };
+}
 
 /// ratatui's hook restores the terminal on a panic from any thread. Workers
 /// catch their own panics and carry on, so the app must keep its screen.
@@ -4093,6 +4102,10 @@ fn next_effects(app: &mut App, rt: &mut Runtime, keys: &Receiver<Event>, msgs: &
 fn on_event(app: &mut App, ev: Event) -> Vec<Effect> {
     match ev {
         Event::Key(k) if k.kind != KeyEventKind::Release => app.handle_key(k),
+        Event::Paste(text) => {
+            app.paste(&text);
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -4205,11 +4218,13 @@ fn write_export(rt: &Runtime, md: &str) -> String {
 fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut App, rt: &Runtime) -> Result<()> {
     let (prog, args) = editor::command(&editor::default_editor(), path, line);
     rt.paused.store(true, Ordering::SeqCst);
+    set_bracketed_paste(false);
     ratatui::restore();
     let status = std::process::Command::new(&prog).args(&args).status();
     // Not `ratatui::init`, which would stack a new panic hook over ours.
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
+    set_bracketed_paste(true);
     terminal.clear()?;
     rt.paused.store(false, Ordering::SeqCst);
     if let Err(e) = status {
@@ -4223,12 +4238,18 @@ Add this method to `App` in `src/app.rs`, with a test that replacing a review re
 
 ```rust
     pub fn set_review(&mut self, index: usize, review: Review) {
+        // An open prompt targets the review being replaced, as after a branch switch.
+        if index == self.selected && matches!(self.input, Some(Input::Comment { .. } | Input::ConfirmClear)) {
+            self.input = None;
+        }
         if let Some(s) = self.states.get_mut(index) {
             s.review = review;
             s.outdated = count_outdated(s);
         }
     }
 ```
+
+Also test that replacing the selected worktree's review cancels an open comment and clear prompt, and that replacing another worktree's leaves them open.
 
 Add change tracking to `Loads` in `src/worker.rs`, with tests: `pub fn mark_changed(&mut self, path: &Path)` records that a worktree changed while its load runs, and does nothing if no load is running. `Finished` gains `pub changed: bool`, which is true only when a change was marked and no waiting load follows, because a waiting load starts after the change and includes it. Promoting a waiting job clears the mark.
 
