@@ -30,6 +30,18 @@ fn press(a: &mut App, c: char) -> Vec<Effect> {
     a.handle_key(KeyEvent::from(KeyCode::Char(c)))
 }
 
+fn type_text(a: &mut App, text: &str) {
+    for c in text.chars() {
+        press(a, c);
+    }
+}
+
+/// Row 0 is the hunk header, so row 1 is the line.
+fn focus_first_line(a: &mut App) {
+    a.focus = Focus::Diff;
+    press(a, 'j');
+}
+
 fn deliver(a: &mut App, name: &str, files: Vec<FileDiff>) {
     let path: std::path::PathBuf = format!("/r/{name}").into();
     let key = CacheKey { worktree: path.clone(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
@@ -75,6 +87,108 @@ fn assert_kept(a: &App, name: &str) {
     assert_eq!((s.file, s.cursor, s.scroll), (i, 20 + i, 10 + i), "position of {name}");
     assert_eq!(s.diffs.as_ref().unwrap()[0].path, format!("{name}-1"));
     assert!(s.key.as_ref().unwrap().worktree.ends_with(name));
+}
+
+fn file_with_line(text: &str) -> FileDiff {
+    FileDiff {
+        path: "a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0,
+        hunks: vec![Hunk {
+            header: "@@ -0,0 +1 @@".into(),
+            lines: vec![Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: text.into() }],
+        }],
+    }
+}
+
+fn app_on_line() -> App {
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![file_with_line("let x = 1;")]);
+    focus_first_line(&mut a);
+    a
+}
+
+fn type_comment(a: &mut App, text: &str) -> Vec<Effect> {
+    press(a, 'c');
+    type_text(a, text);
+    a.handle_key(KeyEvent::from(KeyCode::Enter))
+}
+
+fn numbered(kind: LineKind, old_no: Option<u32>, new_no: Option<u32>) -> Line {
+    Line { kind, old_no, new_no, text: "x".into() }
+}
+
+fn context(old: u32, new: u32) -> Line {
+    numbered(LineKind::Context, Some(old), Some(new))
+}
+
+fn removed(old: u32) -> Line {
+    numbered(LineKind::Removed, Some(old), None)
+}
+
+fn hunk(header: &str, lines: Vec<Line>) -> Hunk {
+    Hunk { header: header.into(), lines }
+}
+
+/// The line `e` opens with the cursor on `row`, or `None` if it opens nothing.
+fn editor_line(f: FileDiff, row: usize) -> Option<u32> {
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![f]);
+    set_cursor_scroll(&mut a, row, 0);
+    match press(&mut a, 'e').as_slice() {
+        [Effect::OpenEditor { line, .. }] => Some(*line),
+        _ => None,
+    }
+}
+
+fn comment_prompt_with(typed: &str) -> App {
+    let mut a = app_on_line();
+    press(&mut a, 'c');
+    type_text(&mut a, typed);
+    a
+}
+
+fn pasted(text: &str) -> String {
+    let mut a = comment_prompt_with("");
+    a.paste(text);
+    match &a.input {
+        Some(Input::Comment { text, .. }) => text.clone(),
+        _ => panic!("the prompt closed"),
+    }
+}
+
+fn note(path: &str, line: u32, side: Side, line_text: &str) -> Comment {
+    Comment { path: path.into(), line, side, line_text: line_text.into(), body: "note".into() }
+}
+
+/// Opens the finder on the last of three worktrees and enters `query`.
+fn submit_finder(query: &str) -> (App, Vec<Effect>) {
+    let mut a = app(&["a", "b", "c"]);
+    press(&mut a, '3');
+    press(&mut a, 'w');
+    type_text(&mut a, query);
+    let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+    (a, fx)
+}
+
+/// Opens the base picker and enters `query`.
+fn submit_base(query: &str) -> (App, Vec<Effect>) {
+    let mut a = app(&["a", "b"]);
+    press(&mut a, 'b');
+    a.handle_msg(Msg::Branches(Ok(vec!["alpha".into(), "main".into()])));
+    type_text(&mut a, query);
+    let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
+    (a, fx)
+}
+
+fn base_missing(a: &mut App, name: &str) -> Vec<Effect> {
+    let path = format!("/r/{name}").into();
+    a.handle_msg(Msg::Loaded { path, result: Err(crate::git::GitError::BaseMissing("develop".into())) })
+}
+
+fn query(a: &App) -> Option<&str> {
+    match &a.input {
+        Some(Input::Worktree { query } | Input::Base { query, .. }) => Some(query),
+        _ => None,
+    }
 }
 
 #[test]
@@ -576,32 +690,6 @@ fn keys_do_nothing_with_no_worktrees_loaded() {
     assert!(a.notice.is_none() && a.fatal.is_none());
 }
 
-fn file_with_line(text: &str) -> FileDiff {
-    FileDiff {
-        path: "a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0,
-        hunks: vec![Hunk {
-            header: "@@ -0,0 +1 @@".into(),
-            lines: vec![Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: text.into() }],
-        }],
-    }
-}
-
-fn app_on_line() -> App {
-    let mut a = app(&["a"]);
-    deliver(&mut a, "a", vec![file_with_line("let x = 1;")]);
-    a.focus = Focus::Diff;
-    press(&mut a, 'j'); // Row 0 is the hunk header, so row 1 is the line.
-    a
-}
-
-fn type_comment(a: &mut App, text: &str) -> Vec<Effect> {
-    press(a, 'c');
-    for ch in text.chars() {
-        press(a, ch);
-    }
-    a.handle_key(KeyEvent::from(KeyCode::Enter))
-}
-
 #[test]
 fn c_then_enter_saves_a_comment_on_the_current_line() {
     let mut a = app_on_line();
@@ -773,8 +861,7 @@ fn comment_on_a_replaced_line_is_not_outdated() {
     ];
     let mut a = app(&["a"]);
     deliver(&mut a, "a", vec![replaced]);
-    a.focus = Focus::Diff;
-    press(&mut a, 'j');
+    focus_first_line(&mut a);
     press(&mut a, 'j');
     type_comment(&mut a, "fix");
     assert_eq!(a.current().unwrap().review.comments[0].side, crate::store::Side::New);
@@ -820,8 +907,7 @@ fn e_opens_the_editor_at_the_current_line() {
 fn removing_the_worktree_cancels_an_open_comment() {
     let mut a = app(&["a", "b"]);
     deliver(&mut a, "a", vec![file_with_line("x")]);
-    a.focus = Focus::Diff;
-    press(&mut a, 'j');
+    focus_first_line(&mut a);
     press(&mut a, 'c');
     press(&mut a, 'h');
     a.handle_msg(list(&["b"]));
@@ -843,33 +929,6 @@ fn removing_the_worktree_cancels_an_open_clear() {
     let fx = press(&mut a, 'y');
     assert!(!fx.iter().any(|e| matches!(e, Effect::SaveReview { .. })));
     assert_eq!(a.current().unwrap().review.comments.len(), 1);
-}
-
-fn numbered(kind: LineKind, old_no: Option<u32>, new_no: Option<u32>) -> Line {
-    Line { kind, old_no, new_no, text: "x".into() }
-}
-
-fn context(old: u32, new: u32) -> Line {
-    numbered(LineKind::Context, Some(old), Some(new))
-}
-
-fn removed(old: u32) -> Line {
-    numbered(LineKind::Removed, Some(old), None)
-}
-
-fn hunk(header: &str, lines: Vec<Line>) -> Hunk {
-    Hunk { header: header.into(), lines }
-}
-
-/// The line `e` opens with the cursor on `row`, or `None` if it opens nothing.
-fn editor_line(f: FileDiff, row: usize) -> Option<u32> {
-    let mut a = app(&["a"]);
-    deliver(&mut a, "a", vec![f]);
-    set_cursor_scroll(&mut a, row, 0);
-    match press(&mut a, 'e').as_slice() {
-        [Effect::OpenEditor { line, .. }] => Some(*line),
-        _ => None,
-    }
 }
 
 #[test]
@@ -935,24 +994,6 @@ fn e_still_opens_untracked_and_binary_files() {
     assert_eq!(editor_line(FileDiff { binary: true, ..file("b.dat") }, 0), Some(1));
 }
 
-fn comment_prompt_with(typed: &str) -> App {
-    let mut a = app_on_line();
-    press(&mut a, 'c');
-    for c in typed.chars() {
-        press(&mut a, c);
-    }
-    a
-}
-
-fn pasted(text: &str) -> String {
-    let mut a = comment_prompt_with("");
-    a.paste(text);
-    match &a.input {
-        Some(Input::Comment { text, .. }) => text.clone(),
-        _ => panic!("the prompt closed"),
-    }
-}
-
 #[test]
 fn a_multi_line_paste_stays_in_one_comment_and_runs_no_hotkeys() {
     let mut a = comment_prompt_with("see: ");
@@ -1004,10 +1045,6 @@ fn a_paste_does_not_answer_the_clear_prompt() {
     assert_eq!(a.current().unwrap().review.comments.len(), 1);
 }
 
-fn note(path: &str, line: u32, side: Side, line_text: &str) -> Comment {
-    Comment { path: path.into(), line, side, line_text: line_text.into(), body: "note".into() }
-}
-
 #[test]
 fn a_save_from_a_later_worktree_holds_its_own_id_and_review() {
     let mut a = app(&["a", "b"]);
@@ -1015,8 +1052,7 @@ fn a_save_from_a_later_worktree_holds_its_own_id_and_review() {
     deliver(&mut a, "b", vec![file_with_line("y")]);
     press(&mut a, 'x');
     press(&mut a, ']');
-    a.focus = Focus::Diff;
-    press(&mut a, 'j');
+    focus_first_line(&mut a);
     let fx = type_comment(&mut a, "fix");
     assert_eq!(a.states[1].review.comments.len(), 1);
     assert_ne!(a.states[0].review, a.states[1].review);
@@ -1052,8 +1088,7 @@ fn a_comment_on_a_typechanges_second_entry_is_current() {
     let mut a = app(&["a"]);
     deliver(&mut a, "a", vec![gone, there]);
     press(&mut a, 'n');
-    a.focus = Focus::Diff;
-    press(&mut a, 'j');
+    focus_first_line(&mut a);
     type_comment(&mut a, "fix");
     assert_eq!(a.outdated_comments(), 0);
 }
@@ -1132,8 +1167,7 @@ fn e_opens_the_full_path_in_the_selected_worktree() {
     let mut a = app(&["a", "b"]);
     deliver(&mut a, "b", vec![file_with_line("x")]);
     press(&mut a, ']');
-    a.focus = Focus::Diff;
-    press(&mut a, 'j');
+    focus_first_line(&mut a);
     assert_eq!(press(&mut a, 'e'), vec![Effect::OpenEditor { path: "/r/b/a.rs".into(), line: 1 }]);
 }
 
@@ -1141,9 +1175,7 @@ fn e_opens_the_full_path_in_the_selected_worktree() {
 fn w_finds_and_selects_a_worktree() {
     let mut a = app(&["feat-auth", "fix-cache"]);
     press(&mut a, 'w');
-    for c in "cache".chars() {
-        press(&mut a, c);
-    }
+    type_text(&mut a, "cache");
     a.handle_key(KeyEvent::from(KeyCode::Enter));
     assert_eq!(a.selected, 1);
     assert!(a.input.is_none());
@@ -1164,9 +1196,7 @@ fn b_changes_the_base_and_reloads_every_worktree() {
     let fx = press(&mut a, 'b');
     assert!(matches!(fx.as_slice(), [Effect::ListBranches]));
     a.handle_msg(Msg::Branches(Ok(vec!["develop".into(), "main".into()])));
-    for c in "main".chars() {
-        press(&mut a, c);
-    }
+    type_text(&mut a, "main");
     let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
     assert_eq!(a.base, "main");
     assert_eq!(fx.iter().filter(|e| matches!(e, Effect::Load { .. })).count(), 2);
@@ -1178,9 +1208,7 @@ fn a_base_change_reloads_the_selected_worktree_first() {
     press(&mut a, '3');
     press(&mut a, 'b');
     a.handle_msg(Msg::Branches(Ok(vec!["develop".into(), "main".into()])));
-    for c in "main".chars() {
-        press(&mut a, c);
-    }
+    type_text(&mut a, "main");
     let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
     assert!(matches!(&fx[0], Effect::Load { path, .. } if path.ends_with("c")));
 }
@@ -1232,30 +1260,6 @@ fn a_base_change_flags_each_old_diff_until_its_load_lands() {
     assert!(!a.states[0].stale && a.states[1].stale);
 }
 
-/// Opens the finder on the last of three worktrees and enters `query`.
-fn submit_finder(query: &str) -> (App, Vec<Effect>) {
-    let mut a = app(&["a", "b", "c"]);
-    press(&mut a, '3');
-    press(&mut a, 'w');
-    for c in query.chars() {
-        press(&mut a, c);
-    }
-    let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
-    (a, fx)
-}
-
-/// Opens the base picker and enters `query`.
-fn submit_base(query: &str) -> (App, Vec<Effect>) {
-    let mut a = app(&["a", "b"]);
-    press(&mut a, 'b');
-    a.handle_msg(Msg::Branches(Ok(vec!["alpha".into(), "main".into()])));
-    for c in query.chars() {
-        press(&mut a, c);
-    }
-    let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
-    (a, fx)
-}
-
 #[test]
 fn enter_on_an_empty_query_keeps_the_selected_worktree() {
     for query in ["", "   "] {
@@ -1284,25 +1288,11 @@ fn enter_on_a_matching_query_still_chooses_it() {
     assert_eq!(fx.len(), 2);
 }
 
-fn base_missing(a: &mut App, name: &str) -> Vec<Effect> {
-    let path = format!("/r/{name}").into();
-    a.handle_msg(Msg::Loaded { path, result: Err(crate::git::GitError::BaseMissing("develop".into())) })
-}
-
-fn query(a: &App) -> Option<&str> {
-    match &a.input {
-        Some(Input::Worktree { query } | Input::Base { query, .. }) => Some(query),
-        _ => None,
-    }
-}
-
 #[test]
 fn the_finder_takes_the_top_match() {
     let mut a = app(&["x", "feat-a", "feat-b"]);
     press(&mut a, 'w');
-    for c in "feat".chars() {
-        press(&mut a, c);
-    }
+    type_text(&mut a, "feat");
     a.handle_key(KeyEvent::from(KeyCode::Enter));
     assert_eq!(a.selected, 1);
 }
@@ -1312,9 +1302,7 @@ fn the_base_picker_takes_the_top_match() {
     let mut a = app(&["a"]);
     press(&mut a, 'b');
     a.handle_msg(Msg::Branches(Ok(vec!["x".into(), "main-a".into(), "main-b".into()])));
-    for c in "main".chars() {
-        press(&mut a, c);
-    }
+    type_text(&mut a, "main");
     a.handle_key(KeyEvent::from(KeyCode::Enter));
     assert_eq!(a.base, "main-a");
 }
