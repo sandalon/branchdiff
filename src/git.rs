@@ -2,8 +2,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,20 +76,16 @@ pub struct Output {
     pub stderr: String,
 }
 
-pub fn run<I, S>(cwd: &Path, args: I) -> Result<Output, GitError>
+fn command<I, S>(cwd: &Path, args: I) -> Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    if !cwd.is_dir() {
-        return Err(cwd_gone(cwd));
-    }
     let mut cmd = Command::new("git");
     for var in REPO_ENV_VARS {
         cmd.env_remove(var);
     }
-    let out = cmd
-        .current_dir(cwd)
+    cmd.current_dir(cwd)
         // Keeps non-ASCII paths readable. Names with tabs or quotes are still
         // C-quoted, and the patch parser handles those.
         .args(["-c", "core.quotePath=false"])
@@ -100,19 +98,36 @@ where
         // `merge_base` matches on stderr text, so it must not be translated.
         .env("LC_ALL", "C")
         // A prompt would write over the TUI and hang the worker.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|e| match e.kind() {
-            // Spawning also fails with NotFound if `cwd` vanished after the check above.
-            std::io::ErrorKind::NotFound if !cwd.is_dir() => cwd_gone(cwd),
-            std::io::ErrorKind::NotFound => GitError::GitMissing,
-            _ => GitError::Failed(e.to_string()),
-        })?;
-    Ok(Output {
-        code: out.status.code(),
-        stdout: out.stdout,
-        stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    })
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+fn spawn_error(cwd: &Path, e: std::io::Error) -> GitError {
+    match e.kind() {
+        // Spawning also fails with NotFound if `cwd` vanished after the check above.
+        std::io::ErrorKind::NotFound if !cwd.is_dir() => cwd_gone(cwd),
+        std::io::ErrorKind::NotFound => GitError::GitMissing,
+        _ => GitError::Failed(e.to_string()),
+    }
+}
+
+fn output(raw: std::process::Output) -> Output {
+    Output {
+        code: raw.status.code(),
+        stdout: raw.stdout,
+        stderr: String::from_utf8_lossy(&raw.stderr).trim().to_string(),
+    }
+}
+
+pub fn run<I, S>(cwd: &Path, args: I) -> Result<Output, GitError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    if !cwd.is_dir() {
+        return Err(cwd_gone(cwd));
+    }
+    command(cwd, args).output().map(output).map_err(|e| spawn_error(cwd, e))
 }
 
 fn cwd_gone(cwd: &Path) -> GitError {
@@ -239,6 +254,39 @@ fn dirty_paths(status: &[u8]) -> Vec<String> {
 pub fn untracked(cwd: &Path) -> Result<Vec<String>, GitError> {
     let text = ok_stdout(run(cwd, ["ls-files", "-z", "--others", "--exclude-standard"])?)?;
     Ok(text.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+}
+
+/// Whether git would notice a change to any of `paths`, going by every ignore
+/// source it has: nested `.gitignore` files, `info/exclude`, global excludes,
+/// and the index, since a tracked file is never ignored. End a path with `/` to
+/// test a directory that no longer exists, which `target/` could not match otherwise.
+pub fn any_not_ignored(cwd: &Path, paths: &[PathBuf]) -> Result<bool, GitError> {
+    if !cwd.is_dir() {
+        return Err(cwd_gone(cwd));
+    }
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.to_string_lossy().as_bytes());
+        input.push(0);
+    }
+    let mut child = command(cwd, ["check-ignore", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| spawn_error(cwd, e))?;
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    // Written from a second thread, because git can fill its stdout pipe while
+    // we are still filling its stdin.
+    let writer = thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output().map(output).map_err(|e| spawn_error(cwd, e))?;
+    let _ = writer.join();
+    // Exit code 1 means that nothing was ignored.
+    if !matches!(out.code, Some(0 | 1)) {
+        return Err(failed(out));
+    }
+    let ignored = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).count();
+    Ok(ignored < paths.len())
 }
 
 /// Diff from `merge_base` to the working tree. Pins the config known to change
