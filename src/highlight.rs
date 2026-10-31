@@ -65,7 +65,14 @@ fn colour(state: &mut Option<HighlightLines>, text: &str) -> Vec<Span> {
     let spans = state.as_mut().and_then(|h| h.highlight_line(&with_newline, syntaxes).ok());
     match spans {
         Some(spans) => spans.iter().map(|(style, text)| {
-            let c = style.foreground;
+            // Only foregrounds are drawn, and an `invalid` token's is the theme's
+            // background, meant to sit on red. In a hunk cut from the middle of
+            // a file, such a token is usually just an unmatched closing brace.
+            let c = if Some(style.foreground) == theme.settings.background {
+                theme.settings.foreground.unwrap_or(style.foreground)
+            } else {
+                style.foreground
+            };
             (Color::Rgb(c.r, c.g, c.b), text.trim_end_matches('\n').to_string())
         }).filter(|(_, t)| !t.is_empty()).collect(),
         None => plain(text),
@@ -145,6 +152,15 @@ mod tests {
     fn an_added_comment_opener_colours_the_context_after_it() {
         let diff = lines("a.c", &[(LineKind::Added, "/* new"), (LineKind::Context, "int c;")]);
         assert_eq!(highlight_file(&diff).hunks[0][1].len(), 1);
+    }
+
+    /// A hunk can open after the `{` that a closing brace belongs to.
+    #[test]
+    fn a_token_the_grammar_calls_invalid_stays_visible() {
+        let out = highlight_file(&file("a.c", "}"));
+        let background = assets().1.settings.background.unwrap();
+        let hidden = Color::Rgb(background.r, background.g, background.b);
+        assert_ne!(out.hunks[0][0][0].0, hidden);
     }
 
     #[test]
