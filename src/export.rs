@@ -20,7 +20,7 @@ pub fn render(branch: &str, base: &str, comments: &[Comment]) -> String {
         // Removed before added, as in the diff. A removed line can share its
         // number with an added one, and these are stored in the order written.
         items.sort_by_key(|c| (c.line, c.side == Side::New));
-        out.push_str(&format!("\n### {}\n", code_span(path)));
+        out.push_str(&format!("\n### {}\n", code_span(&replace_controls(path))));
         for c in items {
             let removed = if c.side == Side::Old { " (removed)" } else { "" };
             out.push_str(&format!("\n- Line {}{removed}: {}\n  {}\n", c.line, quote(&c.line_text), c.body));
@@ -30,9 +30,7 @@ pub fn render(branch: &str, base: &str, comments: &[Comment]) -> String {
 }
 
 fn quote(line: &str) -> String {
-    // Mid-line `\r` reaches here, as the diff only splits on `\n`. Markdown would
-    // read it as a line ending, letting quoted code become a real heading.
-    let line: String = line.chars().map(|c| if c.is_control() && c != '\t' { ' ' } else { c }).collect();
+    let line = replace_controls(line);
     let line = line.trim();
     if line.is_empty() {
         return "(blank line)".into();
@@ -41,6 +39,13 @@ fn quote(line: &str) -> String {
         Some((end, _)) => code_span(&format!("{}…", &line[..end])),
         None => code_span(line),
     }
+}
+
+/// Replaces every control character but tab with a space. Markdown reads `\r`
+/// as a line ending, and the diff only splits lines on `\n`, so code or a file
+/// name could otherwise become a real heading. `ESC` would reach the clipboard.
+fn replace_controls(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() && c != '\t' { ' ' } else { c }).collect()
 }
 
 /// A code span ends at the first backtick run as long as its delimiter, so the
@@ -164,6 +169,13 @@ mod tests {
         comment.line_text = "a\r# Heading\x1b[201~\tb".into();
         let md = render("feat", "develop", &[comment]);
         assert!(md.contains(": `a # Heading [201~\tb`\n"), "{md:?}");
+        assert!(md.chars().all(|c| !c.is_control() || c == '\t' || c == '\n'), "{md:?}");
+    }
+
+    #[test]
+    fn control_characters_cannot_escape_a_path_heading() {
+        let md = render("feat", "develop", &[c("a\n# Heading\r\x1b[201~.rs", 2, "x")]);
+        assert!(md.contains("\n### `a # Heading  [201~.rs`\n"), "{md:?}");
         assert!(md.chars().all(|c| !c.is_control() || c == '\t' || c == '\n'), "{md:?}");
     }
 
