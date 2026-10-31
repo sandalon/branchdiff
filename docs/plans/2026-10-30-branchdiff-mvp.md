@@ -3070,7 +3070,7 @@ Then, in a separate commit, gather the helpers at the top of that file and share
 ## Task 13: UI drawing
 
 **Files:**
-- Modify: `src/ui.rs`
+- Modify: `src/ui.rs`, `src/app.rs`
 - Create: `tests/ui_snapshots.rs`
 
 **Step 1: Write the failing snapshot tests**
@@ -3561,7 +3561,7 @@ fn display_text(s: &str) -> Cow<'_, str> {
 }
 ```
 
-Use it for every piece of diff text in `unified_rows` and `split_rows`, including highlighted spans, for example `Span::raw(display_text(&line.text))`, and pass the result to `pad` in `split_rows`. Do not change `Line.text`.
+Use it for every piece of diff text in `unified_rows`, including highlighted spans, for example `Span::raw(display_text(&line.text))`. `split_rows` gets it through `fit_spans`, below. Do not change `Line.text`.
 
 In `draw_diff`, next to the binary check, show a message for files with no hunks, such as mode-only changes and empty files, so they don't look like a failed load:
 
@@ -3599,9 +3599,48 @@ fn tail(text: &str, width: usize) -> &str {
 
 Add a test that a long prompt shows its last typed character.
 
-Side-by-side diffs need colour too, because the design promises highlighted diffs in both views. Give `split_rows` the `highlight` argument and draw each side from the same spans `unified_rows` uses, cut to the side's width on a character boundary and padded to it, falling back to plain text when there are no spans. The row stays `gutter`, left side, ` │ `, right side, with the line's background. Add a test that a highlighted line in side-by-side view has the same text as the plain one and carries the span colours.
+Side-by-side diffs need colour too, because the design promises highlighted diffs in both views. Give `split_rows` the `highlight` argument. For each line, build `parts: Vec<(Color, &str)>` from the same spans `unified_rows` uses, or `vec![(Color::Reset, line.text.as_str())]` when there are none, and draw both sides with `fit_spans`, passing `&[]` for an absent side. The row is `gutter`, left side, ` │ `, right side, as separate spans, with the line's background. This replaces `pad`, so delete it. Add tests that a highlighted line has the same text as the plain one and carries the span colours, including a tab split across spans, and that a wide character at the edge keeps the divider in the same column as its neighbours.
 
-Terminals without truecolor misread `Color::Rgb`, so add `pub truecolor: bool` to `App`, defaulting to `true`, and pass every RGB colour through one helper when drawing, covering syntax colours and the added and removed backgrounds:
+```rust
+/// Cuts text to `width` cells and pads to it, measuring as drawn so the divider
+/// stays aligned. A wide character that would straddle the edge is dropped.
+fn fit_spans<'a>(parts: &[(Color, &'a str)], width: usize) -> Vec<Span<'a>> {
+    let mut used = 0;
+    let mut out = Vec::new();
+    for (color, text) in parts {
+        let mut kept = String::new();
+        let mut full = false;
+        for c in display_text(text).chars() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + w > width {
+                full = true;
+                break;
+            }
+            used += w;
+            kept.push(c);
+        }
+        out.push(Span::styled(kept, Style::new().fg(*color)));
+        if full {
+            break;
+        }
+    }
+    out.push(Span::raw(" ".repeat(width - used)));
+    out
+}
+```
+
+Terminals without truecolor misread `Color::Rgb`, so add `pub truecolor: bool` to `App` in `src/app.rs`, defaulting to `true`. Convert in one place, as the last step of `draw`, so the row builders stay unaware of it:
+
+```rust
+    if !app.truecolor {
+        for cell in &mut f.buffer_mut().content {
+            cell.fg = fit_color(cell.fg, false);
+            cell.bg = fit_color(cell.bg, false);
+        }
+    }
+```
+
+The helper:
 
 ```rust
 /// Nearest 256-colour entry, for terminals that don't advertise truecolor.
@@ -3635,7 +3674,7 @@ Expected: all pass.
 **Step 7: Commit**
 
 ```bash
-git add src/ui.rs tests/ui_snapshots.rs tests/snapshots
+git add src/ui.rs src/app.rs tests/ui_snapshots.rs tests/snapshots
 git commit -m "feat: draw worktree, file and diff panes with help overlay"
 ```
 
@@ -4003,7 +4042,7 @@ git commit -m "feat: build editor commands that open a file at a line"
 ## Task 16: Event loop and CLI
 
 **Files:**
-- Modify: `src/main.rs`
+- Modify: `src/main.rs`, `src/app.rs`, `src/app/tests.rs`, `src/worker.rs`
 
 **Step 1: Implement `src/main.rs`**
 
@@ -4319,7 +4358,7 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
 }
 ```
 
-Add this method to `App` in `src/app.rs`, with a test that replacing a review recounts `outdated`:
+Add this method to `App` in `src/app.rs`, with a test in `src/app/tests.rs` that replacing a review recounts `outdated`:
 
 ```rust
     pub fn set_review(&mut self, index: usize, review: Review) {
@@ -4362,7 +4401,7 @@ Check each of these:
 **Step 4: Commit**
 
 ```bash
-git add src/main.rs
+git add src/main.rs src/app.rs src/app/tests.rs src/worker.rs
 git commit -m "feat: add CLI and event loop"
 ```
 
