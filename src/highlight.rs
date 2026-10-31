@@ -9,8 +9,8 @@ use syntect::parsing::SyntaxSet;
 pub const MAX_LINE_LEN: usize = 2_000;
 pub const MAX_FILE_LINES: usize = 5_000;
 /// Bounds how long one highlight can hold a worker, which nothing can interrupt
-/// once it runs. Real source takes about a second at `MAX_FILE_LINES`, but
-/// minified code in lines under `MAX_LINE_LEN` manages under 100 lines a second.
+/// once it runs. The line limits don't: real source can take several seconds
+/// under load, and minified code manages under 100 lines a second.
 const MAX_HIGHLIGHT_TIME: Duration = Duration::from_secs(5);
 
 pub type Span = (Color, String);
@@ -45,9 +45,13 @@ fn highlight_within(file: &FileDiff, budget: Duration) -> HighlightedFile {
     // Names like `Makefile` and `.bashrc` are listed whole, and a directory
     // must not count towards an extension.
     let name = file.path.rsplit('/').next().unwrap_or("");
-    let ext = name.rsplit('.').next().unwrap_or("");
-    // The bundled set has no syntax listing `jsx`, and TSX is a superset of it.
-    let ext = if ext.eq_ignore_ascii_case("jsx") { "tsx" } else { ext };
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    // The bundled set lists none of these, and TSX is a superset of JSX.
+    let ext = match ext.as_str() {
+        "jsx" => "tsx",
+        "mjs" | "cjs" => "js",
+        other => other,
+    };
     let syntax = syntaxes.find_syntax_by_extension(name).or_else(|| syntaxes.find_syntax_by_extension(ext));
     let hunks = file.hunks.iter().map(|hunk| {
         // Each side is its own text, so a removed `/*` must not colour the lines
@@ -132,11 +136,24 @@ mod tests {
         assert!(highlight_file(&big).hunks.is_empty());
     }
 
+    /// Real tokens, so that highlighting this line gives many spans.
+    fn code_of_len(len: usize) -> String {
+        let mut code = "let x = 1; ".repeat(len / 11 + 1);
+        code.truncate(len);
+        code
+    }
+
     #[test]
-    fn oversized_files_are_not_highlighted() {
-        let long = "x".repeat(MAX_LINE_LEN + 1);
-        let out = highlight_file(&file("a.rs", &long));
-        assert_eq!(out.hunks[0][0].len(), 1);
+    fn a_line_over_the_length_limit_stays_plain() {
+        let code = code_of_len(MAX_LINE_LEN + 1);
+        let out = highlight_file(&file("a.rs", &code));
+        assert_eq!(out.hunks[0][0], vec![(Color::Reset, code)]);
+    }
+
+    #[test]
+    fn a_line_at_the_length_limit_is_highlighted() {
+        let out = highlight_file(&file("a.rs", &code_of_len(MAX_LINE_LEN)));
+        assert!(out.hunks[0][0].len() > 100);
     }
 
     #[test]
@@ -166,6 +183,14 @@ mod tests {
         assert_eq!(highlight_file(&diff).hunks[0][1].len(), 1);
     }
 
+    #[test]
+    fn a_context_comment_opener_colours_the_removed_lines_after_it() {
+        let diff = lines("a.c", &[(LineKind::Context, "/* open"), (LineKind::Removed, "int c;")]);
+        let out = highlight_file(&diff);
+        assert_eq!(out.hunks[0][1].len(), 1);
+        assert_eq!(out.hunks[0][1][0].0, out.hunks[0][0][0].0);
+    }
+
     /// A hunk can open after the `{` that a closing brace belongs to.
     #[test]
     fn a_token_the_grammar_calls_invalid_stays_visible() {
@@ -187,6 +212,16 @@ mod tests {
         let jsx = highlight_file(&file("src/a.jsx", text));
         assert!(jsx.hunks[0][0].len() > 1);
         assert_eq!(jsx.hunks[0][0], highlight_file(&file("src/a.tsx", text)).hunks[0][0]);
+    }
+
+    #[test]
+    fn colours_mjs_and_cjs_with_the_javascript_syntax() {
+        let text = "const a = 1;";
+        let js = highlight_file(&file("src/a.js", text));
+        assert!(js.hunks[0][0].len() > 1);
+        for path in ["src/a.mjs", "src/a.cjs"] {
+            assert_eq!(highlight_file(&file(path, text)).hunks[0][0], js.hunks[0][0], "{path}");
+        }
     }
 
     #[test]

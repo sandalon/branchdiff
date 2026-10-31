@@ -343,6 +343,33 @@ fn a_reload_keeps_colours_only_while_the_key_is_unchanged() {
 }
 
 #[test]
+fn a_highlight_for_a_stale_key_changes_nothing() {
+    let mut a = app(&["a", "b"]);
+    deliver(&mut a, "a", vec![file("1")]);
+    deliver(&mut a, "b", vec![file("1")]);
+    let stale = a.states[0].key.clone().unwrap();
+    let current = CacheKey { fingerprint: 2, ..stale.clone() };
+    let loaded = Loaded { key: current, diffs: Arc::new(vec![file("1")]), op: None };
+    a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Ok(loaded) });
+
+    a.handle_msg(Msg::Highlighted { key: stale, file_index: 0, lines: Default::default() });
+    assert!(a.states.iter().all(|s| s.highlights.is_empty()));
+}
+
+#[test]
+fn a_highlight_reaches_its_own_worktree_when_another_is_selected() {
+    let mut a = app(&["a", "b"]);
+    deliver(&mut a, "a", vec![file("1")]);
+    deliver(&mut a, "b", vec![file("1")]);
+    assert_eq!(a.selected, 0);
+    let key = a.states[1].key.clone().unwrap();
+
+    a.handle_msg(Msg::Highlighted { key, file_index: 0, lines: Default::default() });
+    assert!(a.states[0].highlights.is_empty());
+    assert!(a.states[1].highlights.contains_key(&0));
+}
+
+#[test]
 fn a_failed_load_keeps_the_diff_and_position() {
     let mut a = app(&["a"]);
     deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
