@@ -132,6 +132,11 @@ impl App {
         if !matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down) {
             self.notice = None;
         }
+        // Switching works from any screen. Text input has to be checked before
+        // this, because these keys are text there.
+        if self.switch_worktree(key.code) {
+            return Vec::new();
+        }
         if self.help_open {
             if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
                 self.help_open = false;
@@ -141,14 +146,6 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_open = true,
-            KeyCode::Char(']') => self.step_worktree(1),
-            KeyCode::Char('[') => self.step_worktree(-1),
-            KeyCode::Char(c @ '1'..='9') => {
-                let i = c as usize - '1' as usize;
-                if i < self.worktrees.len() {
-                    self.selected = i;
-                }
-            }
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Worktrees => Focus::Files,
@@ -170,6 +167,22 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// Answers whether `code` is a worktree switching key.
+    fn switch_worktree(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char(']') => self.step_worktree(1),
+            KeyCode::Char('[') => self.step_worktree(-1),
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = c as usize - '1' as usize;
+                if i < self.worktrees.len() {
+                    self.selected = i;
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn reload_selected(&mut self) -> Vec<Effect> {
@@ -386,12 +399,195 @@ mod tests {
     #[test]
     fn each_worktree_remembers_its_position() {
         let mut a = app(&["a", "b"]);
-        deliver(&mut a, "a", vec![file("1"), file("2"), file("3")]);
+        let files = || vec![file_with_rows("1", 100), file_with_rows("2", 100), file_with_rows("3", 100)];
+        deliver(&mut a, "a", files());
+        deliver(&mut a, "b", files());
         press(&mut a, 'n');
         press(&mut a, 'n');
+        at(&mut a, 50, 40);
+        for (away, back) in [(']', '['), ('2', '1'), ('j', 'k')] {
+            press(&mut a, away);
+            assert_eq!(a.selected, 1);
+            assert_eq!(position(&a), (0, 0, 0));
+            press(&mut a, 'n');
+            at(&mut a, 7, 3);
+            press(&mut a, back);
+            assert_eq!(a.selected, 0);
+            assert_eq!(position(&a), (2, 50, 40));
+            press(&mut a, away);
+            assert_eq!(position(&a), (1, 7, 3));
+            press(&mut a, 'p');
+            at(&mut a, 0, 0);
+            press(&mut a, back);
+        }
+    }
+
+    /// Three worktrees whose loaded diffs and positions all differ.
+    fn prepared() -> App {
+        let names = ["a", "b", "c"];
+        let mut a = app(&names);
+        for (i, name) in names.iter().enumerate() {
+            let files = (1..=3).map(|n| file_with_rows(&format!("{name}-{n}"), 100)).collect();
+            deliver(&mut a, name, files);
+            let s = &mut a.states[i];
+            (s.file, s.cursor, s.scroll) = (i, 20 + i, 10 + i);
+        }
+        a
+    }
+
+    fn list(names: &[&str]) -> Msg {
+        Msg::Worktrees(Ok(names.iter().map(|n| wt(n)).collect()))
+    }
+
+    /// Checks one worktree from `prepared` still has everything it started with.
+    fn assert_kept(a: &App, name: &str) {
+        let i = ["a", "b", "c"].iter().position(|n| *n == name).unwrap();
+        let row = a.worktrees.iter().position(|w| w.branch.as_deref() == Some(name)).unwrap();
+        let s = &a.states[row];
+        assert_eq!((s.file, s.cursor, s.scroll), (i, 20 + i, 10 + i), "position of {name}");
+        assert_eq!(s.diffs.as_ref().unwrap()[0].path, format!("{name}-1"));
+        assert!(s.key.as_ref().unwrap().worktree.ends_with(name));
+    }
+
+    #[test]
+    fn states_stay_with_their_worktrees_when_git_reorders_the_list() {
+        for order in [["c", "b", "a"], ["b", "c", "a"], ["c", "a", "b"]] {
+            for selected in 0..3 {
+                let mut a = prepared();
+                a.selected = selected;
+                let name = a.selected_worktree().unwrap().branch.clone();
+                a.handle_msg(list(&order));
+                assert_eq!(a.selected_worktree().unwrap().branch, name);
+                for name in ["a", "b", "c"] {
+                    assert_kept(&a, name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn states_stay_with_their_worktrees_when_one_appears_between_them() {
+        for selected in 0..3 {
+            let mut a = prepared();
+            a.selected = selected;
+            let name = a.selected_worktree().unwrap().branch.clone();
+            a.handle_msg(list(&["a", "new", "b", "c"]));
+            assert_eq!(a.selected_worktree().unwrap().branch, name);
+            for name in ["a", "b", "c"] {
+                assert_kept(&a, name);
+            }
+            let s = &a.states[1];
+            assert!(s.diffs.is_none() && s.key.is_none());
+            assert_eq!((s.file, s.cursor, s.scroll), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn a_list_refresh_loads_only_new_worktrees() {
+        let mut a = prepared();
+        assert!(a.handle_msg(list(&["a", "b", "c"])).is_empty());
+        assert!(a.handle_msg(list(&["c", "a", "b"])).is_empty());
+        for name in ["a", "b", "c"] {
+            assert_kept(&a, name);
+        }
+        let fx = a.handle_msg(list(&["a", "new", "b", "c"]));
+        assert_eq!(fx, vec![Effect::Load { path: "/r/new".into(), base: "develop".into() }]);
+    }
+
+    #[test]
+    fn a_load_clears_stale_and_error_and_records_the_operation() {
+        let mut a = app(&["a"]);
+        let s = a.current_mut().unwrap();
+        s.stale = true;
+        s.error = Some(crate::git::GitError::NoMergeBase);
+        let path: std::path::PathBuf = "/r/a".into();
+        let key = CacheKey { worktree: path.clone(), base_commit: "b".into(), head: "h".into(), fingerprint: 2 };
+        let loaded = Loaded { key: key.clone(), diffs: Arc::new(vec![file("1")]), op: Some("rebase") };
+        a.handle_msg(Msg::Loaded { path, result: Ok(loaded) });
+        let s = a.current().unwrap();
+        assert!(!s.stale && s.error.is_none());
+        assert_eq!(s.op, Some("rebase"));
+        assert_eq!(s.key, Some(key));
+        deliver(&mut a, "a", vec![file("1")]);
+        assert_eq!(a.current().unwrap().op, None);
+    }
+
+    #[test]
+    fn a_failed_load_keeps_the_diff_and_position() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
+        press(&mut a, 'n');
+        at(&mut a, 50, 40);
+        let key = a.current().unwrap().key.clone();
+        a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::NoMergeBase) });
+        let s = a.current().unwrap();
+        assert_eq!(s.error, Some(crate::git::GitError::NoMergeBase));
+        assert_eq!(s.diffs.as_ref().unwrap().len(), 2);
+        assert!(key.is_some() && s.key == key);
+        assert_eq!(position(&a), (1, 50, 40));
+    }
+
+    #[test]
+    fn a_stale_message_keeps_the_position() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
+        press(&mut a, 'n');
+        at(&mut a, 50, 40);
+        a.handle_msg(Msg::Stale("/r/a".into()));
+        assert_eq!(position(&a), (1, 50, 40));
+    }
+
+    #[test]
+    fn r_loads_the_selected_worktree_with_the_current_base() {
+        let mut a = app(&["a", "b"]);
         press(&mut a, ']');
+        a.base = "main".into();
+        let load = Effect::Load { path: "/r/b".into(), base: "main".into() };
+        assert_eq!(press(&mut a, 'r'), vec![Effect::ReloadWorktrees, load]);
+    }
+
+    #[test]
+    fn moving_to_another_file_resets_the_position() {
+        let mut a = app(&["a"]);
+        deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
+        at(&mut a, 50, 40);
+        press(&mut a, 'n');
+        assert_eq!(position(&a), (1, 0, 0));
+        at(&mut a, 50, 40);
+        press(&mut a, 'p');
+        assert_eq!(position(&a), (0, 0, 0));
+    }
+
+    #[test]
+    fn switching_works_while_help_is_open() {
+        let mut a = app(&["a", "b"]);
+        press(&mut a, '?');
+        press(&mut a, ']');
+        assert_eq!(a.selected, 1);
         press(&mut a, '[');
-        assert_eq!(a.current().unwrap().file, 2);
+        assert_eq!(a.selected, 0);
+        press(&mut a, '2');
+        assert_eq!(a.selected, 1);
+        press(&mut a, '9');
+        assert_eq!(a.selected, 1);
+        assert!(a.help_open);
+        a.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!a.help_open);
+    }
+
+    #[test]
+    fn other_keys_do_nothing_while_help_is_open() {
+        let mut a = app(&["a", "b"]);
+        deliver(&mut a, "a", vec![file_with_rows("1", 100), file_with_rows("2", 100)]);
+        press(&mut a, '?');
+        for c in ['j', 'k', 'n', 'p', 'v', 'r', 'q'] {
+            assert!(press(&mut a, c).is_empty());
+        }
+        a.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(a.selected, 0);
+        assert_eq!(position(&a), (0, 0, 0));
+        assert_eq!((a.focus, a.view), (Focus::Worktrees, DiffView::Unified));
+        assert!(a.help_open && !a.should_quit);
     }
 
     #[test]
