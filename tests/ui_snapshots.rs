@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 fn sample_file() -> FileDiff {
     FileDiff {
@@ -810,5 +811,103 @@ fn the_help_hint_is_whole_or_absent_beside_a_notice_or_a_comment() {
             let line = status_line(&render_sized(a, width, 12));
             assert!(line.contains("? help") || !line.contains('?'), "{line}");
         }
+    }
+}
+
+#[test]
+fn the_status_bar_shortens_a_name_only_when_it_has_to() {
+    let mut a = app();
+    let name = "feat-auth";
+    for width in 40..70 {
+        let line = status_line(&render_sized(&mut a, width, 12));
+        // 48 cells hold the bar without the hint, and 57 hold it with the hint.
+        let whole = line.contains(name);
+        let hint = line.ends_with("? help");
+        match width {
+            ..48 => assert!(!whole && !hint, "{width}: {line}"),
+            48..52 => assert!(whole && !hint, "{width}: {line}"),
+            52..57 => assert!(hint, "{width}: {line}"),
+            _ => assert!(whole && hint, "{width}: {line}"),
+        }
+    }
+}
+
+/// Lines `"line1"` onward, as added lines of one hunk.
+fn long_file(count: usize) -> FileDiff {
+    let lines: Vec<String> = (1..=count).map(|i| format!("line{i}")).collect();
+    file_of(&lines.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+#[test]
+fn the_diff_refills_when_the_terminal_grows() {
+    // A header and 40 lines make 41 rows.
+    let mut a = app_with(vec![long_file(40)]);
+    a.focus = Focus::Diff;
+    press(&mut a, 'j', 40);
+    render(&mut a);
+    assert_eq!(a.current().unwrap().scroll, 32);
+
+    // 30 rows leave 27 for the diff.
+    let out = render_sized(&mut a, 80, 30);
+    assert_eq!(a.current().unwrap().scroll, 14);
+    assert_eq!(row_of(&out, "line40"), Some(27), "{out}");
+}
+
+#[test]
+fn a_shrunk_diff_keeps_the_cursor_on_screen() {
+    let mut a = app_with(vec![long_file(40)]);
+    a.focus = Focus::Diff;
+    press(&mut a, 'j', 40);
+    render(&mut a);
+    a.handle_msg(Msg::Loaded { path: "/r/feat-auth".into(), result: Ok(Loaded { key: key(), diffs: Arc::new(vec![long_file(3)]), op: None }) });
+    let out = render(&mut a);
+    assert_eq!(a.current().unwrap().scroll, 0);
+    assert_eq!(row_of(&out, "line1"), Some(2), "{out}");
+}
+
+/// The cells inside the diff pane on screen row `y`, skipping the second half
+/// of each wide character, which the terminal draws from the first.
+fn diff_row(buffer: &Buffer, y: u16) -> Vec<&ratatui::buffer::Cell> {
+    let mut x = 2 * pane_width(buffer.area.width) + 1;
+    let mut cells = Vec::new();
+    while x < buffer.area.width - 1 {
+        let cell = &buffer[(x, y)];
+        cells.push(cell);
+        x += cell.symbol().width().max(1) as u16;
+    }
+    cells
+}
+
+#[test]
+fn tint_and_cursor_reach_the_pane_edge_in_unified_view() {
+    for text in ["plain", "日本語の行", "heart ❤\u{fe0f} family 👩\u{200d}👩\u{200d}👧", "\ttabbed\r"] {
+        let mut file = file_of(&[text, text]);
+        file.hunks[0].lines[1].kind = LineKind::Removed;
+        let mut a = app_with(vec![file]);
+        a.focus = Focus::Diff;
+        press(&mut a, 'j', 1);
+        let buffer = render_buffer(&mut a, 80, 12);
+        let cursor = diff_row(&buffer, 2);
+        assert!(cursor.iter().all(|c| c.bg == Color::Rgb(16, 48, 24)), "{text}");
+        assert!(cursor.iter().all(|c| c.modifier.contains(Modifier::REVERSED)), "{text}");
+        let removed = diff_row(&buffer, 3);
+        assert!(removed.iter().all(|c| c.bg == Color::Rgb(56, 16, 16)), "{text}");
+    }
+}
+
+#[test]
+fn the_cursor_reaches_the_pane_edge_on_context_and_header_rows() {
+    let mut a = app();
+    a.focus = Focus::Diff;
+    for view in [false, true] {
+        if view {
+            press(&mut a, 'v', 1);
+        }
+        let buffer = render_buffer(&mut a, 81, 12);
+        assert!(diff_row(&buffer, 1).iter().all(|c| c.modifier.contains(Modifier::REVERSED)), "header, split {view}");
+        press(&mut a, 'j', 1);
+        let buffer = render_buffer(&mut a, 81, 12);
+        assert!(diff_row(&buffer, 2).iter().all(|c| c.modifier.contains(Modifier::REVERSED)), "context, split {view}");
+        press(&mut a, 'k', 1);
     }
 }

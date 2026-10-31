@@ -97,21 +97,18 @@ fn block(title: &str, focused: bool) -> Block<'_> {
     Block::default().borders(Borders::ALL).border_style(style).title(title)
 }
 
-/// Moves `offset` just enough to bring `selected` inside `visible` rows.
-fn follow(offset: usize, selected: usize, visible: usize) -> usize {
-    if selected < offset {
+/// Moves `offset` just enough to bring `selected` inside `visible` rows of a
+/// list of `len`, which also can't leave rows unused below its end after the
+/// list shrinks or the terminal grows.
+fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> usize {
+    let offset = if selected < offset {
         selected
     } else if visible > 0 && selected >= offset + visible {
         selected + 1 - visible
     } else {
         offset
-    }
-}
-
-/// As `follow`, for a list of `len` rows, which also can't leave rows unused
-/// below its end after the list shrinks or the terminal grows.
-fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> usize {
-    follow(offset, selected, visible).min(len.saturating_sub(visible))
+    };
+    offset.min(len.saturating_sub(visible))
 }
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
@@ -173,13 +170,15 @@ fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
 /// Builds only the visible rows, so frame cost does not grow with diff size.
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let visible = area.height.saturating_sub(2) as usize;
+    let width = area.width.saturating_sub(2) as usize;
+    let rows = app.diff_row_count();
     let Some(s) = app.current_mut() else {
         // Git always lists a worktree, so an empty list hasn't arrived yet.
         let text = app.fatal.as_ref().map_or("Loading…".to_string(), |e| format!("Could not list worktrees: {e}"));
         f.render_widget(message(text).block(block("Diff", app.focus == Focus::Diff)), area);
         return;
     };
-    s.scroll = follow(s.scroll, s.cursor, visible);
+    s.scroll = list_offset(s.scroll, s.cursor, visible, rows);
     let app = &*app;
     let Some(s) = app.current() else { return };
     let focused = app.focus == Focus::Diff;
@@ -206,8 +205,8 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let highlight = s.highlights.get(&s.file);
     let commented = app.commented_lines();
     let rows = match app.view {
-        DiffView::Unified => unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible),
-        DiffView::SideBySide => split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, area.width.saturating_sub(2) as usize),
+        DiffView::Unified => unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
+        DiffView::SideBySide => split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
     };
     f.render_widget(Paragraph::new(rows).block(block("Diff", focused)), area);
 }
@@ -242,6 +241,7 @@ fn unified_rows<'a>(
     cursor: usize,
     scroll: usize,
     visible: usize,
+    width: usize,
 ) -> Vec<TextLine<'a>> {
     let mut rows = Vec::with_capacity(visible);
     let mut row = 0;
@@ -251,7 +251,7 @@ fn unified_rows<'a>(
             continue;
         }
         if row >= scroll {
-            rows.push(mark(TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)), row == cursor));
+            rows.push(finish_row(TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)), row == cursor, width));
         }
         row += 1;
         for (li, line) in hunk.lines.iter().enumerate() {
@@ -271,7 +271,7 @@ fn unified_rows<'a>(
                     Some(parts) => spans.extend(parts.iter().map(|(c, t)| Span::styled(display_text(t), span_style(*c)))),
                     None => spans.push(Span::raw(display_text(&line.text))),
                 }
-                rows.push(mark(TextLine::from(spans).style(line_style(line.kind)), row == cursor));
+                rows.push(finish_row(TextLine::from(spans).style(line_style(line.kind)), row == cursor, width));
             }
             row += 1;
         }
@@ -299,7 +299,7 @@ fn split_rows<'a>(
             break;
         }
         if row >= scroll {
-            rows.push(mark(TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)), row == cursor));
+            rows.push(finish_row(TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)), row == cursor, width));
         }
         row += 1;
         for (li, line) in hunk.lines.iter().enumerate() {
@@ -317,7 +317,7 @@ fn split_rows<'a>(
                 spans.extend(fit_spans(left, side));
                 spans.push(Span::raw(" │ "));
                 spans.extend(fit_spans(right, side));
-                rows.push(mark(TextLine::from(spans).style(line_style(line.kind)), row == cursor));
+                rows.push(finish_row(TextLine::from(spans).style(line_style(line.kind)), row == cursor, width));
             }
             row += 1;
         }
@@ -353,7 +353,19 @@ fn fit_spans<'a>(parts: &[(Color, &'a str)], width: usize) -> Vec<Span<'a>> {
     out
 }
 
-fn mark(line: TextLine<'_>, selected: bool) -> TextLine<'_> {
+/// Fills a row to `width` cells, so its background and the cursor reach the
+/// pane's edge, and marks the cursor. Stops measuring at the edge, because a
+/// minified line can be megabytes long.
+fn finish_row(mut line: TextLine<'_>, selected: bool, width: usize) -> TextLine<'_> {
+    let graphemes = line.spans.iter().flat_map(|s| s.styled_graphemes(Style::new()));
+    let mut used = 0;
+    for grapheme in graphemes {
+        used += grapheme.symbol.width();
+        if used >= width {
+            break;
+        }
+    }
+    line.spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
     if selected { line.patch_style(Style::new().add_modifier(Modifier::REVERSED)) } else { line }
 }
 
@@ -391,8 +403,9 @@ fn status_summary(app: &App, width: usize) -> String {
     let fixed = 1 + warnings.width() + "base: ".len() + GAP.len() * 2 + counts.width();
     let spare = width.saturating_sub(fixed);
     let hint = HELP_HINT.width();
-    let room = if spare >= MIN_NAME * 2 + hint { spare - hint } else { spare };
     let label = worktree_label(w);
+    let names = MIN_BASE.min(drawn_width(&app.base)) + MIN_NAME.min(drawn_width(&label));
+    let room = if spare >= names + hint { spare - hint } else { spare };
     let base_room = room.saturating_sub(drawn_width(&label).min(room / 2)).max(MIN_BASE);
     let base = elide(&app.base, base_room);
     let label_room = room.saturating_sub(drawn_width(&base)).max(MIN_NAME);
