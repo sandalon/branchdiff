@@ -2818,6 +2818,7 @@ In `handle_msg`, replace the `Msg::Branches` handling and the `Err` arm of `Msg:
             Msg::Branches(Ok(branches)) => {
                 // A late reply must not wipe a half-written comment.
                 if self.input.is_none() {
+                    self.help_open = false;
                     self.input = Some(Input::Base { query: String::new(), branches });
                 }
                 Vec::new()
