@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     };
     let base = cli.base.or(configured).unwrap_or_else(|| "develop".into());
 
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().context("could not start the terminal")?;
     keep_terminal_on_worker_panic();
     set_bracketed_paste(true);
     let result = run(&mut terminal, info, base, config_problem);
