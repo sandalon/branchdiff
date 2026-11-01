@@ -674,6 +674,46 @@ fn a_submodule_seen_from_its_linked_worktree_keeps_both() {
 }
 
 #[test]
+fn core_editor_is_read_from_the_repository_config() {
+    let repo = Repo::new();
+    run(&repo.main, &["config", "core.editor", "  nano -w  "]);
+    assert_eq!(git::core_editor(&repo.main).as_deref(), Some("nano -w"));
+}
+
+#[test]
+fn a_blank_core_editor_is_no_editor() {
+    let repo = Repo::new();
+    run(&repo.main, &["config", "core.editor", "   "]);
+    assert_eq!(git::core_editor(&repo.main), None);
+}
+
+#[test]
+fn core_editor_is_none_where_git_cannot_answer() {
+    assert_eq!(git::core_editor("/definitely/not/a/repo".as_ref()), None);
+}
+
+#[test]
+fn a_missing_core_editor_is_no_editor() {
+    let child = "missing_core_editor_child";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", child])
+        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}");
+}
+
+/// A child process, because the user's own config could set `core.editor`.
+#[test]
+#[ignore = "run in a child process by a_missing_core_editor_is_no_editor"]
+fn missing_core_editor_child() {
+    let repo = Repo::new();
+    assert_eq!(git::core_editor(&repo.main), None);
+}
+
+#[test]
 fn a_superproject_does_not_list_its_submodules() {
     let repo = Repo::new();
     let (superproject, _sub) = repo_with_submodule(&repo);

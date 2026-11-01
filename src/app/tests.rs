@@ -1428,3 +1428,62 @@ fn a_watch_limit_tells_the_user_the_badge_may_be_incomplete() {
     assert!(fx.is_empty());
     assert_eq!(a.notice.as_deref(), Some("File watching limit reached, the changed badge may be incomplete"));
 }
+
+fn review_on(path: &str, line: u32, line_text: &str) -> Review {
+    let comment = Comment { path: path.into(), line, side: Side::New, line_text: line_text.into(), body: "b".into() };
+    Review { comments: vec![comment], ..Review::default() }
+}
+
+#[test]
+fn replacing_a_review_recounts_outdated() {
+    let mut a = app_on_line();
+    a.set_review(0, review_on("a.rs", 1, "not the text there"));
+    assert_eq!(a.outdated_comments(), 1);
+    a.set_review(0, Review::default());
+    assert_eq!(a.outdated_comments(), 0);
+}
+
+#[test]
+fn replacing_a_review_past_the_end_of_the_list_does_nothing() {
+    let mut a = app(&["a"]);
+    a.set_review(5, Review::default());
+    assert_eq!(a.states.len(), 1);
+}
+
+#[test]
+fn replacing_the_selected_review_cancels_a_prompt_that_targets_it() {
+    let mut a = app_on_line();
+    press(&mut a, 'c');
+    assert!(matches!(a.input, Some(Input::Comment { .. })));
+    a.set_review(0, Review::default());
+    assert!(a.input.is_none());
+
+    type_comment(&mut a, "fix");
+    press(&mut a, 'D');
+    assert!(matches!(a.input, Some(Input::ConfirmClear)));
+    a.set_review(0, Review::default());
+    assert!(a.input.is_none());
+}
+
+#[test]
+fn replacing_a_review_leaves_a_prompt_that_targets_no_review() {
+    let mut a = app_on_line();
+    press(&mut a, 'w');
+    a.set_review(0, Review::default());
+    assert!(matches!(a.input, Some(Input::Worktree { .. })));
+}
+
+#[test]
+fn replacing_another_worktrees_review_leaves_prompts_open() {
+    let mut a = app_on_line();
+    a.handle_msg(list(&["a", "b"]));
+    press(&mut a, 'c');
+    a.set_review(1, Review::default());
+    assert!(matches!(a.input, Some(Input::Comment { .. })));
+
+    a.input = None;
+    type_comment(&mut a, "fix");
+    press(&mut a, 'D');
+    a.set_review(1, Review::default());
+    assert!(matches!(a.input, Some(Input::ConfirmClear)));
+}

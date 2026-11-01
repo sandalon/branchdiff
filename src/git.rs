@@ -337,6 +337,13 @@ pub fn branches(cwd: &Path) -> Result<Vec<String>, GitError> {
     Ok(text.lines().filter_map(|line| line.strip_suffix(' ')).map(String::from).collect())
 }
 
+/// The `core.editor` setting. Not `git var GIT_EDITOR`, which answers `vi` when
+/// nothing is set and so hides whether the user chose one.
+pub fn core_editor(cwd: &Path) -> Option<String> {
+    let text = ok_stdout(run(cwd, ["config", "--get", "core.editor"]).ok()?).ok()?;
+    Some(text.trim().to_string()).filter(|editor| !editor.is_empty())
+}
+
 /// The operation in progress in this worktree, if it is a rebase or a merge.
 pub fn in_progress_op(cwd: &Path) -> Option<&'static str> {
     let text = ok_stdout(run(cwd, ["rev-parse", "--absolute-git-dir"]).ok()?).ok()?;

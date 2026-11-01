@@ -2,15 +2,20 @@ use std::path::Path;
 
 const FALLBACK: &str = if cfg!(windows) { "notepad" } else { "vi" };
 
-pub fn default_editor() -> String {
-    pick(|name| std::env::var(name).ok())
+/// Picks the editor as git would. `core_editor` is `git::core_editor`'s answer.
+pub fn default_editor(core_editor: Option<String>) -> String {
+    pick(core_editor, |name| std::env::var(name).ok())
 }
 
-/// `VISUAL` wins, as it does for git. Unlike git, a value that names no program
-/// counts as unset.
-fn pick(var: impl Fn(&str) -> Option<String>) -> String {
-    let set = |name| var(name).filter(|value| split(value).is_some());
-    set("VISUAL").or_else(|| set("EDITOR")).unwrap_or_else(|| FALLBACK.into())
+/// Uses git's order. Unlike git, a value that names no program counts as unset.
+fn pick(core_editor: Option<String>, var: impl Fn(&str) -> Option<String>) -> String {
+    let usable = |value: &String| split(value).is_some();
+    let set = |name| var(name).filter(usable);
+    set("GIT_EDITOR")
+        .or_else(|| core_editor.filter(usable))
+        .or_else(|| set("VISUAL"))
+        .or_else(|| set("EDITOR"))
+        .unwrap_or_else(|| FALLBACK.into())
 }
 
 /// Splits `editor` at whitespace, keeping quoted text together and, outside
@@ -72,6 +77,29 @@ pub fn command(editor: &str, path: &Path, line: u32) -> (String, Vec<String>) {
         _ => args.push(file),
     }
     (prog, args)
+}
+
+/// Runs `f` so that Ctrl-C can't end this process. Raw mode is off while an
+/// editor runs, so the terminal signals both the editor and us. This installs a
+/// handler that does nothing rather than ignoring the signal, because an ignored
+/// signal stays ignored in a child, while a handler goes back to the default.
+#[cfg(unix)]
+pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
+    extern "C" fn do_nothing(_: libc::c_int) {}
+    let handler: extern "C" fn(libc::c_int) = do_nothing;
+    // SAFETY: the handler touches nothing, and these calls only swap the
+    // process's SIGINT disposition.
+    let previous = unsafe { libc::signal(libc::SIGINT, handler as libc::sighandler_t) };
+    let result = f();
+    unsafe { libc::signal(libc::SIGINT, previous) };
+    result
+}
+
+/// Windows has no such signal. Its console sends a control event instead, which
+/// this doesn't handle.
+#[cfg(not(unix))]
+pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 #[cfg(test)]
@@ -150,7 +178,35 @@ mod tests {
     }
 
     fn picked(visual: &str, editor: &str) -> String {
-        pick(|name| Some(if name == "VISUAL" { visual } else { editor }.to_string()))
+        let var = |name: &str| match name {
+            "VISUAL" => Some(visual.to_string()),
+            "EDITOR" => Some(editor.to_string()),
+            _ => None,
+        };
+        pick(None, var)
+    }
+
+    /// Every source set, each naming itself, with `missing` left out.
+    fn picked_without(missing: &[&str]) -> String {
+        let has = |name: &str| !missing.contains(&name);
+        let core = has("core.editor").then(|| "core.editor".to_string());
+        pick(core, |name| has(name).then(|| name.to_string()))
+    }
+
+    #[test]
+    fn sources_are_tried_in_gits_order() {
+        assert_eq!(picked_without(&[]), "GIT_EDITOR");
+        assert_eq!(picked_without(&["GIT_EDITOR"]), "core.editor");
+        assert_eq!(picked_without(&["GIT_EDITOR", "core.editor"]), "VISUAL");
+        assert_eq!(picked_without(&["GIT_EDITOR", "core.editor", "VISUAL"]), "EDITOR");
+        assert_eq!(picked_without(&["GIT_EDITOR", "core.editor", "VISUAL", "EDITOR"]), FALLBACK);
+    }
+
+    #[test]
+    fn a_blank_git_setting_counts_as_unset() {
+        let var = |name: &str| (name != "VISUAL").then(|| if name == "GIT_EDITOR" { " " } else { "nano" }.to_string());
+        assert_eq!(pick(Some("hx".into()), var), "hx");
+        assert_eq!(pick(Some("''".into()), var), "nano");
     }
 
     #[test]
@@ -159,7 +215,7 @@ mod tests {
         assert_eq!(picked("", "nano"), "nano");
         assert_eq!(picked("  ", "nano"), "nano");
         assert_eq!(picked("", " "), FALLBACK);
-        assert_eq!(pick(|_| None), FALLBACK);
+        assert_eq!(pick(None, |_| None), FALLBACK);
         assert_eq!(args("  ").0, FALLBACK);
     }
 
@@ -210,5 +266,31 @@ mod tests {
         assert_eq!(args("VIM").1, vec!["+7", "/r/a.rs"]);
         assert_eq!(args("vim.exe").1, vec!["+7", "/r/a.rs"]);
         assert_eq!(args("Code.exe").1, vec!["--wait", "--goto", "/r/a.rs:7"]);
+    }
+
+    /// One test, because a signal's handling is shared by the whole process.
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_during_an_editor_reaches_only_the_editor() {
+        use std::process::{Command, ExitStatus};
+        fn shell(script: &str) -> ExitStatus {
+            without_interrupts(|| Command::new("sh").args(["-c", script]).status().unwrap())
+        }
+        fn current_handler() -> libc::sighandler_t {
+            // SAFETY: a null action only reads, and `old` is valid to write.
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                assert_eq!(libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old), 0);
+                old.sa_sigaction
+            }
+        }
+
+        let before = current_handler();
+        // Without the hold, this kills the test process.
+        assert_eq!(shell("kill -INT $PPID; exit 3").code(), Some(3));
+        // A signal left ignored would stay ignored in the editor, which would
+        // reach `exit 3` here. It must die of the signal instead.
+        assert_eq!(shell("kill -INT $$; exit 3").code(), None);
+        assert_eq!(current_handler(), before);
     }
 }

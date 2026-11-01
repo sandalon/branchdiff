@@ -151,6 +151,17 @@ impl App {
         }
     }
 
+    pub fn set_review(&mut self, index: usize, review: Review) {
+        // An open prompt targets the review being replaced, as after a branch switch.
+        if index == self.selected && matches!(self.input, Some(Input::Comment { .. } | Input::ConfirmClear)) {
+            self.input = None;
+        }
+        if let Some(s) = self.states.get_mut(index) {
+            s.review = review;
+            s.outdated = count_outdated(s);
+        }
+    }
+
     pub fn selected_worktree(&self) -> Option<&Worktree> {
         self.worktrees.get(self.selected)
     }

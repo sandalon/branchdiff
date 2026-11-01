@@ -44,6 +44,7 @@ pub enum Msg {
 struct Running {
     base: String,
     waiting_base: Option<String>,
+    changed: bool,
 }
 
 /// What to do about a load that has just finished.
@@ -55,6 +56,9 @@ pub struct Finished {
     /// `BaseMissing` would reopen the picker. A result for the same base is
     /// valid and newer than what's on screen, so it's shown until `next` lands.
     pub superseded: bool,
+    /// The worktree changed during this load, so the result may predate that
+    /// change. Never set with `next`, which starts after the change.
+    pub changed: bool,
 }
 
 /// Allows one running load per worktree, because a load can take seconds and
@@ -74,9 +78,16 @@ impl Loads {
                 None
             }
             None => {
-                self.running.insert(path.clone(), Running { base: base.clone(), waiting_base: None });
+                self.running.insert(path.clone(), Running { base: base.clone(), waiting_base: None, changed: false });
                 Some(Job::Load { path, base })
             }
+        }
+    }
+
+    /// Records that a worktree changed. Does nothing if no load is running.
+    pub fn mark_changed(&mut self, path: &Path) {
+        if let Some(running) = self.running.get_mut(path) {
+            running.changed = true;
         }
     }
 
@@ -85,13 +96,14 @@ impl Loads {
         let Some(running) = self.running.get_mut(path) else {
             return Finished::default();
         };
+        let changed = std::mem::take(&mut running.changed);
         let Some(base) = running.waiting_base.take() else {
             self.running.remove(path);
-            return Finished::default();
+            return Finished { changed, ..Finished::default() };
         };
         let superseded = base != running.base;
         running.base = base.clone();
-        Finished { next: Some(Job::Load { path: path.to_path_buf(), base }), superseded }
+        Finished { next: Some(Job::Load { path: path.to_path_buf(), base }), superseded, changed: false }
     }
 }
 
@@ -314,6 +326,71 @@ mod tests {
         let done = Loads::default().finished("a".as_ref());
         assert!(done.next.is_none());
         assert!(!done.superseded);
+    }
+
+    #[test]
+    fn a_change_during_a_load_is_reported_when_it_finishes() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.mark_changed("a".as_ref());
+        assert!(loads.finished("a".as_ref()).changed);
+    }
+
+    #[test]
+    fn a_finished_load_with_no_change_reports_none() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        assert!(!loads.finished("a".as_ref()).changed);
+    }
+
+    #[test]
+    fn a_change_with_no_load_running_is_forgotten() {
+        let mut loads = Loads::default();
+        loads.mark_changed("a".as_ref());
+        loads.request("a".into(), "develop".into());
+        assert!(!loads.finished("a".as_ref()).changed);
+    }
+
+    #[test]
+    fn a_change_to_one_worktree_leaves_another_alone() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.request("b".into(), "develop".into());
+        loads.mark_changed("a".as_ref());
+        assert!(!loads.finished("b".as_ref()).changed);
+    }
+
+    #[test]
+    fn a_waiting_load_includes_the_change_and_clears_the_mark() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.mark_changed("a".as_ref());
+        loads.request("a".into(), "develop".into());
+        let done = loads.finished("a".as_ref());
+        assert!(done.next.is_some());
+        assert!(!done.changed);
+        // The promoted load started after the change.
+        assert!(!loads.finished("a".as_ref()).changed);
+    }
+
+    #[test]
+    fn a_change_during_a_promoted_load_is_reported() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.request("a".into(), "develop".into());
+        loads.finished("a".as_ref());
+        loads.mark_changed("a".as_ref());
+        assert!(loads.finished("a".as_ref()).changed);
+    }
+
+    #[test]
+    fn a_new_load_does_not_inherit_a_finished_loads_change() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "develop".into());
+        loads.mark_changed("a".as_ref());
+        loads.finished("a".as_ref());
+        loads.request("a".into(), "develop".into());
+        assert!(!loads.finished("a".as_ref()).changed);
     }
 
     #[test]
