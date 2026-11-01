@@ -166,7 +166,32 @@ pub fn discover(cwd: &Path) -> Result<RepoInfo, GitError> {
 
 pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, GitError> {
     let text = ok_stdout(run(cwd, ["worktree", "list", "--porcelain", "-z"])?)?;
-    Ok(parse_worktrees(&text))
+    let mut list = parse_worktrees(&text);
+    // Git lists the main worktree first, and as its git dir if that lives outside
+    // it, as with `--separate-git-dir` or in a submodule. Bare entries are gone by
+    // now, so a directory with no `.git` here can only be such a git dir.
+    if list.first().is_some_and(|w| w.path.is_dir() && !w.path.join(".git").exists()) {
+        match main_worktree_root(cwd, &list[0].path) {
+            Some(root) => list[0].path = root,
+            None => drop(list.remove(0)),
+        }
+    }
+    Ok(list)
+}
+
+/// The working tree of a git dir that lives outside it. A submodule's git dir
+/// records it. A separate git dir doesn't, so it can be found only from inside
+/// that working tree, and a linked worktree's own toplevel would be the wrong one.
+fn main_worktree_root(cwd: &Path, git_dir: &Path) -> Option<PathBuf> {
+    toplevel(git_dir).or_else(|| {
+        let here = ok_stdout(run(cwd, ["rev-parse", "--absolute-git-dir"]).ok()?).ok()?;
+        if Path::new(here.trim_end()) == git_dir { toplevel(cwd) } else { None }
+    })
+}
+
+fn toplevel(cwd: &Path) -> Option<PathBuf> {
+    let text = ok_stdout(run(cwd, ["rev-parse", "--show-toplevel"]).ok()?).ok()?;
+    Some(text.trim_end().into())
 }
 
 fn parse_worktrees(text: &str) -> Vec<Worktree> {

@@ -632,3 +632,128 @@ fn any_not_ignored_follows_every_ignore_source_and_the_index() {
     assert!(check(&["kept.log"]));
     assert!(check(&["a.txt"]));
 }
+
+/// A repository whose git dir is outside its working tree, with `a.txt`
+/// committed on `develop` and then edited, so a diff from `develop` has content.
+struct SeparateGitDir {
+    _dir: tempfile::TempDir,
+    worktree: std::path::PathBuf,
+    git_dir: std::path::PathBuf,
+}
+
+impl SeparateGitDir {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (worktree, git_dir) = (base.join("worktree"), base.join("elsewhere.git"));
+        let separate = format!("--separate-git-dir={}", git_dir.display());
+        run(&base, &["init", "-q", "-b", "develop", &separate, worktree.to_str().unwrap()]);
+        run(&worktree, &["config", "user.email", "test@example.com"]);
+        run(&worktree, &["config", "user.name", "Test"]);
+        std::fs::write(worktree.join("a.txt"), "one\n").unwrap();
+        run(&worktree, &["add", "."]);
+        run(&worktree, &["commit", "-qm", "init"]);
+        run(&worktree, &["switch", "-qc", "feat"]);
+        std::fs::write(worktree.join("a.txt"), "two\n").unwrap();
+        Self { _dir: dir, worktree, git_dir }
+    }
+}
+
+/// A superproject with `Repo::main` added as the submodule `sub`, on a new
+/// branch, with `a.txt` edited. Returns the superproject and the submodule.
+fn repo_with_submodule(repo: &Repo) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = repo.main.parent().unwrap().canonicalize().unwrap();
+    let superproject = base.join("super");
+    std::fs::create_dir(&superproject).unwrap();
+    run(&superproject, &["init", "-q", "-b", "develop"]);
+    run(&superproject, &["config", "user.email", "test@example.com"]);
+    run(&superproject, &["config", "user.name", "Test"]);
+    run(&superproject, &["commit", "-qm", "init", "--allow-empty"]);
+    let source = base.join("main");
+    run(&superproject, &["-c", "protocol.file.allow=always", "submodule", "--quiet", "add", source.to_str().unwrap(), "sub"]);
+    let sub = superproject.join("sub");
+    run(&sub, &["switch", "-qc", "feat"]);
+    std::fs::write(sub.join("a.txt"), "edited\n").unwrap();
+    (superproject, sub)
+}
+
+fn paths(wts: &[git::Worktree]) -> Vec<std::path::PathBuf> {
+    wts.iter().map(|w| w.path.clone()).collect()
+}
+
+fn assert_reviewable(root: &std::path::Path) {
+    let base = git::merge_base(root, "develop").unwrap();
+    let files = branchdiff::diff::load(root, &base).unwrap();
+    assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), vec!["a.txt"]);
+}
+
+#[test]
+fn a_separate_git_dir_lists_the_working_tree() {
+    let repo = SeparateGitDir::new();
+    let wts = git::list_worktrees(&repo.worktree).unwrap();
+    assert_eq!(paths(&wts), vec![repo.worktree.clone()]);
+    assert_eq!(wts[0].branch.as_deref(), Some("feat"));
+    assert_reviewable(&wts[0].path);
+}
+
+#[test]
+fn a_separate_git_dir_lists_the_working_tree_from_a_subdirectory() {
+    let repo = SeparateGitDir::new();
+    std::fs::create_dir(repo.worktree.join("deep")).unwrap();
+    assert_eq!(paths(&git::list_worktrees(&repo.worktree.join("deep")).unwrap()), vec![repo.worktree.clone()]);
+}
+
+#[test]
+fn a_separate_git_dir_keeps_its_linked_worktrees() {
+    let repo = SeparateGitDir::new();
+    let linked = repo.worktree.parent().unwrap().join("linked");
+    run(&repo.worktree, &["worktree", "add", "-q", "-b", "linked", linked.to_str().unwrap()]);
+    assert_eq!(paths(&git::list_worktrees(&repo.worktree).unwrap()), vec![repo.worktree.clone(), linked]);
+}
+
+/// The git dir has no record of its working tree, so from elsewhere it can't be
+/// found. Listing the linked worktree twice, or the git dir, would both be wrong.
+#[test]
+fn a_separate_git_dir_seen_from_a_linked_worktree_lists_only_what_it_can_find() {
+    let repo = SeparateGitDir::new();
+    let linked = repo.worktree.parent().unwrap().join("linked");
+    run(&repo.worktree, &["worktree", "add", "-q", "-b", "linked", linked.to_str().unwrap()]);
+    assert_eq!(paths(&git::list_worktrees(&linked).unwrap()), vec![linked.clone()]);
+    assert!(!repo.git_dir.join(".git").exists());
+}
+
+#[test]
+fn a_submodule_lists_its_working_tree() {
+    let repo = Repo::new();
+    let (_superproject, sub) = repo_with_submodule(&repo);
+    let wts = git::list_worktrees(&sub).unwrap();
+    assert_eq!(paths(&wts), vec![sub.clone()]);
+    assert_eq!(wts[0].branch.as_deref(), Some("feat"));
+    assert_reviewable(&wts[0].path);
+}
+
+#[test]
+fn a_submodule_seen_from_its_linked_worktree_keeps_both() {
+    let repo = Repo::new();
+    let (_superproject, sub) = repo_with_submodule(&repo);
+    let linked = sub.parent().unwrap().parent().unwrap().join("sub-linked");
+    run(&sub, &["worktree", "add", "-q", "-b", "other", linked.to_str().unwrap()]);
+    assert_eq!(paths(&git::list_worktrees(&linked).unwrap()), vec![sub, linked]);
+}
+
+#[test]
+fn a_superproject_does_not_list_its_submodules() {
+    let repo = Repo::new();
+    let (superproject, _sub) = repo_with_submodule(&repo);
+    assert_eq!(paths(&git::list_worktrees(&superproject).unwrap()), vec![superproject]);
+}
+
+#[test]
+fn a_bare_repository_is_skipped_when_seen_from_its_linked_worktree() {
+    let repo = Repo::new();
+    let base = repo.main.parent().unwrap().canonicalize().unwrap();
+    run(&base, &["clone", "-q", "--bare", "main", "bare.git"]);
+    let linked = base.join("linked");
+    run(&base.join("bare.git"), &["worktree", "add", "-q", "-b", "linked", linked.to_str().unwrap()]);
+    assert_eq!(paths(&git::list_worktrees(&linked).unwrap()), vec![linked]);
+}
