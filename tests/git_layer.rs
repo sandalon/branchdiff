@@ -586,30 +586,6 @@ fn untracked_lines_hold_no_spare_capacity() {
 }
 
 #[test]
-fn watcher_reports_stale_worktree_and_new_worktrees() {
-    use branchdiff::{watch, worker::Msg};
-    use std::time::Duration;
-
-    let repo = Repo::new();
-    let info = git::discover(&repo.main).unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let cmds = watch::spawn(info.common_dir.clone(), tx).unwrap();
-    let main = real(&repo.main);
-    cmds.send(watch::Command::SetWorktrees(vec![main.clone()])).unwrap();
-    // Applied on the watcher's thread. Starting an FSEvents stream takes about
-    // 200 ms when run from `target/debug/deps`, and a write before that is lost.
-    std::thread::sleep(Duration::from_secs(1));
-
-    std::fs::write(main.join("a.txt"), "edited\n").unwrap();
-    let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(matches!(got, Msg::Stale(p) if p == main));
-
-    repo.add_worktree("later");
-    let got = (0..20).find_map(|_| rx.recv_timeout(Duration::from_secs(1)).ok().filter(|m| matches!(m, Msg::WorktreesChanged)));
-    assert!(got.is_some());
-}
-
-#[test]
 fn any_not_ignored_follows_every_ignore_source_and_the_index() {
     let repo = Repo::new();
     let main = &repo.main;

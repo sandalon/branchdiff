@@ -279,11 +279,17 @@ fn steady_ignored_writes_do_not_hold_back_a_real_change() {
             }
         })
     };
-    std::fs::write(main.join("a.txt"), "edited\n").unwrap();
-    let seen = session.saw_stale(&main);
+    std::thread::sleep(Duration::from_millis(300));
+    // Below the watcher's maximum wait of 2 s, which would otherwise report it
+    // anyway. A slow machine gets more attempts, but a held back badge misses them all.
+    let in_time = (0..3).any(|attempt| {
+        let edited = Instant::now();
+        std::fs::write(main.join("a.txt"), format!("edited {attempt}\n")).unwrap();
+        session.next_stale().is_some() && edited.elapsed() < Duration::from_millis(1900)
+    });
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
-    assert!(seen);
+    assert!(in_time);
 }
 
 #[test]
