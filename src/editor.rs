@@ -1,28 +1,63 @@
 use std::path::Path;
 
+const FALLBACK: &str = if cfg!(windows) { "notepad" } else { "vi" };
+
 pub fn default_editor() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| if cfg!(windows) { "notepad".into() } else { "vi".into() })
+    pick(|name| std::env::var(name).ok())
 }
 
-/// Builds the program and arguments that open `path` at `line`.
+/// `VISUAL` wins, as it does for git. Unlike git, a blank value counts as unset.
+fn pick(var: impl Fn(&str) -> Option<String>) -> String {
+    let set = |name| var(name).filter(|value| !value.trim().is_empty());
+    set("VISUAL").or_else(|| set("EDITOR")).unwrap_or_else(|| FALLBACK.into())
+}
+
+/// Splits `editor` at whitespace, keeping quoted text together and, outside
+/// Windows, a character after a backslash, so that `"/opt/My Ed/ed" -w` works.
+/// git would run the value in a shell. This expands nothing, so that no shell
+/// ever sees a file's name, and a missing editor is an error rather than exit 127.
+fn words(editor: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote = None;
+    let mut chars = editor.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => word.get_or_insert_default().push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            (None, '\\') if !cfg!(windows) => word.get_or_insert_default().extend(chars.next()),
+            (None, _) if c.is_whitespace() => words.extend(word.take()),
+            (None, _) => word.get_or_insert_default().push(c),
+        }
+    }
+    words.extend(word);
+    words
+}
+
+/// Builds the program and arguments that open `path` at `line`. `path` is
+/// absolute, so even a file named `-x` can't be taken for an option.
 pub fn command(editor: &str, path: &Path, line: u32) -> (String, Vec<String>) {
-    let mut parts = editor.split_whitespace().map(String::from);
-    let prog = parts.next().unwrap_or_else(|| "vi".into());
+    let mut parts = words(editor).into_iter();
+    let prog = parts.next().unwrap_or_else(|| FALLBACK.into());
     let mut args: Vec<String> = parts.collect();
     let name = Path::new(&prog).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
     let file = path.display().to_string();
     let at_line = format!("{file}:{line}");
     match name.as_str() {
-        "vi" | "vim" | "nvim" | "nano" | "emacs" | "kak" | "micro" => {
+        "vi" | "vim" | "nvim" | "nano" | "emacs" | "emacsclient" | "kak" | "micro" => {
             args.extend([format!("+{line}"), file]);
         }
         "code" | "code-insiders" | "cursor" | "windsurf" | "codium" => {
             args.extend(["--wait".to_string(), "--goto".to_string(), at_line]);
         }
-        "subl" => args.extend(["--wait".to_string(), at_line]),
+        "subl" | "sublime_text" | "zed" => args.extend(["--wait".to_string(), at_line]),
         "hx" | "helix" => args.push(at_line),
+        "gedit" => args.extend([file, format!("+{line}")]),
+        "idea" => args.extend(["--line".to_string(), line.to_string(), file]),
         _ => args.push(file),
     }
     (prog, args)
@@ -66,5 +101,53 @@ mod tests {
     #[test]
     fn unknown_editors_just_get_the_path() {
         assert_eq!(args("myed").1, vec!["/r/a.rs"]);
+    }
+
+    #[test]
+    fn other_editors_get_their_own_form_of_the_line() {
+        assert_eq!(args("emacs").1, vec!["+7", "/r/a.rs"]);
+        assert_eq!(args("emacsclient").1, vec!["+7", "/r/a.rs"]);
+        assert_eq!(args("kak").1, vec!["+7", "/r/a.rs"]);
+        assert_eq!(args("micro").1, vec!["+7", "/r/a.rs"]);
+        assert_eq!(args("gedit").1, vec!["/r/a.rs", "+7"]);
+        assert_eq!(args("sublime_text").1, vec!["--wait", "/r/a.rs:7"]);
+        assert_eq!(args("zed").1, vec!["--wait", "/r/a.rs:7"]);
+        assert_eq!(args("idea").1, vec!["--line", "7", "/r/a.rs"]);
+    }
+
+    #[test]
+    fn quotes_keep_a_path_with_spaces_together() {
+        let subl = "/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl";
+        for editor in [format!("\"{subl}\" -w"), format!("'{subl}' -w")] {
+            let (prog, a) = args(&editor);
+            assert_eq!(prog, subl);
+            assert_eq!(a, vec!["-w", "--wait", "/r/a.rs:7"]);
+        }
+        assert_eq!(args("vim -c 'set ft=rust'").1, vec!["-c", "set ft=rust", "+7", "/r/a.rs"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_keeps_a_space_in_the_word() {
+        assert_eq!(args("/opt/My\\ Editor/vim").0, "/opt/My Editor/vim");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_backslash_is_a_path_separator_on_windows() {
+        assert_eq!(args(r#""C:\Program Files\Vim\gvim.exe" -f"#).0, r"C:\Program Files\Vim\gvim.exe");
+    }
+
+    #[test]
+    fn a_blank_value_counts_as_unset() {
+        let from = |visual: &'static str, editor: &'static str| {
+            pick(move |name| Some(if name == "VISUAL" { visual } else { editor }.to_string()))
+        };
+        assert_eq!(from("hx", "nano"), "hx");
+        assert_eq!(from("", "nano"), "nano");
+        assert_eq!(from("  ", "nano"), "nano");
+        assert_eq!(from("", " "), FALLBACK);
+        assert_eq!(pick(|_| None), FALLBACK);
+        assert_eq!(args("  ").0, FALLBACK);
     }
 }
