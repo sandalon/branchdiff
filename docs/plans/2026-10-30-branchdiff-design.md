@@ -29,13 +29,13 @@ The tool ships as a single binary.
 
 ## Architecture
 
-Run `branchdiff` from anywhere inside a repo. It discovers worktrees with `git worktree list --porcelain`. The base branch defaults to `develop` and can be set with `--base` or a per-repo config value.
+Run `branchdiff` from anywhere inside a repo. It discovers worktrees with `git worktree list --porcelain`. The base branch defaults to `develop` and can be set with `--base` or a per-repo value, `base`, in `<git-common-dir>/branchdiff/config.toml`.
 
 The core rule is that **the UI thread never waits on git.**
 
-- **UI loop:** handles input and draws from in-memory state only. Every keypress gets an immediate response, even while data is loading. The one exception is saving a review, which is synchronous so that an edit is on disk before the next key is handled.
-- **Git workers:** a background thread pool runs git and sends results to the UI over channels. Each worktree has at most one load running. A request made during a load runs next, and the finished result is still shown unless the base branch changed in the meantime.
-- **File watcher:** watches each worktree, debounces bursts of edits, and marks the worktree as stale. It also watches `.git/worktrees`, so worktrees created or removed during a session update the list.
+- **UI loop:** handles input and draws from in-memory state only. Every keypress gets an immediate response, even while data is loading. Two short exceptions: saving a review is synchronous, so an edit is on disk before the next key is handled, and loading a review file happens as the worktree list is applied. Startup runs `git rev-parse` before the first frame, and `e` reads `core.editor` just before handing over the terminal.
+- **Git workers:** a background thread pool runs git and sends results to the UI over channels. Each worktree has at most one load running. A request made during a load runs next, and the finished result is still shown unless the base branch changed in the meantime. One worktree list runs at a time, and one probe per worktree.
+- **File watcher:** watches each worktree and debounces bursts of edits. A report doesn't raise the badge by itself: a probe job compares HEAD and a `git status` fingerprint with the diff on screen, so a tool that only rewrites the index changes nothing. A change seen during a load is probed once that load lands. It also watches `.git/worktrees`, so worktrees created or removed during a session update the list.
 
 ### Git access
 
@@ -43,7 +43,7 @@ Workers call the `git` CLI rather than libgit2 or gitoxide. Diffs then match git
 
 ### Cache
 
-Diffs are held in memory, keyed by the base commit, the worktree's HEAD and a fingerprint of its working tree state. Each worktree's summary is prefetched at startup, and file diffs for neighbouring worktrees load in the background. Switching to a worktree with a fresh cache entry is just a redraw.
+Each worktree holds one diff in memory, with a key of the base commit, its HEAD and a fingerprint of its working tree state. Every worktree's full diff loads in the background at startup, so switching is just a redraw.
 
 ## User interface
 
@@ -62,7 +62,7 @@ Worktree rows show lines added, a "changed" badge and a comment count. The diff 
 
 Each worktree remembers its selected file, scroll position and unexported comments, so switching back returns to the same place.
 
-When a worktree changes during review, it gets a "changed" badge. The diff does not redraw until the user refreshes, so nothing moves under the cursor. The badge also shows after a base change, until that worktree's diff has reloaded.
+When a worktree changes during review, it gets a "changed" badge. The diff does not redraw until the user refreshes, so nothing moves under the cursor. The badge also shows after a base change, until that worktree's diff has reloaded. It stays on after an edit is reverted, until `r`. A change that only moves the merge base doesn't raise it.
 
 ### Keybindings
 
@@ -78,14 +78,15 @@ When a worktree changes during review, it gets a "changed" badge. The diff does 
 | `c` | Comment on the current line |
 | `d` | Delete the comment on the current line |
 | `D` | Clear all comments for this worktree, after a confirmation |
-| `e` | Open the file and line in `$EDITOR` |
+| `e` | Open the file and line in your editor, chosen in git's order: `GIT_EDITOR`, `core.editor`, `VISUAL`, `EDITOR`, then a platform default |
 | `x` | Mark a file as reviewed |
-| `y` | Copy comments to the clipboard as a Markdown prompt |
-| `Y` | Write comments to a Markdown file |
-| `r` | Apply a pending refresh, or retry a failed command |
+| `y` | Copy comments to the clipboard as a Markdown prompt, or write the file if there's no clipboard |
+| `Y` | Write comments to `<git-common-dir>/branchdiff/exports/latest.md` |
+| `r` | Refresh this worktree and the worktree list, or retry a failed command |
 | `b` | Change the base branch for this session |
 | `?` | Open or close the help overlay |
-| `Esc` | Close the help overlay |
+| `Esc` | Close the help overlay or a prompt |
+| `q` / `Ctrl-C` | Quit. Ctrl-C also quits from a prompt |
 
 `?` works everywhere except while typing a comment, when it is entered as text.
 
@@ -94,9 +95,10 @@ When a worktree changes during review, it gets a "changed" badge. The diff does 
 Loading a worktree:
 
 1. Run `git merge-base <base> HEAD` in the worktree to find the fork point.
-2. Run `git diff <merge-base>` to get the summary and per-file diffs. This covers committed and uncommitted changes.
-3. Run `git ls-files --others --exclude-standard` to find untracked files, and show them as new files.
-4. Send the results to the UI, which keeps them in memory with the key that identifies their inputs.
+2. Read HEAD and the working tree fingerprint, before the diff, so a change during the load shows as a difference.
+3. Run `git diff <merge-base>` to get the summary and per-file diffs. This covers committed and uncommitted changes.
+4. Run `git ls-files --others --exclude-standard` to find untracked files, and show them as new files.
+5. Send the results to the UI, which keeps them in memory with the key that identifies their inputs.
 
 The default diff is measured from the fork point, not the base branch tip, so changes merged to the base after forking do not appear in the review.
 
@@ -121,12 +123,18 @@ Export produces a Markdown prompt that can be pasted into any agent, which avoid
 | Situation | Behaviour |
 | --- | --- |
 | Not in a repo, or `git` missing | Exit with a clear message before the UI starts |
-| Base branch missing | Open the UI and prompt for a base with `b` |
+| Base branch missing | Open the UI and show the base picker |
 | No merge base | Show the failure on that worktree's row; other worktrees keep working |
-| Detached HEAD | Show the diff normally; key comments by commit |
+| Detached HEAD | Show the diff normally; key comments by commit, or by the branch being rebased during a rebase |
 | Worktree deleted while selected | Show a notice and move to the next worktree; keep saved comments on disk |
 | Mid-rebase or merge | Show a warning badge, since the diff may look unusual |
 | Git command fails | Show stderr in the diff area; `r` retries |
+| No terminal | Exit with a clear message |
+| Config file unusable | Ignore it and show a notice |
+| File watching unavailable or at its limit | Show a notice; the badge may be incomplete |
+| Review file unreadable | Move it aside and show a notice |
+| Editor fails or won't start | Show a notice |
+| SIGTERM or SIGHUP | Restore the terminal and exit once any editor has finished |
 
 ## Testing
 
@@ -134,7 +142,7 @@ Export produces a Markdown prompt that can be pasted into any agent, which avoid
 - **Parsing and state:** unit tests cover diff parsing, cache keys, dropping late results and flagging outdated comments. A test confirms an interrupted save leaves the old file intact.
 - **UI:** snapshot tests render screens to ratatui's test backend and check them with `insta`. Key-driven tests cover switching, per-worktree position and the help overlay.
 - **Platforms:** CI runs everything on macOS, Linux and Windows.
-- **Speed:** a benchmark uses a generated repo with 10 worktrees and a 5,000-file diff. CI fails if these targets slip:
+- **Speed:** tests render an in-memory app with 10 worktrees and a 5,000-file diff, and a benchmark parses a patch of about 100 MB. CI fails if these targets slip:
 
 | Measure | Target |
 | --- | --- |
@@ -161,4 +169,4 @@ Export produces a Markdown prompt that can be pasted into any agent, which avoid
 - Viewing multiple repos at once
 - Custom keybindings and themes
 
-The only config in the first release is the per-repo base branch.
+The only config in the first release is the per-repo base branch, in `<git-common-dir>/branchdiff/config.toml`.

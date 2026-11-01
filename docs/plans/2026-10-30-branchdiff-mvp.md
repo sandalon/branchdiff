@@ -4573,7 +4573,7 @@ fn help_output_starts_within_the_first_frame_budget() {
 }
 ```
 
-This only covers process start. The first frame draws before git returns because `run` draws an empty `App` immediately, so the two are close, but confirm by hand with a real repo once.
+This only covers process start. `main` runs one `git rev-parse` in `git::discover` and reads the config before `run` draws, so the first frame waits for that one process, but not for the worktree list or any diff. `tests/pty.rs` can measure a real first frame: add a test asserting that the median of several runs is under 100 ms.
 
 **Step 4: Write `benches/render.rs`**
 
@@ -4598,7 +4598,7 @@ criterion_main!(benches);
 ```
 
 Run: `cargo bench`
-Expected: completes and reports a time for `parse about 100 MB`, which was about 0.1 s for a shape this size when measured in review.
+Expected: completes and reports a time for `parse about 100 MB`, which was about 0.15 s for a shape this size when measured in review.
 
 **Step 5: Commit**
 
@@ -4630,6 +4630,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      BRANCHDIFF_TEST_QUIET_MS: 3000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -4664,10 +4666,11 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: '' }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: '' }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, ext: '' }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, ext: '' }
           - { os: macos-latest, target: aarch64-apple-darwin, ext: '' }
           - { os: macos-latest, target: x86_64-apple-darwin, ext: '' }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: '.exe' }
@@ -4686,15 +4689,24 @@ jobs:
           files: branchdiff-${{ matrix.target }}${{ matrix.ext }}
 ```
 
-The Linux build depends on the system libc. `arboard` is built with `wayland-data-control`, so it supports both X11 and Wayland. If a runner is missing headers, add an `apt-get install` step for `libxcb1-dev`.
+The Linux build needs no system libraries: with `wayland-data-control`, `arboard` uses pure-Rust X11 and Wayland clients and links neither libxcb nor libwayland. The binary needs at least the glibc it was built against, so build on `ubuntu-22.04` and `ubuntu-22.04-arm` to reach more distributions. As far as we know the ARM runner is only free for public repos, so check that before tagging.
 
 **Step 3: Write `README.md`**
 
-Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from `HELP` in `src/ui.rs`, which adds `q` and `Esc` for prompts, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, that the badge stays on after an edit is reverted until `r` is pressed, that on Linux a low inotify limit makes the badge incomplete and shows a notice, that on macOS a worktree reached through a symlink created after it was added won't show the badge for file edits, that on Windows deleting a worktree's directory by hand isn't noticed until the list next refreshes, that on Windows VS Code may need `EDITOR=code.cmd`, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside, and that colours assume a dark background, so context rows can be hard to read on a light terminal.
+Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from `HELP` in `src/ui.rs`, which adds `q` and `Esc` for prompts, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, that the badge stays on after an edit is reverted until `r` is pressed, that on Linux a low inotify limit makes the badge incomplete and shows a notice, that on macOS a worktree reached through a symlink created after it was added won't show the badge for file edits, that on Windows deleting a worktree's directory by hand isn't noticed until the list next refreshes, that on Windows VS Code may need `EDITOR=code.cmd`, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside, and that colours assume a dark background, so context rows can be hard to read on a light terminal, that `e` picks the editor in git's order (`GIT_EDITOR`, `core.editor`, `VISUAL`, `EDITOR`, then `vi`, or `notepad` on Windows) but runs it without a shell, so variables in the value aren't expanded, that the base defaults to `develop`, a blank `base` counts as unset and an unusable config file is ignored with a notice, that a change which only moves the merge base doesn't raise the badge until `r`, and that on Windows Ctrl-C while an editor is open isn't handled.
 
 **Step 4: Verify the final state**
 
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
+Add `rustfmt.toml`, because the code is written for about 120 columns:
+
+```toml
+max_width = 120
+use_small_heuristics = "Max"
+```
+
+Run: `cargo fmt`, and commit it alone as `style: format with rustfmt`, so the format diff isn't mixed with anything else.
+
+Run: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 Expected: no warnings, all tests pass.
 
 Run: `cargo test --release --test perf -- --ignored`
