@@ -174,6 +174,11 @@ impl App {
             .to_path_buf()
     }
 
+    /// The key of the diff held for the worktree at `path`.
+    pub fn key_for(&self, path: &Path) -> Option<CacheKey> {
+        self.states.get(self.index_of(path)?)?.key.clone()
+    }
+
     pub fn selected_worktree(&self) -> Option<&Worktree> {
         self.worktrees.get(self.selected)
     }
@@ -381,6 +386,8 @@ impl App {
                 }
                 Vec::new()
             }
+            // `main` decides what these mean, through `Probes`.
+            Msg::Probed { .. } => Vec::new(),
             Msg::WorktreesChanged => vec![Effect::ReloadWorktrees],
             Msg::WatchLimit => {
                 self.notice = Some("File watching limit reached, the changed badge may be incomplete".into());

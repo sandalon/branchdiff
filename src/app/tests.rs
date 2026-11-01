@@ -1505,3 +1505,20 @@ fn repository_commands_run_in_the_first_directory_that_still_exists() {
     std::fs::remove_dir(&two).unwrap();
     assert_eq!(a.repo_dir(&start, &common), common);
 }
+
+#[test]
+fn the_key_for_a_path_is_that_of_its_loaded_diff() {
+    let mut a = app(&["a", "b"]);
+    assert_eq!(a.key_for("/r/a".as_ref()), None);
+    deliver(&mut a, "a", vec![file("x")]);
+    assert_eq!(a.key_for("/r/a".as_ref()).unwrap().worktree, std::path::Path::new("/r/a"));
+    assert_eq!(a.key_for("/r/b".as_ref()), None);
+    assert_eq!(a.key_for("/r/gone".as_ref()), None);
+}
+
+#[test]
+fn a_probe_result_alone_changes_nothing_in_the_app() {
+    let mut a = app(&["a"]);
+    assert!(a.handle_msg(Msg::Probed { path: "/r/a".into(), changed: true }).is_empty());
+    assert!(!a.states[0].stale);
+}

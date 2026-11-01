@@ -1,6 +1,9 @@
 mod common;
+use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError};
+use branchdiff::worker::{Job, Msg, Pool};
 use common::{git as run, real, repo_with_submodule, Repo, SeparateGitDir};
+use crossbeam_channel::{unbounded, Receiver};
 use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
@@ -743,6 +746,111 @@ fn a_detached_worktree_with_no_rebase_has_no_branch() {
     let wt = repo.add_worktree("feat");
     run(&wt, &["checkout", "-q", "--detach"]);
     assert_eq!(branch_of(&wt), None);
+}
+
+/// Loads `path` with a real worker, for a key to probe against.
+fn loaded_key(pool: &Pool, msgs: &Receiver<Msg>, path: &std::path::Path) -> CacheKey {
+    pool.submit(Job::Load { path: path.to_path_buf(), base: "develop".into() });
+    match msgs.recv_timeout(Duration::from_secs(10)).unwrap() {
+        Msg::Loaded { result: Ok(loaded), .. } => loaded.key,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+fn probe(pool: &Pool, msgs: &Receiver<Msg>, key: &CacheKey) -> bool {
+    pool.submit(Job::Probe { key: key.clone() });
+    match msgs.recv_timeout(Duration::from_secs(10)).unwrap() {
+        Msg::Probed { path, changed } => {
+            assert_eq!(path, key.worktree);
+            changed
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+fn pool() -> (Pool, Receiver<Msg>) {
+    let (tx, rx) = unbounded();
+    (Pool::new(1, tx), rx)
+}
+
+#[test]
+fn a_probe_sees_no_change_from_what_only_touches_the_index_or_ignored_files() {
+    let repo = Repo::new();
+    let (pool, msgs) = pool();
+    std::fs::write(repo.main.join(".gitignore"), "target/\n").unwrap();
+    repo.commit_all(&repo.main, "ignore");
+    std::fs::write(repo.main.join("a.txt"), "dirty\n").unwrap();
+    let key = loaded_key(&pool, &msgs, &repo.main);
+    assert!(!probe(&pool, &msgs, &key));
+
+    run(&repo.main, &["status"]);
+    assert!(!probe(&pool, &msgs, &key));
+
+    std::fs::create_dir(repo.main.join("target")).unwrap();
+    std::fs::write(repo.main.join("target/out"), "built").unwrap();
+    assert!(!probe(&pool, &msgs, &key));
+}
+
+#[test]
+fn a_probe_sees_no_change_from_a_touched_clean_file() {
+    let repo = Repo::new();
+    let (pool, msgs) = pool();
+    let key = loaded_key(&pool, &msgs, &repo.main);
+    set_mtime(&repo.main.join("a.txt"), 1_000_000);
+    run(&repo.main, &["status"]);
+    assert!(!probe(&pool, &msgs, &key));
+}
+
+#[test]
+fn a_probe_sees_an_edit_a_stage_and_a_commit() {
+    let repo = Repo::new();
+    let (pool, msgs) = pool();
+    let clean = loaded_key(&pool, &msgs, &repo.main);
+
+    std::fs::write(repo.main.join("a.txt"), "edit\n").unwrap();
+    assert!(probe(&pool, &msgs, &clean));
+    let edited = loaded_key(&pool, &msgs, &repo.main);
+
+    run(&repo.main, &["add", "a.txt"]);
+    assert!(probe(&pool, &msgs, &edited));
+    let staged = loaded_key(&pool, &msgs, &repo.main);
+
+    run(&repo.main, &["commit", "-qm", "edit"]);
+    assert!(probe(&pool, &msgs, &staged));
+}
+
+#[test]
+fn a_probe_sees_a_second_edit_of_a_dirty_file_and_a_new_untracked_file() {
+    let repo = Repo::new();
+    let (pool, msgs) = pool();
+    std::fs::write(repo.main.join("a.txt"), "first\n").unwrap();
+    let key = loaded_key(&pool, &msgs, &repo.main);
+
+    std::fs::write(repo.main.join("a.txt"), "second, longer\n").unwrap();
+    assert!(probe(&pool, &msgs, &key));
+    let key = loaded_key(&pool, &msgs, &repo.main);
+    std::fs::write(repo.main.join("new.txt"), "new\n").unwrap();
+    assert!(probe(&pool, &msgs, &key));
+}
+
+#[test]
+fn a_reverted_edit_of_a_clean_file_is_no_change() {
+    let repo = Repo::new();
+    let (pool, msgs) = pool();
+    let key = loaded_key(&pool, &msgs, &repo.main);
+    std::fs::write(repo.main.join("a.txt"), "edit\n").unwrap();
+    assert!(probe(&pool, &msgs, &key));
+    std::fs::write(repo.main.join("a.txt"), "one\ntwo\n").unwrap();
+    assert!(!probe(&pool, &msgs, &key));
+}
+
+#[test]
+fn a_probe_that_cannot_run_git_reports_a_change() {
+    let repo = Repo::new();
+    let (pool, msgs) = pool();
+    let mut key = loaded_key(&pool, &msgs, &repo.main);
+    key.worktree = "/definitely/not/a/repo".into();
+    assert!(probe(&pool, &msgs, &key));
 }
 
 #[test]

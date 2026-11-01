@@ -21,6 +21,7 @@ pub enum Job {
     Load { path: PathBuf, base: String },
     ListBranches { cwd: PathBuf },
     Highlight { key: CacheKey, file_index: usize, diffs: Diffs },
+    Probe { key: CacheKey },
 }
 
 #[derive(Debug)]
@@ -37,6 +38,8 @@ pub enum Msg {
     Branches(Result<Vec<String>, GitError>),
     Highlighted { key: CacheKey, file_index: usize, lines: crate::highlight::HighlightedFile },
     Stale(PathBuf),
+    /// Answers `Job::Probe`. `changed` means the worktree no longer matches its key.
+    Probed { path: PathBuf, changed: bool },
     WorktreesChanged,
     WatchLimit,
 }
@@ -91,6 +94,10 @@ impl Loads {
         }
     }
 
+    pub fn is_running(&self, path: &Path) -> bool {
+        self.running.contains_key(path)
+    }
+
     /// Call for every finished load.
     pub fn finished(&mut self, path: &Path) -> Finished {
         let Some(running) = self.running.get_mut(path) else {
@@ -104,6 +111,74 @@ impl Loads {
         let superseded = base != running.base;
         running.base = base.clone();
         Finished { next: Some(Job::Load { path: path.to_path_buf(), base }), superseded, changed: false }
+    }
+}
+
+/// What a report that a worktree changed calls for.
+#[derive(Debug)]
+pub enum Reaction {
+    Nothing,
+    /// Submit this job, which finds out whether anything really changed.
+    Submit(Job),
+    /// Tell the app. There's no loaded diff to compare against.
+    Badge,
+}
+
+/// What to do about a probe that has just finished.
+#[derive(Debug, Default)]
+pub struct ProbeDone {
+    /// A probe for a change seen during this one, which now counts as running.
+    pub next: Option<Job>,
+    /// The diff on screen no longer matches its worktree, so show the badge.
+    pub raise: bool,
+}
+
+struct RunningProbe {
+    key: CacheKey,
+    waiting: bool,
+}
+
+/// Decides when a reported change needs a probe. Tools such as `git status`
+/// rewrite the index without changing anything a diff shows, so a report alone
+/// isn't enough to raise the badge. Allows one running probe per worktree and
+/// one waiting behind it, so a burst of reports can't queue up work, yet a report
+/// that arrives during a probe is always checked afterwards.
+#[derive(Default)]
+pub struct Probes {
+    running: HashMap<PathBuf, RunningProbe>,
+}
+
+impl Probes {
+    /// Call when a worktree may have changed. `loading` says a load is running,
+    /// which `Loads::finished` reports on later. `key` is the worktree's diff.
+    pub fn on_change(&mut self, loading: bool, key: Option<CacheKey>) -> Reaction {
+        if loading {
+            return Reaction::Nothing;
+        }
+        let Some(key) = key else { return Reaction::Badge };
+        match self.running.get_mut(&key.worktree) {
+            Some(running) => {
+                running.waiting = true;
+                Reaction::Nothing
+            }
+            None => {
+                self.running.insert(key.worktree.clone(), RunningProbe { key: key.clone(), waiting: false });
+                Reaction::Submit(Job::Probe { key })
+            }
+        }
+    }
+
+    /// Call for every finished probe. `current` is the worktree's key now. If a
+    /// refresh replaced the key during the probe, the answer is about a diff
+    /// that has gone, and that refresh reports its own changes through `Loads`.
+    pub fn finished(&mut self, path: &Path, changed: bool, current: Option<CacheKey>) -> ProbeDone {
+        let Some(running) = self.running.remove(path) else { return ProbeDone::default() };
+        let raise = changed && current.as_ref() == Some(&running.key);
+        let next = current.filter(|_| running.waiting).map(|key| {
+            self.running.insert(path.to_path_buf(), RunningProbe { key: key.clone(), waiting: false });
+            Job::Probe { key }
+        });
+        ProbeDone { next, raise }
     }
 }
 
@@ -166,6 +241,17 @@ fn run(job: Job) -> Msg {
             let lines = guarded(highlight).unwrap_or_default();
             Msg::Highlighted { key, file_index, lines }
         }
+        Job::Probe { key } => {
+            let path = key.worktree.clone();
+            let compare = || {
+                #[cfg(test)]
+                tests::panic_if_marked(&path);
+                probe(&key)
+            };
+            // A probe that fails can't say the diff is current, so it counts as a change.
+            let changed = guarded(std::panic::AssertUnwindSafe(compare)).unwrap_or(true);
+            Msg::Probed { path, changed }
+        }
     }
 }
 
@@ -191,9 +277,18 @@ fn panic_text(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+fn head(path: &Path) -> Result<String, GitError> {
+    Ok(String::from_utf8_lossy(&git::run(path, ["rev-parse", "HEAD"])?.stdout).trim().to_string())
+}
+
+/// Answers whether the inputs of the diff behind `key` have changed.
+fn probe(key: &CacheKey) -> Result<bool, GitError> {
+    Ok(head(&key.worktree)? != key.head || git::fingerprint(&key.worktree)? != key.fingerprint)
+}
+
 fn load(path: &Path, base: &str) -> Result<Loaded, GitError> {
     let base_commit = git::merge_base(path, base)?;
-    let head = String::from_utf8_lossy(&git::run(path, ["rev-parse", "HEAD"])?.stdout).trim().to_string();
+    let head = head(path)?;
     let fingerprint = git::fingerprint(path)?;
     let diffs = Arc::new(crate::diff::load(path, &base_commit)?);
     let key = CacheKey { worktree: path.to_path_buf(), base_commit, head, fingerprint };
@@ -393,6 +488,132 @@ mod tests {
         assert!(!loads.finished("a".as_ref()).changed);
     }
 
+    fn key(fingerprint: u64) -> CacheKey {
+        CacheKey { worktree: "a".into(), base_commit: "b".into(), head: "h".into(), fingerprint }
+    }
+
+    /// Starts a probe of `a` against `key`, checking that one was due.
+    fn start_probe(probes: &mut Probes, key: CacheKey) {
+        assert_eq!(probed_key(probes.on_change(false, Some(key.clone()))), key);
+    }
+
+    fn probed_key(reaction: Reaction) -> CacheKey {
+        match reaction {
+            Reaction::Submit(Job::Probe { key }) => key,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn next_key(job: Option<Job>) -> Option<CacheKey> {
+        match job {
+            Some(Job::Probe { key }) => Some(key),
+            None => None,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_change_during_a_load_waits_for_the_load() {
+        let mut probes = Probes::default();
+        assert!(matches!(probes.on_change(true, Some(key(1))), Reaction::Nothing));
+        assert!(matches!(probes.on_change(true, None), Reaction::Nothing));
+        // It started nothing, so a probe can still run.
+        start_probe(&mut probes, key(1));
+    }
+
+    #[test]
+    fn a_change_with_no_key_has_nothing_to_compare_so_raises_the_badge() {
+        assert!(matches!(Probes::default().on_change(false, None), Reaction::Badge));
+    }
+
+    #[test]
+    fn only_one_probe_runs_per_worktree() {
+        let mut probes = Probes::default();
+        start_probe(&mut probes, key(1));
+        for _ in 0..50 {
+            assert!(matches!(probes.on_change(false, Some(key(1))), Reaction::Nothing));
+        }
+        let other = CacheKey { worktree: "b".into(), ..key(1) };
+        assert_eq!(probed_key(probes.on_change(false, Some(other.clone()))), other);
+    }
+
+    #[test]
+    fn a_burst_during_a_probe_runs_exactly_one_more() {
+        let mut probes = Probes::default();
+        start_probe(&mut probes, key(1));
+        for _ in 0..50 {
+            probes.on_change(false, Some(key(1)));
+        }
+        assert_eq!(next_key(probes.finished("a".as_ref(), false, Some(key(1))).next), Some(key(1)));
+        // The re-run counts as running, and nothing waits behind it.
+        assert!(matches!(probes.on_change(false, Some(key(1))), Reaction::Nothing));
+        assert_eq!(next_key(probes.finished("a".as_ref(), false, Some(key(1))).next), Some(key(1)));
+        assert!(next_key(probes.finished("a".as_ref(), false, Some(key(1))).next).is_none());
+        start_probe(&mut probes, key(1));
+    }
+
+    #[test]
+    fn a_finished_probe_with_nothing_waiting_frees_the_worktree() {
+        let mut probes = Probes::default();
+        start_probe(&mut probes, key(1));
+        assert!(probes.finished("a".as_ref(), false, Some(key(1))).next.is_none());
+        start_probe(&mut probes, key(1));
+    }
+
+    #[test]
+    fn a_probe_raises_the_badge_only_for_a_change() {
+        let mut probes = Probes::default();
+        start_probe(&mut probes, key(1));
+        assert!(!probes.finished("a".as_ref(), false, Some(key(1))).raise);
+        start_probe(&mut probes, key(1));
+        assert!(probes.finished("a".as_ref(), true, Some(key(1))).raise);
+    }
+
+    #[test]
+    fn a_probe_of_a_key_since_replaced_says_nothing() {
+        let mut probes = Probes::default();
+        start_probe(&mut probes, key(1));
+        // A refresh landed during the probe, which compared against the old diff.
+        assert!(!probes.finished("a".as_ref(), true, Some(key(2))).raise);
+    }
+
+    #[test]
+    fn a_waiting_probe_compares_against_the_newest_key() {
+        let mut probes = Probes::default();
+        start_probe(&mut probes, key(1));
+        probes.on_change(false, Some(key(1)));
+        assert_eq!(next_key(probes.finished("a".as_ref(), false, Some(key(2))).next), Some(key(2)));
+        assert!(probes.finished("a".as_ref(), true, Some(key(2))).raise);
+    }
+
+    #[test]
+    fn a_removed_worktree_ends_its_probes() {
+        let mut probes = Probes::default();
+        start_probe(&mut probes, key(1));
+        probes.on_change(false, Some(key(1)));
+        let done = probes.finished("a".as_ref(), true, None);
+        assert!(!done.raise);
+        assert!(done.next.is_none());
+        start_probe(&mut probes, key(1));
+    }
+
+    #[test]
+    fn finishing_an_unknown_probe_does_nothing() {
+        let done = Probes::default().finished("a".as_ref(), true, Some(key(1)));
+        assert!(!done.raise);
+        assert!(done.next.is_none());
+    }
+
+    #[test]
+    fn loads_report_whether_one_is_running() {
+        let mut loads = Loads::default();
+        assert!(!loads.is_running("a".as_ref()));
+        loads.request("a".into(), "develop".into());
+        assert!(loads.is_running("a".as_ref()));
+        loads.finished("a".as_ref());
+        assert!(!loads.is_running("a".as_ref()));
+    }
+
     #[test]
     fn guarded_passes_results_through() {
         assert_eq!(guarded(|| Ok(1)), Ok(1));
@@ -459,7 +680,13 @@ mod tests {
         let key = CacheKey { worktree: PANIC_PATH.into(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
         pool.submit(Job::Highlight { key: key.clone(), file_index: 3, diffs: Arc::new(vec![]) });
         match next() {
-            Msg::Highlighted { key: got, file_index, .. } => assert_eq!((got, file_index), (key, 3)),
+            Msg::Highlighted { key: got, file_index, .. } => assert_eq!((got, file_index), (key.clone(), 3)),
+            other => panic!("unexpected {other:?}"),
+        }
+        pool.submit(Job::Probe { key });
+        match next() {
+            // A failed probe counts as a change.
+            Msg::Probed { path, changed } => assert_eq!((path.as_path(), changed), (Path::new(PANIC_PATH), true)),
             other => panic!("unexpected {other:?}"),
         }
 

@@ -4,7 +4,7 @@ use branchdiff::app::{coalesce_saves, App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
-use branchdiff::worker::{Job, Loads, Msg, Pool, WORKER_THREAD};
+use branchdiff::worker::{Job, Loads, Msg, Pool, Probes, Reaction, WORKER_THREAD};
 use branchdiff::{config, editor, signals, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
@@ -87,6 +87,7 @@ fn keep_terminal_on_worker_panic() {
 struct Runtime {
     pool: Pool,
     loads: Loads,
+    probes: Probes,
     store: Store,
     common_dir: PathBuf,
     /// Opened on first copy, then kept alive because on Linux this process
@@ -148,6 +149,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Opt
     let mut rt = Runtime {
         pool: Pool::new(threads, msg_tx.clone()),
         loads: Loads::default(),
+        probes: Probes::default(),
         store: Store::new(&info.common_dir),
         common_dir: info.common_dir.clone(),
         clipboard: None,
@@ -208,11 +210,32 @@ fn on_event(app: &mut App, ev: Event) -> Vec<Effect> {
     }
 }
 
+/// Finds out whether a worktree really changed before showing it.
+fn report_change(app: &mut App, rt: &mut Runtime, path: &Path) {
+    match rt.probes.on_change(rt.loads.is_running(path), app.key_for(path)) {
+        Reaction::Submit(job) => rt.pool.submit(job),
+        Reaction::Badge => drop(app.handle_msg(Msg::Stale(path.to_path_buf()))),
+        Reaction::Nothing => {}
+    }
+}
+
 fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
-    let mut changed_during_load = None;
     if let Msg::Stale(path) = &msg {
         rt.loads.mark_changed(path);
+        report_change(app, rt, path);
+        return Vec::new();
     }
+    if let Msg::Probed { path, changed } = &msg {
+        let done = rt.probes.finished(path, *changed, app.key_for(path));
+        if let Some(job) = done.next {
+            rt.pool.submit(job);
+        }
+        if done.raise {
+            app.handle_msg(Msg::Stale(path.clone()));
+        }
+        return Vec::new();
+    }
+    let mut changed_during_load = None;
     if let Msg::Loaded { path, .. } = &msg {
         let done = rt.loads.finished(path);
         if let Some(job) = done.next {
@@ -257,9 +280,9 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
         }
         other => app.handle_msg(other),
     };
-    // A loaded result clears the badge, so restore it for edits it can't include.
+    // A loaded result clears the badge, so check for edits it can't include.
     if let Some(path) = changed_during_load {
-        app.handle_msg(Msg::Stale(path));
+        report_change(app, rt, &path);
     }
     effects
 }
