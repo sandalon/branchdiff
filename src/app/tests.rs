@@ -234,6 +234,27 @@ fn switching_works_from_any_focus() {
 }
 
 #[test]
+fn tab_and_arrows_cycle_focus_both_ways() {
+    let mut a = app(&["a"]);
+    for expect in [Focus::Files, Focus::Diff, Focus::Worktrees] {
+        a.handle_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(a.focus, expect);
+    }
+
+    a.handle_key(KeyEvent::from(KeyCode::Left));
+    assert_eq!(a.focus, Focus::Diff);
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(a.focus, Focus::Files);
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(a.focus, Focus::Worktrees);
+    a.handle_key(KeyEvent::from(KeyCode::Left));
+    assert_eq!(a.focus, Focus::Diff);
+
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    assert_eq!(a.focus, Focus::Worktrees);
+}
+
+#[test]
 fn number_keys_jump_and_ignore_out_of_range() {
     let mut a = app(&["a", "b"]);
     press(&mut a, '2');
