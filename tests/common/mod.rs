@@ -57,3 +57,49 @@ impl Repo {
         git(cwd, &["commit", "-qm", msg]);
     }
 }
+
+/// A repository whose git dir is outside its working tree, with `a.txt`
+/// committed on `develop` and then edited, so a diff from `develop` has content.
+pub struct SeparateGitDir {
+    _dir: TempDir,
+    pub worktree: PathBuf,
+    pub git_dir: PathBuf,
+}
+
+impl SeparateGitDir {
+    pub fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (worktree, git_dir) = (base.join("worktree"), base.join("elsewhere.git"));
+        let separate = format!("--separate-git-dir={}", git_dir.display());
+        git(&base, &["init", "-q", "-b", "develop", &separate, worktree.to_str().unwrap()]);
+        git(&worktree, &["config", "user.email", "test@example.com"]);
+        git(&worktree, &["config", "user.name", "Test"]);
+        std::fs::write(worktree.join("a.txt"), "one\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-qm", "init"]);
+        git(&worktree, &["switch", "-qc", "feat"]);
+        std::fs::write(worktree.join("a.txt"), "two\n").unwrap();
+        Self { _dir: dir, worktree, git_dir }
+    }
+}
+
+/// A superproject with `Repo::main` added as the submodule `sub`, on a new
+/// branch, with `a.txt` edited. Returns the superproject and the submodule.
+pub fn repo_with_submodule(repo: &Repo) -> (PathBuf, PathBuf) {
+    let base = repo.main.parent().unwrap().canonicalize().unwrap();
+    let superproject = base.join("super");
+    std::fs::create_dir(&superproject).unwrap();
+    git(&superproject, &["init", "-q", "-b", "develop"]);
+    git(&superproject, &["config", "user.email", "test@example.com"]);
+    git(&superproject, &["config", "user.name", "Test"]);
+    git(&superproject, &["commit", "-qm", "init", "--allow-empty"]);
+    let source = base.join("main");
+    git(&superproject, &["-c", "protocol.file.allow=always", "submodule", "--quiet", "add", source.to_str().unwrap(), "sub"]);
+    let sub = superproject.join("sub");
+    git(&sub, &["config", "user.email", "test@example.com"]);
+    git(&sub, &["config", "user.name", "Test"]);
+    git(&sub, &["switch", "-qc", "feat"]);
+    std::fs::write(sub.join("a.txt"), "edited\n").unwrap();
+    (superproject, sub)
+}

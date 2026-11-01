@@ -51,16 +51,10 @@ enum Change {
     List,
 }
 
-/// `linked` maps each directory name under `worktrees_dir` to its worktree.
-fn classify(
-    path: &Path,
-    worktrees_dir: &Path,
-    roots: &[PathBuf],
-    linked: &HashMap<OsString, PathBuf>,
-) -> Option<Change> {
+fn classify(path: &Path, worktrees_dir: &Path, worktrees: &Worktrees) -> Option<Change> {
     if let Ok(rel) = path.strip_prefix(worktrees_dir) {
         let parts: Vec<_> = rel.iter().map(|c| c.to_str().unwrap_or_default()).collect();
-        let owner = rel.iter().next().and_then(|name| linked.get(name)).cloned();
+        let owner = rel.iter().next().and_then(|name| worktrees.linked.get(name)).cloned();
         return match parts.as_slice() {
             [] | [_] | [_, "gitdir"] => Some(Change::List),
             [_, "HEAD"] => Some(owner.map_or(Change::List, Change::Head)),
@@ -68,7 +62,16 @@ fn classify(
             _ => None,
         };
     }
-    let root = owning_worktree(path, roots)?;
+    if let (Some(main), Some(rel)) = (&worktrees.main_with_git_file, strip_common(path, worktrees_dir)) {
+        return if rel == Path::new("HEAD") {
+            Some(Change::Head(main.clone()))
+        } else if rel == Path::new("index") || rel == Path::new("logs/HEAD") {
+            Some(Change::State(main.clone()))
+        } else {
+            None
+        };
+    }
+    let root = owning_worktree(path, &worktrees.roots)?;
     let rel = path.strip_prefix(&root).ok()?;
     Some(if rel == Path::new(".git/HEAD") {
         Change::Head(root)
@@ -85,12 +88,16 @@ fn is_change(kind: &EventKind) -> bool {
     !matches!(kind, EventKind::Access(_))
 }
 
-/// The name of a linked worktree's directory under `<common>/worktrees`, read
-/// from its `.git` file. The main worktree's `.git` is a directory.
-fn linked_name(root: &Path) -> Option<OsString> {
+fn strip_common<'a>(path: &'a Path, worktrees_dir: &Path) -> Option<&'a Path> {
+    path.strip_prefix(worktrees_dir.parent()?).ok()
+}
+
+/// Where a worktree's `.git` file points, which a submodule gives as a relative
+/// path. `.git` is a directory in an ordinary main worktree, which gives `None`.
+fn git_dir_from_file(root: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(root.join(".git")).ok()?;
     let dir = text.strip_prefix("gitdir:")?.trim();
-    Path::new(dir).file_name().map(OsString::from)
+    root.join(dir).canonicalize().ok()
 }
 
 struct Pending {
@@ -196,11 +203,15 @@ pub fn spawn(common_dir: PathBuf, msgs: Sender<Msg>) -> notify::Result<Sender<Co
 struct Worktrees {
     roots: Vec<PathBuf>,
     watched: HashSet<PathBuf>,
+    /// Each directory name under `<common>/worktrees`, and its worktree.
     linked: HashMap<OsString, PathBuf>,
+    /// The main worktree, if its `.git` is a file, so that its index and HEAD
+    /// are directly in the common dir: a separate git dir or a submodule.
+    main_with_git_file: Option<PathBuf>,
 }
 
 impl Worktrees {
-    fn set(&mut self, watcher: &mut RecommendedWatcher, next: Vec<PathBuf>, limit: &mut WatchLimit) {
+    fn set(&mut self, watcher: &mut RecommendedWatcher, next: Vec<PathBuf>, limit: &mut WatchLimit, worktrees_dir: &Path) {
         let gone: Vec<_> = self.watched.iter().filter(|r| !next.contains(r)).cloned().collect();
         for root in gone {
             self.forget(watcher, &root);
@@ -216,8 +227,25 @@ impl Worktrees {
                 Err(e) => limit.note(&e),
             }
         }
-        self.linked = next.iter().filter_map(|r| Some((linked_name(r)?, r.clone()))).collect();
+        self.find_git_dirs(&next, worktrees_dir);
         self.roots = next;
+    }
+
+    /// A `.git` file points at the common dir itself from the main worktree, and
+    /// at `<common>/worktrees/<name>` from a linked one. The names can't be
+    /// compared alone: a submodule `a` can have a linked worktree `a`.
+    fn find_git_dirs(&mut self, roots: &[PathBuf], worktrees_dir: &Path) {
+        let common = worktrees_dir.parent().and_then(|c| c.canonicalize().ok());
+        self.linked.clear();
+        self.main_with_git_file = None;
+        for root in roots {
+            let Some(git_dir) = git_dir_from_file(root) else { continue };
+            if Some(&git_dir) == common.as_ref() {
+                self.main_with_git_file = Some(root.clone());
+            } else if let Some(name) = git_dir.file_name() {
+                self.linked.insert(name.to_os_string(), root.clone());
+            }
+        }
     }
 
     fn forget(&mut self, watcher: &mut RecommendedWatcher, root: &Path) {
@@ -265,7 +293,7 @@ fn run(
         let idle = unchecked.is_empty() && bursts.is_empty() && list_changed.is_empty();
         select! {
             recv(cmd_rx) -> cmd => match cmd {
-                Ok(Command::SetWorktrees(next)) => worktrees.set(&mut watcher, next, &mut limit),
+                Ok(Command::SetWorktrees(next)) => worktrees.set(&mut watcher, next, &mut limit, &worktrees_dir),
                 Err(_) => return,
             },
             recv(fs_rx) -> event => {
@@ -281,7 +309,7 @@ fn run(
                 }
                 for event in event.iter().filter(|e| is_change(&e.kind)) {
                     for path in &event.paths {
-                        match classify(path, &worktrees_dir, &worktrees.roots, &worktrees.linked) {
+                        match classify(path, &worktrees_dir, &worktrees) {
                             Some(Change::File(root)) if path == &root && !root.exists() => {
                                 worktrees.forget(&mut watcher, &root);
                                 list_changed.record(worktrees_dir.clone(), now);
@@ -471,7 +499,46 @@ mod tests {
 
     fn classified(p: &str) -> Option<Change> {
         let linked = HashMap::from([(OsString::from("a"), PathBuf::from("/r/main/.worktrees/a"))]);
-        classify(Path::new(p), Path::new("/r/main/.git/worktrees"), &roots(), &linked)
+        let worktrees = Worktrees { roots: roots(), linked, ..Worktrees::default() };
+        classify(Path::new(p), Path::new("/r/main/.git/worktrees"), &worktrees)
+    }
+
+    fn classified_with_git_file(p: &str, main: Option<&str>) -> Option<Change> {
+        let linked = HashMap::from([(OsString::from("a"), PathBuf::from("/r/a"))]);
+        let worktrees = Worktrees {
+            roots: vec!["/r/wt".into(), "/r/a".into()],
+            linked,
+            main_with_git_file: main.map(PathBuf::from),
+            ..Worktrees::default()
+        };
+        classify(Path::new(p), Path::new("/r/sep.git/worktrees"), &worktrees)
+    }
+
+    #[test]
+    fn git_state_in_the_common_dir_belongs_to_a_main_worktree_whose_git_is_a_file() {
+        let (wt, main) = (|| PathBuf::from("/r/wt"), Some("/r/wt"));
+        assert_eq!(classified_with_git_file("/r/sep.git/index", main), Some(Change::State(wt())));
+        assert_eq!(classified_with_git_file("/r/sep.git/logs/HEAD", main), Some(Change::State(wt())));
+        assert_eq!(classified_with_git_file("/r/sep.git/HEAD", main), Some(Change::Head(wt())));
+    }
+
+    #[test]
+    fn scratch_files_in_that_common_dir_mean_nothing() {
+        for name in ["index.lock", "HEAD.lock", "ORIG_HEAD", "objects/ab/cd", "refs/heads/x", "logs/refs/heads/x"] {
+            assert_eq!(classified_with_git_file(&format!("/r/sep.git/{name}"), Some("/r/wt")), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn linked_worktrees_keep_their_own_state_beside_such_a_main_worktree() {
+        let linked = Some(Change::State("/r/a".into()));
+        assert_eq!(classified_with_git_file("/r/sep.git/worktrees/a/index", Some("/r/wt")), linked);
+    }
+
+    #[test]
+    fn the_common_dir_means_nothing_without_such_a_main_worktree() {
+        assert_eq!(classified_with_git_file("/r/sep.git/index", None), None);
+        assert_eq!(classified_with_git_file("/r/sep.git/HEAD", None), None);
     }
 
     #[test]

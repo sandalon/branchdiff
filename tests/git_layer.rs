@@ -1,6 +1,6 @@
 mod common;
 use branchdiff::git::{self, GitError};
-use common::{git as run, Repo};
+use common::{git as run, repo_with_submodule, Repo, SeparateGitDir};
 use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
@@ -631,50 +631,6 @@ fn any_not_ignored_follows_every_ignore_source_and_the_index() {
     assert!(check(&["target/out", "src/lib.rs"]));
     assert!(check(&["kept.log"]));
     assert!(check(&["a.txt"]));
-}
-
-/// A repository whose git dir is outside its working tree, with `a.txt`
-/// committed on `develop` and then edited, so a diff from `develop` has content.
-struct SeparateGitDir {
-    _dir: tempfile::TempDir,
-    worktree: std::path::PathBuf,
-    git_dir: std::path::PathBuf,
-}
-
-impl SeparateGitDir {
-    fn new() -> Self {
-        let dir = tempfile::TempDir::new().unwrap();
-        let base = dir.path().canonicalize().unwrap();
-        let (worktree, git_dir) = (base.join("worktree"), base.join("elsewhere.git"));
-        let separate = format!("--separate-git-dir={}", git_dir.display());
-        run(&base, &["init", "-q", "-b", "develop", &separate, worktree.to_str().unwrap()]);
-        run(&worktree, &["config", "user.email", "test@example.com"]);
-        run(&worktree, &["config", "user.name", "Test"]);
-        std::fs::write(worktree.join("a.txt"), "one\n").unwrap();
-        run(&worktree, &["add", "."]);
-        run(&worktree, &["commit", "-qm", "init"]);
-        run(&worktree, &["switch", "-qc", "feat"]);
-        std::fs::write(worktree.join("a.txt"), "two\n").unwrap();
-        Self { _dir: dir, worktree, git_dir }
-    }
-}
-
-/// A superproject with `Repo::main` added as the submodule `sub`, on a new
-/// branch, with `a.txt` edited. Returns the superproject and the submodule.
-fn repo_with_submodule(repo: &Repo) -> (std::path::PathBuf, std::path::PathBuf) {
-    let base = repo.main.parent().unwrap().canonicalize().unwrap();
-    let superproject = base.join("super");
-    std::fs::create_dir(&superproject).unwrap();
-    run(&superproject, &["init", "-q", "-b", "develop"]);
-    run(&superproject, &["config", "user.email", "test@example.com"]);
-    run(&superproject, &["config", "user.name", "Test"]);
-    run(&superproject, &["commit", "-qm", "init", "--allow-empty"]);
-    let source = base.join("main");
-    run(&superproject, &["-c", "protocol.file.allow=always", "submodule", "--quiet", "add", source.to_str().unwrap(), "sub"]);
-    let sub = superproject.join("sub");
-    run(&sub, &["switch", "-qc", "feat"]);
-    std::fs::write(sub.join("a.txt"), "edited\n").unwrap();
-    (superproject, sub)
 }
 
 fn paths(wts: &[git::Worktree]) -> Vec<std::path::PathBuf> {

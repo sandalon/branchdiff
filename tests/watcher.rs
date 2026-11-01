@@ -6,7 +6,7 @@ mod common;
 use branchdiff::git;
 use branchdiff::watch::{self, Command};
 use branchdiff::worker::Msg;
-use common::{git as run, Repo};
+use common::{git as run, repo_with_submodule, Repo, SeparateGitDir};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,6 +99,17 @@ impl Session {
 
     fn saw_list_change(&self) -> bool {
         self.saw(|m| matches!(m, Msg::WorktreesChanged))
+    }
+
+    /// Commits whatever is staged, and fails if any other worktree gets a badge.
+    fn assert_commit_marks_only(&self, root: &Path) {
+        run(root, &["commit", "-qm", "work", "--allow-empty"]);
+        assert_eq!(self.next_stale().as_deref(), Some(root));
+        while let Ok(msg) = self.msgs.recv_timeout(QUIET) {
+            if let Msg::Stale(other) = msg {
+                assert_eq!(other, root);
+            }
+        }
     }
 
     fn assert_no_msg(&self, context: &str) {
@@ -320,4 +331,72 @@ fn the_thread_ends_when_the_command_sender_is_dropped() {
     drop(cmds);
     // The thread holds the only sender, so the channel closes when it ends.
     assert!(matches!(rx.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected)));
+}
+
+#[test]
+fn a_commit_in_a_normal_repository_marks_only_the_worktree_it_happened_in() {
+    let (repo, main, common) = repo_with_main();
+    let linked = repo.add_worktree("feat").canonicalize().unwrap();
+    let session = Session::start(&common, &[&main, &linked]);
+    session.assert_commit_marks_only(&main);
+    session.assert_commit_marks_only(&linked);
+}
+
+#[test]
+fn a_commit_in_a_separate_git_dir_marks_its_main_worktree() {
+    let repo = SeparateGitDir::new();
+    run(&repo.worktree, &["add", "a.txt"]);
+    let session = Session::start(&repo.git_dir, &[&repo.worktree]);
+    session.assert_commit_marks_only(&repo.worktree);
+    // Nothing is staged now, so only the reflog changes.
+    session.assert_commit_marks_only(&repo.worktree);
+}
+
+#[test]
+fn a_commit_in_a_submodule_marks_its_main_worktree() {
+    let repo = Repo::new();
+    let (_superproject, sub) = repo_with_submodule(&repo);
+    run(&sub, &["add", "a.txt"]);
+    let common = git::discover(&sub).unwrap().common_dir;
+    let session = Session::start(&common, &[&sub]);
+    session.assert_commit_marks_only(&sub);
+    session.assert_commit_marks_only(&sub);
+}
+
+#[test]
+fn switching_branch_refreshes_the_list_when_dot_git_is_a_file() {
+    let separate = SeparateGitDir::new();
+    let repo = Repo::new();
+    let (_superproject, sub) = repo_with_submodule(&repo);
+    let common = git::discover(&sub).unwrap().common_dir;
+    for (common, root) in [(&separate.git_dir, &separate.worktree), (&common, &sub)] {
+        let session = Session::start(common, &[root]);
+        run(root, &["switch", "-qc", "next"]);
+        assert!(session.saw_list_change(), "{}", root.display());
+    }
+}
+
+#[test]
+fn commits_in_a_separate_git_dir_mark_the_right_worktree() {
+    let repo = SeparateGitDir::new();
+    let linked = repo.worktree.parent().unwrap().join("linked");
+    run(&repo.worktree, &["worktree", "add", "-q", "-b", "linked", linked.to_str().unwrap()]);
+    let session = Session::start(&repo.git_dir, &[&repo.worktree, &linked]);
+    session.assert_commit_marks_only(&linked);
+    session.assert_commit_marks_only(&repo.worktree);
+}
+
+/// The linked worktree shares the name `sub` with the submodule's git dir, which
+/// is what the main worktree's `.git` file ends in.
+#[test]
+fn commits_in_a_submodule_mark_the_right_worktree_even_with_the_same_name() {
+    let repo = Repo::new();
+    let (superproject, sub) = repo_with_submodule(&repo);
+    let linked = superproject.parent().unwrap().join("linked/sub");
+    run(&sub, &["worktree", "add", "-q", "-b", "other", linked.to_str().unwrap()]);
+    let common = git::discover(&sub).unwrap().common_dir;
+    // Main goes last, so that it would take over the shared name if it were kept.
+    let session = Session::start(&common, &[&linked, &sub]);
+    session.assert_commit_marks_only(&linked);
+    session.assert_commit_marks_only(&sub);
 }
