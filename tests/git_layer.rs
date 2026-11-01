@@ -748,6 +748,19 @@ fn a_detached_worktree_with_no_rebase_has_no_branch() {
     assert_eq!(branch_of(&wt), None);
 }
 
+/// Without `GIT_OPTIONAL_LOCKS=0`, `git status` refreshes a stat-dirty entry and
+/// rewrites the index, which the watcher would report as a change in the worktree.
+#[test]
+fn a_fingerprint_leaves_a_stat_dirty_index_untouched() {
+    let repo = Repo::new();
+    let index = repo.main.join(".git/index");
+    set_mtime(&repo.main.join("a.txt"), 1_000_000);
+    let before = std::fs::read(&index).unwrap();
+
+    git::fingerprint(&repo.main).unwrap();
+    assert!(std::fs::read(&index).unwrap() == before, "the index was rewritten");
+}
+
 /// Loads `path` with a real worker, for a key to probe against.
 fn loaded_key(pool: &Pool, msgs: &Receiver<Msg>, path: &std::path::Path) -> CacheKey {
     pool.submit(Job::Load { path: path.to_path_buf(), base: "develop".into() });
@@ -817,6 +830,17 @@ fn a_probe_sees_an_edit_a_stage_and_a_commit() {
 
     run(&repo.main, &["commit", "-qm", "edit"]);
     assert!(probe(&pool, &msgs, &staged));
+}
+
+#[test]
+fn a_probe_sees_a_new_head_when_the_fingerprint_is_unchanged() {
+    let repo = Repo::new();
+    let (pool, msgs) = pool();
+    let key = loaded_key(&pool, &msgs, &repo.main);
+
+    run(&repo.main, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+    assert_eq!(git::fingerprint(&repo.main).unwrap(), key.fingerprint);
+    assert!(probe(&pool, &msgs, &key));
 }
 
 #[test]
