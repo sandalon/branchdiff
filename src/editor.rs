@@ -6,9 +6,10 @@ pub fn default_editor() -> String {
     pick(|name| std::env::var(name).ok())
 }
 
-/// `VISUAL` wins, as it does for git. Unlike git, a blank value counts as unset.
+/// `VISUAL` wins, as it does for git. Unlike git, a value that names no program
+/// counts as unset.
 fn pick(var: impl Fn(&str) -> Option<String>) -> String {
-    let set = |name| var(name).filter(|value| !value.trim().is_empty());
+    let set = |name| var(name).filter(|value| split(value).is_some());
     set("VISUAL").or_else(|| set("EDITOR")).unwrap_or_else(|| FALLBACK.into())
 }
 
@@ -29,7 +30,11 @@ fn words(editor: &str) -> Vec<String> {
                 quote = Some(c);
                 word.get_or_insert_default();
             }
-            (None, '\\') if !cfg!(windows) => word.get_or_insert_default().extend(chars.next()),
+            (None, '\\') if !cfg!(windows) => {
+                if let Some(next) = chars.next() {
+                    word.get_or_insert_default().push(next);
+                }
+            }
             (None, _) if c.is_whitespace() => words.extend(word.take()),
             (None, _) => word.get_or_insert_default().push(c),
         }
@@ -38,12 +43,18 @@ fn words(editor: &str) -> Vec<String> {
     words
 }
 
+/// The program and arguments in `editor`, or `None` if it names no program, in
+/// which case any arguments belonged to nothing and go with it.
+fn split(editor: &str) -> Option<(String, Vec<String>)> {
+    let mut words = words(editor).into_iter();
+    let prog = words.next().filter(|prog| !prog.trim().is_empty())?;
+    Some((prog, words.collect()))
+}
+
 /// Builds the program and arguments that open `path` at `line`. `path` is
 /// absolute, so even a file named `-x` can't be taken for an option.
 pub fn command(editor: &str, path: &Path, line: u32) -> (String, Vec<String>) {
-    let mut parts = words(editor).into_iter();
-    let prog = parts.next().unwrap_or_else(|| FALLBACK.into());
-    let mut args: Vec<String> = parts.collect();
+    let (prog, mut args) = split(editor).unwrap_or_else(|| (FALLBACK.into(), Vec::new()));
     let name = Path::new(&prog).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
     let file = path.display().to_string();
     let at_line = format!("{file}:{line}");
@@ -138,16 +149,66 @@ mod tests {
         assert_eq!(args(r#""C:\Program Files\Vim\gvim.exe" -f"#).0, r"C:\Program Files\Vim\gvim.exe");
     }
 
+    fn picked(visual: &str, editor: &str) -> String {
+        pick(|name| Some(if name == "VISUAL" { visual } else { editor }.to_string()))
+    }
+
     #[test]
     fn a_blank_value_counts_as_unset() {
-        let from = |visual: &'static str, editor: &'static str| {
-            pick(move |name| Some(if name == "VISUAL" { visual } else { editor }.to_string()))
-        };
-        assert_eq!(from("hx", "nano"), "hx");
-        assert_eq!(from("", "nano"), "nano");
-        assert_eq!(from("  ", "nano"), "nano");
-        assert_eq!(from("", " "), FALLBACK);
+        assert_eq!(picked("hx", "nano"), "hx");
+        assert_eq!(picked("", "nano"), "nano");
+        assert_eq!(picked("  ", "nano"), "nano");
+        assert_eq!(picked("", " "), FALLBACK);
         assert_eq!(pick(|_| None), FALLBACK);
         assert_eq!(args("  ").0, FALLBACK);
+    }
+
+    #[test]
+    fn a_value_with_no_real_program_counts_as_unset() {
+        let fallback = args(FALLBACK);
+        for blank in ["\"\"", "''", "\"\" vim", "'' ''", "\"", "'", "\"   \"", "'   ' -w"] {
+            assert_eq!(args(blank), fallback, "{blank}");
+            assert_eq!(picked(blank, "nano"), "nano", "{blank}");
+            assert_eq!(picked("hx", blank), "hx", "{blank}");
+            assert_eq!(picked(blank, blank), FALLBACK, "{blank}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_trailing_backslash_adds_no_word() {
+        assert_eq!(args("vim \\").1, vec!["+7", "/r/a.rs"]);
+        assert_eq!(args("\\"), args(FALLBACK));
+        assert_eq!(picked("\\", "nano"), "nano");
+    }
+
+    #[test]
+    fn a_quote_is_closed_only_by_its_own_kind() {
+        let (prog, a) = args("\"/opt/it's/vim\" -u NONE");
+        assert_eq!(prog, "/opt/it's/vim");
+        assert_eq!(a, vec!["-u", "NONE", "+7", "/r/a.rs"]);
+        assert_eq!(args("'/opt/a\"b/vim'").0, "/opt/a\"b/vim");
+    }
+
+    #[test]
+    fn an_empty_quoted_argument_is_kept() {
+        assert_eq!(args("vim -u ''").1, vec!["-u", "", "+7", "/r/a.rs"]);
+    }
+
+    #[test]
+    fn every_name_of_an_editor_gets_its_form_of_the_line() {
+        let goto = vec!["--wait", "--goto", "/r/a.rs:7"];
+        assert_eq!(args("vi").1, vec!["+7", "/r/a.rs"]);
+        for editor in ["code-insiders", "windsurf", "codium"] {
+            assert_eq!(args(editor).1, goto, "{editor}");
+        }
+        assert_eq!(args("helix").1, vec!["/r/a.rs:7"]);
+    }
+
+    #[test]
+    fn the_name_ignores_case_and_an_extension() {
+        assert_eq!(args("VIM").1, vec!["+7", "/r/a.rs"]);
+        assert_eq!(args("vim.exe").1, vec!["+7", "/r/a.rs"]);
+        assert_eq!(args("Code.exe").1, vec!["--wait", "--goto", "/r/a.rs:7"]);
     }
 }
