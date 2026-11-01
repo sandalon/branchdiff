@@ -4175,6 +4175,8 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
 
     // Workers mostly wait on git, so few CPUs is no reason for few threads.
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 8));
+    let watcher = watch::spawn(info.common_dir.clone(), msg_tx.clone());
+    let watch_failed = watcher.is_err();
     let mut rt = Runtime {
         pool: Pool::new(threads, msg_tx.clone()),
         loads: Loads::default(),
@@ -4183,11 +4185,14 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
         clipboard: None,
         paused,
         repo: info.toplevel.clone(),
-        watch: watch::spawn(info.common_dir.clone(), msg_tx).ok(),
+        watch: watcher.ok(),
         highlighting: HashSet::new(),
     };
     let mut app = App::new(base);
     app.truecolor = supports_truecolor();
+    if watch_failed {
+        app.notice = Some("File watching is unavailable, so the changed badge will not appear".into());
+    }
     rt.pool.submit(Job::ListWorktrees { cwd: rt.repo.clone() });
 
     loop {
@@ -4678,7 +4683,7 @@ The Linux build depends on the system libc. `arboard` is built with `wayland-dat
 
 **Step 3: Write `README.md`**
 
-Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from `HELP` in `src/ui.rs`, which adds `q` and `Esc` for prompts, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside, and that colours assume a dark background, so context rows can be hard to read on a light terminal.
+Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from `HELP` in `src/ui.rs`, which adds `q` and `Esc` for prompts, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, that ignored files written inside a submodule can show it falsely, that the badge can also appear falsely after a first build or after renaming an ignored directory, that on Linux a low inotify limit makes the badge incomplete and shows a notice, that on macOS a worktree reached through a symlink created after it was added won't show the badge for file edits, that on Windows deleting a worktree's directory by hand isn't noticed until the list next refreshes, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside, and that colours assume a dark background, so context rows can be hard to read on a light terminal.
 
 **Step 4: Verify the final state**
 
