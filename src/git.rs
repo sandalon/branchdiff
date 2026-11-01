@@ -176,7 +176,24 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, GitError> {
             None => drop(list.remove(0)),
         }
     }
+    for w in list.iter_mut().filter(|w| w.branch.is_none()) {
+        w.branch = rebasing_branch(&w.path);
+    }
     Ok(list)
+}
+
+/// The branch being rebased in a worktree, which git lists as detached until the
+/// rebase ends. Rebasing a detached HEAD records no ref, so that gives `None`.
+fn rebasing_branch(worktree: &Path) -> Option<String> {
+    let dir = absolute_git_dir(worktree)?;
+    let name = ["rebase-merge", "rebase-apply"].iter()
+        .find_map(|state| std::fs::read_to_string(dir.join(state).join("head-name")).ok())?;
+    name.trim().strip_prefix("refs/heads/").map(String::from)
+}
+
+fn absolute_git_dir(cwd: &Path) -> Option<PathBuf> {
+    let text = ok_stdout(run(cwd, ["rev-parse", "--absolute-git-dir"]).ok()?).ok()?;
+    Some(text.trim_end().into())
 }
 
 /// The working tree of a git dir that lives outside it. A submodule's git dir
@@ -184,8 +201,7 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, GitError> {
 /// that working tree, and a linked worktree's own toplevel would be the wrong one.
 fn main_worktree_root(cwd: &Path, git_dir: &Path) -> Option<PathBuf> {
     toplevel(git_dir).or_else(|| {
-        let here = ok_stdout(run(cwd, ["rev-parse", "--absolute-git-dir"]).ok()?).ok()?;
-        if Path::new(here.trim_end()) == git_dir { toplevel(cwd) } else { None }
+        if absolute_git_dir(cwd)? == git_dir { toplevel(cwd) } else { None }
     })
 }
 
@@ -346,8 +362,7 @@ pub fn core_editor(cwd: &Path) -> Option<String> {
 
 /// The operation in progress in this worktree, if it is a rebase or a merge.
 pub fn in_progress_op(cwd: &Path) -> Option<&'static str> {
-    let text = ok_stdout(run(cwd, ["rev-parse", "--absolute-git-dir"]).ok()?).ok()?;
-    let dir = PathBuf::from(text.trim());
+    let dir = absolute_git_dir(cwd)?;
     if dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists() {
         Some("rebase")
     } else if dir.join("MERGE_HEAD").exists() {

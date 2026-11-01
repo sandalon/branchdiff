@@ -673,6 +673,78 @@ fn a_submodule_seen_from_its_linked_worktree_keeps_both() {
     assert_eq!(paths(&git::list_worktrees(&linked).unwrap()), vec![sub, linked]);
 }
 
+/// Leaves `feat` stopped at a conflict, partway through rebasing onto `develop`.
+fn stop_at_a_rebase_conflict(repo: &Repo, wt: &std::path::Path, args: &[&str]) {
+    std::fs::write(wt.join("a.txt"), "ours\n").unwrap();
+    repo.commit_all(wt, "feat");
+    std::fs::write(repo.main.join("a.txt"), "theirs\n").unwrap();
+    repo.commit_all(&repo.main, "develop");
+    let mut rebase = vec!["rebase"];
+    rebase.extend_from_slice(args);
+    rebase.push("develop");
+    assert!(!common::git_unchecked(wt, &rebase).status.success());
+}
+
+fn branch_of(wt: &std::path::Path) -> Option<String> {
+    let list = git::list_worktrees(wt).unwrap();
+    list.into_iter().find(|w| w.path == real(wt)).unwrap().branch
+}
+
+#[test]
+fn a_worktree_keeps_its_branch_during_a_rebase() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    stop_at_a_rebase_conflict(&repo, &wt, &[]);
+    assert_eq!(branch_of(&wt).as_deref(), Some("feat"));
+    assert_eq!(git::list_worktrees(&repo.main).unwrap().iter().filter(|w| w.branch.as_deref() == Some("feat")).count(), 1);
+
+    run(&wt, &["rebase", "--abort"]);
+    assert_eq!(branch_of(&wt).as_deref(), Some("feat"));
+}
+
+#[test]
+fn a_worktree_keeps_its_branch_during_an_apply_rebase() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    stop_at_a_rebase_conflict(&repo, &wt, &["--apply"]);
+    assert_eq!(branch_of(&wt).as_deref(), Some("feat"));
+}
+
+#[test]
+fn a_main_worktree_keeps_its_branch_during_a_rebase() {
+    let repo = Repo::new();
+    run(&repo.main, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(repo.main.join("a.txt"), "ours\n").unwrap();
+    repo.commit_all(&repo.main, "feat");
+    run(&repo.main, &["checkout", "-q", "develop"]);
+    std::fs::write(repo.main.join("a.txt"), "theirs\n").unwrap();
+    repo.commit_all(&repo.main, "develop");
+    run(&repo.main, &["checkout", "-q", "feat"]);
+    assert!(!common::git_unchecked(&repo.main, &["rebase", "develop"]).status.success());
+    assert_eq!(branch_of(&repo.main).as_deref(), Some("feat"));
+}
+
+#[test]
+fn a_detached_rebase_has_no_branch() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    std::fs::write(wt.join("a.txt"), "ours\n").unwrap();
+    repo.commit_all(&wt, "feat");
+    run(&wt, &["checkout", "-q", "--detach"]);
+    std::fs::write(repo.main.join("a.txt"), "theirs\n").unwrap();
+    repo.commit_all(&repo.main, "develop");
+    assert!(!common::git_unchecked(&wt, &["rebase", "develop"]).status.success());
+    assert_eq!(branch_of(&wt), None);
+}
+
+#[test]
+fn a_detached_worktree_with_no_rebase_has_no_branch() {
+    let repo = Repo::new();
+    let wt = repo.add_worktree("feat");
+    run(&wt, &["checkout", "-q", "--detach"]);
+    assert_eq!(branch_of(&wt), None);
+}
+
 #[test]
 fn core_editor_is_read_from_the_repository_config() {
     let repo = Repo::new();
