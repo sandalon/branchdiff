@@ -79,19 +79,23 @@ pub fn command(editor: &str, path: &Path, line: u32) -> (String, Vec<String>) {
     (prog, args)
 }
 
-/// Runs `f` so that Ctrl-C can't end this process. Raw mode is off while an
-/// editor runs, so the terminal signals both the editor and us. This installs a
-/// handler that does nothing rather than ignoring the signal, because an ignored
-/// signal stays ignored in a child, while a handler goes back to the default.
+/// Runs `f` so that Ctrl-C and Ctrl-\ can't end this process, as git does. Raw
+/// mode is off while an editor runs, so the terminal signals both the editor and
+/// us. This installs a handler that does nothing rather than ignoring the signal,
+/// because an ignored signal stays ignored in a child, while a handler goes back
+/// to the default.
 #[cfg(unix)]
 pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     extern "C" fn do_nothing(_: libc::c_int) {}
     let handler: extern "C" fn(libc::c_int) = do_nothing;
     // SAFETY: the handler touches nothing, and these calls only swap the
-    // process's SIGINT disposition.
-    let previous = unsafe { libc::signal(libc::SIGINT, handler as libc::sighandler_t) };
+    // process's disposition of each signal.
+    let previous = [libc::SIGINT, libc::SIGQUIT]
+        .map(|signal| (signal, unsafe { libc::signal(signal, handler as libc::sighandler_t) }));
     let result = f();
-    unsafe { libc::signal(libc::SIGINT, previous) };
+    for (signal, handler) in previous {
+        unsafe { libc::signal(signal, handler) };
+    }
     result
 }
 
@@ -271,26 +275,28 @@ mod tests {
     /// One test, because a signal's handling is shared by the whole process.
     #[cfg(unix)]
     #[test]
-    fn ctrl_c_during_an_editor_reaches_only_the_editor() {
+    fn terminal_signals_during_an_editor_reach_only_the_editor() {
         use std::process::{Command, ExitStatus};
         fn shell(script: &str) -> ExitStatus {
             without_interrupts(|| Command::new("sh").args(["-c", script]).status().unwrap())
         }
-        fn current_handler() -> libc::sighandler_t {
+        fn current_handler(signal: libc::c_int) -> libc::sighandler_t {
             // SAFETY: a null action only reads, and `old` is valid to write.
             unsafe {
                 let mut old: libc::sigaction = std::mem::zeroed();
-                assert_eq!(libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old), 0);
+                assert_eq!(libc::sigaction(signal, std::ptr::null(), &mut old), 0);
                 old.sa_sigaction
             }
         }
 
-        let before = current_handler();
-        // Without the hold, this kills the test process.
-        assert_eq!(shell("kill -INT $PPID; exit 3").code(), Some(3));
-        // A signal left ignored would stay ignored in the editor, which would
-        // reach `exit 3` here. It must die of the signal instead.
-        assert_eq!(shell("kill -INT $$; exit 3").code(), None);
-        assert_eq!(current_handler(), before);
+        let before = [libc::SIGINT, libc::SIGQUIT].map(current_handler);
+        for name in ["INT", "QUIT"] {
+            // Without the hold, this kills the test process.
+            assert_eq!(shell(&format!("kill -{name} $PPID; exit 3")).code(), Some(3), "{name}");
+            // A signal left ignored would stay ignored in the editor, which would
+            // reach `exit 3` here. It must die of the signal instead.
+            assert_eq!(shell(&format!("kill -{name} $$; exit 3")).code(), None, "{name}");
+        }
+        assert_eq!([libc::SIGINT, libc::SIGQUIT].map(current_handler), before);
     }
 }
