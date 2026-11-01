@@ -4,7 +4,7 @@ use branchdiff::app::{coalesce_saves, App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
-use branchdiff::worker::{Job, Loads, Msg, Pool, Probes, Reaction, WORKER_THREAD};
+use branchdiff::worker::{Job, Lists, Loads, Msg, Pool, Probes, Reaction, WORKER_THREAD};
 use branchdiff::{config, editor, signals, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
@@ -88,6 +88,7 @@ struct Runtime {
     pool: Pool,
     loads: Loads,
     probes: Probes,
+    lists: Lists,
     store: Store,
     common_dir: PathBuf,
     /// Opened on first copy, then kept alive because on Linux this process
@@ -150,6 +151,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Opt
         pool: Pool::new(threads, msg_tx.clone()),
         loads: Loads::default(),
         probes: Probes::default(),
+        lists: Lists::default(),
         store: Store::new(&info.common_dir),
         common_dir: info.common_dir.clone(),
         clipboard: None,
@@ -164,7 +166,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Opt
     if watch_failed {
         app.notice = Some("File watching is unavailable, so the changed badge will not appear".into());
     }
-    rt.pool.submit(Job::ListWorktrees { cwd: rt.repo.clone() });
+    request_list(&app, &mut rt);
 
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
@@ -210,6 +212,12 @@ fn on_event(app: &mut App, ev: Event) -> Vec<Effect> {
     }
 }
 
+fn request_list(app: &App, rt: &mut Runtime) {
+    if rt.lists.request() {
+        rt.pool.submit(Job::ListWorktrees { cwd: rt.repo_dir(app) });
+    }
+}
+
 /// Finds out whether a worktree really changed before showing it.
 fn report_change(app: &mut App, rt: &mut Runtime, path: &Path) {
     match rt.probes.on_change(rt.loads.is_running(path), app.key_for(path)) {
@@ -234,6 +242,9 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
             app.handle_msg(Msg::Stale(path.clone()));
         }
         return Vec::new();
+    }
+    if matches!(msg, Msg::Worktrees(_)) && rt.lists.finished() {
+        rt.pool.submit(Job::ListWorktrees { cwd: rt.repo_dir(app) });
     }
     let mut changed_during_load = None;
     if let Msg::Loaded { path, .. } = &msg {
@@ -294,7 +305,7 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
                 rt.pool.submit(job);
             }
         }
-        Effect::ReloadWorktrees => rt.pool.submit(Job::ListWorktrees { cwd: rt.repo_dir(app) }),
+        Effect::ReloadWorktrees => request_list(app, rt),
         Effect::ListBranches => rt.pool.submit(Job::ListBranches { cwd: rt.repo_dir(app) }),
         Effect::Highlight { key, file_index, diffs } => {
             // Holding `n` would otherwise queue a job per file passed and

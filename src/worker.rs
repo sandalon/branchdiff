@@ -182,6 +182,31 @@ impl Probes {
     }
 }
 
+/// Allows one worktree list at a time. The newest list applied wins, so one that
+/// took longer than a later one would undo what that one found. A request made
+/// during a list waits and starts once that list has finished, which also means
+/// a burst of requests runs just one more.
+#[derive(Default)]
+pub struct Lists {
+    running: bool,
+    waiting: bool,
+}
+
+impl Lists {
+    /// Answers whether to submit a list now.
+    pub fn request(&mut self) -> bool {
+        self.waiting = self.running;
+        self.running = true;
+        !self.waiting
+    }
+
+    /// Call for every finished list. Answers whether to submit the waiting one.
+    pub fn finished(&mut self) -> bool {
+        self.running = std::mem::take(&mut self.waiting);
+        self.running
+    }
+}
+
 pub struct Pool {
     jobs: Sender<Job>,
 }
@@ -602,6 +627,43 @@ mod tests {
         let done = Probes::default().finished("a".as_ref(), true, Some(key(1)));
         assert!(!done.raise);
         assert!(done.next.is_none());
+    }
+
+    #[test]
+    fn only_one_worktree_list_runs_at_a_time() {
+        let mut lists = Lists::default();
+        assert!(lists.request());
+        assert!(!lists.request());
+    }
+
+    #[test]
+    fn a_burst_during_a_list_runs_exactly_one_more_after_it() {
+        let mut lists = Lists::default();
+        lists.request();
+        for _ in 0..50 {
+            assert!(!lists.request());
+        }
+        assert!(lists.finished());
+        // The re-run counts as running, and nothing waits behind it.
+        assert!(!lists.request());
+        assert!(lists.finished());
+        assert!(!lists.finished());
+        assert!(lists.request());
+    }
+
+    #[test]
+    fn a_finished_list_with_nothing_waiting_allows_a_new_one() {
+        let mut lists = Lists::default();
+        lists.request();
+        assert!(!lists.finished());
+        assert!(lists.request());
+    }
+
+    #[test]
+    fn a_stray_finish_leaves_nothing_running() {
+        let mut lists = Lists::default();
+        assert!(!lists.finished());
+        assert!(lists.request());
     }
 
     #[test]
