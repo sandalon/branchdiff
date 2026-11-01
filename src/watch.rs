@@ -176,9 +176,9 @@ fn roots_to_rescan(event: &Event, watched: &HashSet<PathBuf>) -> Vec<PathBuf> {
 pub fn spawn(common_dir: PathBuf, msgs: Sender<Msg>) -> notify::Result<Sender<Command>> {
     let (fs_tx, fs_rx) = unbounded::<notify::Result<Event>>();
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
-    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |e| {
-        let _ = fs_tx.send(e);
-    })?;
+    // Off, because `git check-ignore` fails for a path that goes through a symlink.
+    let config = notify::Config::default().with_follow_symlinks(false);
+    let mut watcher = RecommendedWatcher::new(move |e| { let _ = fs_tx.send(e); }, config)?;
     // Recursive, because `worktrees` may not exist yet, is deleted along with the
     // last linked worktree, and holds their index files. A bare repository has
     // no worktree of its own to cover it.
