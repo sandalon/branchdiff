@@ -5,10 +5,12 @@ use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
 use branchdiff::worker::{Job, Loads, Msg, Pool, WORKER_THREAD};
-use branchdiff::{config, editor, ui, watch};
+use branchdiff::{config, editor, signals, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::DefaultTerminal;
@@ -40,12 +42,17 @@ fn main() -> Result<()> {
     };
     let base = cli.base.or(configured).unwrap_or_else(|| "develop".into());
 
+    signals::catch_quit_signals();
     let mut terminal = ratatui::try_init().context("could not start the terminal")?;
     keep_terminal_on_worker_panic();
     set_bracketed_paste(true);
     let result = run(&mut terminal, info, base, config_problem);
+    let _ = terminal.show_cursor();
     set_bracketed_paste(false);
-    ratatui::restore();
+    // Not `ratatui::restore` or the terminal's drop, which both panic writing
+    // their own error to a terminal that has hung up.
+    let _ = ratatui::try_restore();
+    std::mem::forget(terminal);
     result
 }
 
@@ -115,10 +122,23 @@ fn spawn_input(tx: Sender<Event>, paused: Arc<AtomicBool>) {
     });
 }
 
+/// Sends Ctrl-C after a quit signal, because that quits from every state, so
+/// `run` ends the normal way once any editor has finished. Separate from
+/// `spawn_input` because crossterm's poll never returns once the terminal hangs up.
+fn spawn_quit_watch(tx: Sender<Event>) {
+    std::thread::spawn(move || {
+        while !signals::quit_requested() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = tx.send(Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    });
+}
+
 fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Option<String>) -> Result<()> {
     let (msg_tx, msg_rx) = unbounded::<Msg>();
     let (key_tx, key_rx) = unbounded::<Event>();
     let paused = Arc::new(AtomicBool::new(false));
+    spawn_quit_watch(key_tx.clone());
     spawn_input(key_tx, paused.clone());
 
     // Workers mostly wait on git, so few CPUs is no reason for few threads.
@@ -300,7 +320,7 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
     let status = editor::without_interrupts(|| -> Result<_> {
         terminal.show_cursor()?;
         set_bracketed_paste(false);
-        ratatui::restore();
+        let _ = ratatui::try_restore();
         let status = std::process::Command::new(&prog).args(&args).status();
         // Not `ratatui::init`, which would stack a new panic hook over ours.
         enable_raw_mode()?;

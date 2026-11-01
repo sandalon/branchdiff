@@ -7,6 +7,7 @@ pub mod export;
 pub mod fuzzy;
 pub mod git;
 pub mod highlight;
+pub mod signals;
 pub mod store;
 pub mod ui;
 pub mod watch;
