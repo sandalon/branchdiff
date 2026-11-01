@@ -687,14 +687,21 @@ mod tests {
         paths.into_iter().next().unwrap().to_str().unwrap().to_string()
     }
 
+    /// The stored form of a removed directory: the path with the platform's
+    /// separator appended, which `add_path` uses to mark a directory. Windows
+    /// appends `\`, so the literal `/` expectation would fail there.
+    fn removed_dir() -> String {
+        format!("/r/target{}", std::path::MAIN_SEPARATOR)
+    }
+
     #[test]
     fn a_removed_directory_keeps_its_slash_for_dir_only_rules() {
-        assert_eq!(stored_path(EventKind::Remove(RemoveKind::Folder)), "/r/target/");
+        assert_eq!(stored_path(EventKind::Remove(RemoveKind::Folder)), removed_dir());
     }
 
     #[test]
     fn windows_cannot_say_what_was_removed_so_any_removal_may_be_a_directory() {
-        assert_eq!(stored_path(EventKind::Remove(RemoveKind::Any)), "/r/target/");
+        assert_eq!(stored_path(EventKind::Remove(RemoveKind::Any)), removed_dir());
     }
 
     #[test]

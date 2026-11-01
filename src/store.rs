@@ -5,11 +5,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 /// Longest encoded name kept whole. File names are usually limited to 255
 /// bytes, and this leaves room for the prefix and every suffix the store adds.
 const MAX_ENCODED_LEN: usize = 200;
+
+/// Windows refuses to replace a file that is momentarily open elsewhere, so a
+/// rename can fail for a short window where Unix would succeed. Retrying a few
+/// times keeps the "last save wins" behaviour in practice.
+const PERSIST_RETRIES: usize = 20;
+const PERSIST_RETRY: Duration = Duration::from_millis(10);
 
 /// Which file version `Comment::line` counts in. A replaced line has the
 /// same number on both sides, so the number alone is ambiguous.
@@ -114,20 +121,67 @@ impl Store {
 
     /// Review files end up 0600, which suits private review notes.
     fn replace(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        let mut tmp = NamedTempFile::new_in(&self.dir)?;
+        let dir = fs_path(&self.dir);
+        fs::create_dir_all(&dir)?;
+        let mut tmp = NamedTempFile::new_in(&dir)?;
         tmp.write_all(bytes)?;
         // Otherwise a power loss can keep the rename but not the data, leaving
         // an empty file in place of the review.
         tmp.as_file().sync_all()?;
-        tmp.persist(path).map(drop).map_err(|e| e.error)
+        persist_with_retry(tmp, &fs_path(path))
     }
+}
+
+/// Adds the `\\?\` verbatim prefix on Windows, which lifts the 260-character
+/// `MAX_PATH` limit so a review file for a very long branch name under a long
+/// repo path still saves. `git rev-parse --path-format=absolute` already gives
+/// absolute, backslash-separated paths on Windows, which the prefix requires.
+/// Relative and already-prefixed paths, and every path off Windows, pass
+/// through unchanged.
+#[cfg(windows)]
+fn fs_path(path: &Path) -> PathBuf {
+    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().starts_with(b"\\\\?\\") {
+        return path.to_path_buf();
+    }
+    // A verbatim `\\?\` path must use backslashes throughout, never `/`.
+    let mut prefixed = String::from("\\\\?\\");
+    prefixed.push_str(&path.to_string_lossy().replace('/', "\\"));
+    PathBuf::from(prefixed)
+}
+
+#[cfg(not(windows))]
+fn fs_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Windows cannot atomically replace a file another thread or process has open:
+/// `persist` fails with "access is denied" for the moment the reader holds it,
+/// where Unix `rename` swaps the file regardless. Retrying for a short while
+/// keeps the "last save wins" behaviour, and every attempt renames the same
+/// completed temp file, so a partial review is never exposed.
+fn persist_with_retry(mut tmp: NamedTempFile, path: &Path) -> io::Result<()> {
+    let mut last = io::Error::new(ErrorKind::PermissionDenied, "persist failed");
+    for _ in 0..PERSIST_RETRIES {
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last = e.error;
+                if last.kind() != ErrorKind::PermissionDenied {
+                    // Not the transient open-file race; dropping `tmp` removes it.
+                    return Err(last);
+                }
+                tmp = e.file;
+                std::thread::sleep(PERSIST_RETRY);
+            }
+        }
+    }
+    Err(last)
 }
 
 /// Returns `None` if something is there that can't be used. A missing file is
 /// an empty review, including when a file sits where the store directory goes.
 fn read_review(path: &Path) -> Option<Review> {
-    match fs::read(path) {
+    match fs::read(fs_path(path)) {
         Ok(bytes) => serde_json::from_slice(&bytes).ok(),
         Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Some(Review::default()),
         Err(_) => None,
@@ -141,11 +195,11 @@ fn set_aside(path: &Path) -> io::Result<Option<PathBuf>> {
     // Two processes moving different bad files at the same instant can pick the same free name, which is accepted as too narrow to matter.
     let mut free = path.with_extension("json.corrupt");
     let mut n = 0;
-    while free.exists() {
+    while fs_path(&free).exists() {
         n += 1;
         free = path.with_extension(format!("json.corrupt.{n}"));
     }
-    match fs::rename(path, &free) {
+    match fs::rename(fs_path(path), fs_path(&free)) {
         Ok(()) => Ok(Some(free)),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
