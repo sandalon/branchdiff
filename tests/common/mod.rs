@@ -6,6 +6,17 @@ use tempfile::TempDir;
 
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
+/// `canonicalize` gives `\\?\C:\...` on Windows, which never equals git's `C:/...`.
+pub fn real(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap();
+    if cfg!(windows) {
+        if let Some(s) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            return PathBuf::from(s);
+        }
+    }
+    path
+}
+
 pub struct Repo {
     _dir: TempDir,
     pub main: PathBuf,
@@ -69,7 +80,7 @@ pub struct SeparateGitDir {
 impl SeparateGitDir {
     pub fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let base = dir.path().canonicalize().unwrap();
+        let base = real(dir.path());
         let (worktree, git_dir) = (base.join("worktree"), base.join("elsewhere.git"));
         let separate = format!("--separate-git-dir={}", git_dir.display());
         git(&base, &["init", "-q", "-b", "develop", &separate, worktree.to_str().unwrap()]);
@@ -87,7 +98,7 @@ impl SeparateGitDir {
 /// A superproject with `Repo::main` added as the submodule `sub`, on a new
 /// branch, with `a.txt` edited. Returns the superproject and the submodule.
 pub fn repo_with_submodule(repo: &Repo) -> (PathBuf, PathBuf) {
-    let base = repo.main.parent().unwrap().canonicalize().unwrap();
+    let base = real(repo.main.parent().unwrap());
     let superproject = base.join("super");
     std::fs::create_dir(&superproject).unwrap();
     git(&superproject, &["init", "-q", "-b", "develop"]);

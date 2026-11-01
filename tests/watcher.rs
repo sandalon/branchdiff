@@ -6,7 +6,7 @@ mod common;
 use branchdiff::git;
 use branchdiff::watch::{self, Command};
 use branchdiff::worker::Msg;
-use common::{git as run, repo_with_submodule, Repo, SeparateGitDir};
+use common::{git as run, real, repo_with_submodule, Repo, SeparateGitDir};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,15 +128,15 @@ impl Session {
 
 fn repo_with_main() -> (Repo, PathBuf, PathBuf) {
     let repo = Repo::new();
-    let main = repo.main.canonicalize().unwrap();
-    let common = git::discover(&repo.main).unwrap().common_dir.canonicalize().unwrap();
+    let main = real(&repo.main);
+    let common = real(&git::discover(&repo.main).unwrap().common_dir);
     (repo, main, common)
 }
 
 #[test]
 fn commit_in_a_linked_worktree_marks_it_without_touching_the_list() {
     let (repo, main, common) = repo_with_main();
-    let linked = repo.add_worktree("feat").canonicalize().unwrap();
+    let linked = real(&repo.add_worktree("feat"));
     std::fs::write(linked.join("new.txt"), "new\n").unwrap();
     let session = Session::start(&common, &[&main, &linked]);
 
@@ -162,7 +162,7 @@ fn commit_with_an_untouched_index_marks_the_main_worktree() {
 #[test]
 fn switching_branch_refreshes_the_list_from_any_worktree() {
     let (repo, main, common) = repo_with_main();
-    let linked = repo.add_worktree("feat").canonicalize().unwrap();
+    let linked = real(&repo.add_worktree("feat"));
     let session = Session::start(&common, &[&main, &linked]);
     for (root, branch) in [(&main, "next-main"), (&linked, "next-linked")] {
         run(root, &["switch", "-qc", branch]);
@@ -174,7 +174,7 @@ fn switching_branch_refreshes_the_list_from_any_worktree() {
 #[test]
 fn git_commands_in_a_linked_worktree_leave_the_list_alone() {
     let (repo, main, common) = repo_with_main();
-    let linked = repo.add_worktree("feat").canonicalize().unwrap();
+    let linked = real(&repo.add_worktree("feat"));
     let session = Session::start(&common, &[&main, &linked]);
     for args in [&["status"][..], &["diff"], &["log", "-1"], &["fetch", "-q", ".", "feat"], &["tag", "t"]] {
         run(&linked, args);
@@ -271,10 +271,12 @@ fn a_root_missing_at_first_is_watched_once_it_exists() {
     assert!(session.saw_stale(&later));
 }
 
+// Windows raises no event for the watched root itself.
+#[cfg(not(windows))]
 #[test]
 fn deleting_a_worktree_without_git_refreshes_the_list() {
     let (repo, main, common) = repo_with_main();
-    let linked = repo.add_worktree("feat").canonicalize().unwrap();
+    let linked = real(&repo.add_worktree("feat"));
     let session = Session::start(&common, &[&main, &linked]);
     std::fs::remove_dir_all(&linked).unwrap();
     assert!(session.saw_list_change());
@@ -298,7 +300,7 @@ fn a_commit_in_a_nested_worktree_marks_only_that_worktree() {
 #[test]
 fn a_bare_repository_reports_every_new_worktree_and_their_commits() {
     let repo = Repo::new();
-    let base = repo.main.parent().unwrap().canonicalize().unwrap();
+    let base = real(repo.main.parent().unwrap());
     let bare = base.join("bare.git");
     run(&base, &["clone", "-q", "--bare", "main", "bare.git"]);
     let session = Session::start(&bare, &[]);
@@ -336,7 +338,7 @@ fn the_thread_ends_when_the_command_sender_is_dropped() {
 #[test]
 fn a_commit_in_a_normal_repository_marks_only_the_worktree_it_happened_in() {
     let (repo, main, common) = repo_with_main();
-    let linked = repo.add_worktree("feat").canonicalize().unwrap();
+    let linked = real(&repo.add_worktree("feat"));
     let session = Session::start(&common, &[&main, &linked]);
     session.assert_commit_marks_only(&main);
     session.assert_commit_marks_only(&linked);

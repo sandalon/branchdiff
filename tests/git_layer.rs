@@ -1,6 +1,6 @@
 mod common;
 use branchdiff::git::{self, GitError};
-use common::{git as run, repo_with_submodule, Repo, SeparateGitDir};
+use common::{git as run, real, repo_with_submodule, Repo, SeparateGitDir};
 use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
@@ -8,7 +8,7 @@ fn discovers_common_dir_from_linked_worktree() {
     let repo = Repo::new();
     let wt = repo.add_worktree("feat");
     let info = git::discover(&wt).unwrap();
-    assert_eq!(info.common_dir.canonicalize().unwrap(), repo.main.join(".git").canonicalize().unwrap());
+    assert_eq!(real(&info.common_dir), real(&repo.main.join(".git")));
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn inherited_git_dir_child() {
     let Some(expected) = std::env::var_os(CHILD_COMMON_DIR) else { return };
     let info = git::discover(&std::env::current_dir().unwrap()).unwrap();
     let expected = std::path::PathBuf::from(expected);
-    assert_eq!(info.common_dir.canonicalize().unwrap(), expected.canonicalize().unwrap());
+    assert_eq!(real(&info.common_dir), real(&expected));
 }
 
 fn set_mtime(path: &std::path::Path, secs: u64) {
@@ -594,7 +594,7 @@ fn watcher_reports_stale_worktree_and_new_worktrees() {
     let info = git::discover(&repo.main).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let cmds = watch::spawn(info.common_dir.clone(), tx).unwrap();
-    let main = repo.main.canonicalize().unwrap();
+    let main = real(&repo.main);
     cmds.send(watch::Command::SetWorktrees(vec![main.clone()])).unwrap();
     // Applied on the watcher's thread. Starting an FSEvents stream takes about
     // 200 ms when run from `target/debug/deps`, and a write before that is lost.
@@ -707,7 +707,7 @@ fn a_superproject_does_not_list_its_submodules() {
 #[test]
 fn a_bare_repository_is_skipped_when_seen_from_its_linked_worktree() {
     let repo = Repo::new();
-    let base = repo.main.parent().unwrap().canonicalize().unwrap();
+    let base = real(repo.main.parent().unwrap());
     run(&base, &["clone", "-q", "--bare", "main", "bare.git"]);
     let linked = base.join("linked");
     run(&base.join("bare.git"), &["worktree", "add", "-q", "-b", "linked", linked.to_str().unwrap()]);

@@ -264,8 +264,9 @@ fn any_counts(root: &Path, paths: HashSet<PathBuf>) -> bool {
 
 /// A directory that is gone can only match a rule like `target/` with its
 /// slash. Paths compare equal without it, so `insert` would not store it.
+/// Windows sends `Any` for every removal, so that may be a directory too.
 fn add_path(paths: &mut HashSet<PathBuf>, path: &Path, kind: &EventKind) {
-    if matches!(kind, EventKind::Remove(RemoveKind::Folder)) {
+    if matches!(kind, EventKind::Remove(RemoveKind::Folder | RemoveKind::Any)) {
         paths.replace(path.join(""));
     } else {
         paths.insert(path.to_path_buf());
@@ -583,6 +584,28 @@ mod tests {
         assert_eq!(classified("/r/main/.git/index"), Some(Change::State(main())));
         assert_eq!(classified("/r/main/.git/logs/HEAD"), Some(Change::State(main())));
         assert_eq!(classified("/r/main/.git/HEAD"), Some(Change::Head(main())));
+    }
+
+    fn stored_path(kind: EventKind) -> String {
+        let mut paths = HashSet::new();
+        add_path(&mut paths, Path::new("/r/target"), &EventKind::Create(notify::event::CreateKind::Any));
+        add_path(&mut paths, Path::new("/r/target"), &kind);
+        paths.into_iter().next().unwrap().to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_removed_directory_keeps_its_slash_for_dir_only_rules() {
+        assert_eq!(stored_path(EventKind::Remove(RemoveKind::Folder)), "/r/target/");
+    }
+
+    #[test]
+    fn windows_cannot_say_what_was_removed_so_any_removal_may_be_a_directory() {
+        assert_eq!(stored_path(EventKind::Remove(RemoveKind::Any)), "/r/target/");
+    }
+
+    #[test]
+    fn a_removed_file_has_no_slash() {
+        assert_eq!(stored_path(EventKind::Remove(RemoveKind::File)), "/r/target");
     }
 
     #[test]
