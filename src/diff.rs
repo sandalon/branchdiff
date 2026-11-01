@@ -1,5 +1,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status { Modified, Added, Deleted, Renamed, Untracked }
+pub enum Status {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+}
 
 impl Status {
     pub fn letter(self) -> char {
@@ -14,7 +20,11 @@ impl Status {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineKind { Context, Added, Removed }
+pub enum LineKind {
+    Context,
+    Added,
+    Removed,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
@@ -47,7 +57,16 @@ pub struct FileDiff {
 
 impl FileDiff {
     fn empty() -> Self {
-        Self { path: String::new(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 0, removed: 0, hunks: Vec::new() }
+        Self {
+            path: String::new(),
+            old_path: None,
+            status: Status::Modified,
+            binary: false,
+            content_id: None,
+            added: 0,
+            removed: 0,
+            hunks: Vec::new(),
+        }
     }
 }
 
@@ -121,7 +140,9 @@ pub fn parse(input: &[u8]) -> Vec<FileDiff> {
         } else if line.starts_with("Binary files ") {
             file.binary = true;
         } else if let Some(p) = line.strip_prefix("--- ").or_else(|| line.strip_prefix("+++ ")) {
-            if let Some(p) = side_path(p) { file.path = p; }
+            if let Some(p) = side_path(p) {
+                file.path = p;
+            }
         } else if line.starts_with("@@ ") {
             if let Some((o, ol, n, nl)) = parse_hunk_header(&line) {
                 (old_no, old_left, new_no, new_left) = (o, ol, n, nl);
@@ -301,18 +322,18 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
     if !f.binary {
         let text = String::from_utf8_lossy(&bytes);
         // Not `lines()`, which drops the `\r` of CRLF that patch lines keep.
-        let mut lines: Vec<Line> = text.split_terminator('\n').enumerate().map(|(i, l)| Line {
-            kind: LineKind::Added,
-            old_no: None,
-            new_no: Some(i as u32 + 1),
-            text: l.to_string(),
-        }).collect();
+        let mut lines: Vec<Line> = text
+            .split_terminator('\n')
+            .enumerate()
+            .map(|(i, l)| Line { kind: LineKind::Added, old_no: None, new_no: Some(i as u32 + 1), text: l.to_string() })
+            .collect();
         lines.shrink_to_fit();
         *budget = budget.saturating_sub(lines.len().saturating_mul(LINE_OVERHEAD_BYTES));
         f.added = lines.len() as u32;
         if !lines.is_empty() {
             // Like git, which leaves out a count of 1.
-            let header = if lines.len() == 1 { "@@ -0,0 +1 @@".to_string() } else { format!("@@ -0,0 +1,{} @@", lines.len()) };
+            let header =
+                if lines.len() == 1 { "@@ -0,0 +1 @@".to_string() } else { format!("@@ -0,0 +1,{} @@", lines.len()) };
             f.hunks.push(Hunk { header, lines });
         }
     }
@@ -667,7 +688,8 @@ mod tests {
     #[test]
     fn releases_spare_hunk_capacity_on_every_file() {
         let body = " a\n".repeat(5);
-        let file = |name: &str| format!("diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1,5 +1,5 @@\n{body}");
+        let file =
+            |name: &str| format!("diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1,5 +1,5 @@\n{body}");
         let files = parse(format!("{}{}", file("x"), file("y")).as_bytes());
         for f in &files {
             let lines = &f.hunks[0].lines;
@@ -719,7 +741,9 @@ mod tests {
         p.extend(b"diff --git a/ol\xc3\xa9 x.txt b/n\xc3\xa9w x.txt\nsimilarity index 80%\nrename from ol\xc3\xa9 x.txt\nrename to n\xc3\xa9w x.txt\n--- a/ol\xc3\xa9 x.txt\t\n+++ b/n\xc3\xa9w x.txt\t\n@@ -1 +1 @@\n-a\xff\n+b\r\n");
         p.extend(b"diff --git \"a/q\\\" \\303\\251\\t.txt\" \"b/q\\\" \\303\\251\\t.txt\"\nnew file mode 100644\nindex 0000000..e69de29\n");
         p.extend("diff --git a/é.bin b/é.bin\nBinary files a/é.bin and b/é.bin differ\n".as_bytes());
-        p.extend("diff --git a/é b/é\ndeleted file mode 100644\n--- a/é\n+++ /dev/null\n@@ -1 +0,0 @@\n-é\n".as_bytes());
+        p.extend(
+            "diff --git a/é b/é\ndeleted file mode 100644\n--- a/é\n+++ /dev/null\n@@ -1 +0,0 @@\n-é\n".as_bytes(),
+        );
         p
     }
 

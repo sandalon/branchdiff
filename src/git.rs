@@ -186,7 +186,8 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, GitError> {
 /// rebase ends. Rebasing a detached HEAD records no ref, so that gives `None`.
 fn rebasing_branch(worktree: &Path) -> Option<String> {
     let dir = absolute_git_dir(worktree)?;
-    let name = ["rebase-merge", "rebase-apply"].iter()
+    let name = ["rebase-merge", "rebase-apply"]
+        .iter()
         .find_map(|state| std::fs::read_to_string(dir.join(state).join("head-name")).ok())?;
     name.trim().strip_prefix("refs/heads/").map(String::from)
 }
@@ -200,9 +201,7 @@ fn absolute_git_dir(cwd: &Path) -> Option<PathBuf> {
 /// records it. A separate git dir doesn't, so it can be found only from inside
 /// that working tree, and a linked worktree's own toplevel would be the wrong one.
 fn main_worktree_root(cwd: &Path, git_dir: &Path) -> Option<PathBuf> {
-    toplevel(git_dir).or_else(|| {
-        if absolute_git_dir(cwd)? == git_dir { toplevel(cwd) } else { None }
-    })
+    toplevel(git_dir).or_else(|| if absolute_git_dir(cwd)? == git_dir { toplevel(cwd) } else { None })
 }
 
 fn toplevel(cwd: &Path) -> Option<PathBuf> {
@@ -333,21 +332,42 @@ pub fn any_not_ignored(cwd: &Path, paths: &[PathBuf]) -> Result<bool, GitError> 
 /// Diff from `merge_base` to the working tree. Pins the config known to change
 /// the patch format, so the parser sees the same shape under most user config.
 pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
-    let out = run(cwd, [
-        "-c", "diff.suppressBlankEmpty=false",
-        "diff", "-M", "--no-color", "--no-ext-diff", "--no-textconv",
-        "--full-index", "--src-prefix=a/", "--dst-prefix=b/", "-U3", "--inter-hunk-context=0",
-        "--no-relative", "--submodule=short", "--ignore-submodules=none",
-        // Overrides `diff.orderFile`. On Windows this relies on git's own
-        // mapping of /dev/null, which is unverified until CI runs there.
-        "-O/dev/null",
-        "--end-of-options", merge_base, "--",
-    ])?;
-    if out.code == Some(0) { Ok(out.stdout) } else { Err(failed(out)) }
+    let out = run(
+        cwd,
+        [
+            "-c",
+            "diff.suppressBlankEmpty=false",
+            "diff",
+            "-M",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--full-index",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U3",
+            "--inter-hunk-context=0",
+            "--no-relative",
+            "--submodule=short",
+            "--ignore-submodules=none",
+            // Overrides `diff.orderFile`. On Windows this relies on git's own
+            // mapping of /dev/null, which is unverified until CI runs there.
+            "-O/dev/null",
+            "--end-of-options",
+            merge_base,
+            "--",
+        ],
+    )?;
+    if out.code == Some(0) {
+        Ok(out.stdout)
+    } else {
+        Err(failed(out))
+    }
 }
 
 pub fn branches(cwd: &Path) -> Result<Vec<String>, GitError> {
-    let text = ok_stdout(run(cwd, ["for-each-ref", "--format=%(refname:short) %(symref)", "refs/heads", "refs/remotes"])?)?;
+    let text =
+        ok_stdout(run(cwd, ["for-each-ref", "--format=%(refname:short) %(symref)", "refs/heads", "refs/remotes"])?)?;
     // A ref name cannot contain a space, so a line ending in one has an empty
     // `symref`. Symbolic refs such as `origin/HEAD` are aliases, not branches.
     Ok(text.lines().filter_map(|line| line.strip_suffix(' ')).map(String::from).collect())

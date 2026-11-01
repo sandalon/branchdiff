@@ -20,24 +20,35 @@ const LINES: usize = 40;
 const BUDGET: Duration = Duration::from_millis(16);
 
 fn big_diff() -> Vec<FileDiff> {
-    (0..FILES).map(|f| FileDiff {
-        path: format!("src/module_{f}.rs"), old_path: None, status: Status::Modified, binary: false, content_id: Some(format!("{f}")),
-        added: LINES as u32, removed: 0,
-        hunks: vec![Hunk {
-            header: format!("@@ -0,0 +1,{LINES} @@"),
-            lines: (0..LINES).map(|i| Line {
-                kind: LineKind::Added, old_no: None, new_no: Some(i as u32 + 1),
-                text: format!("let value_{i} = compute({i});"),
-            }).collect(),
-        }],
-    }).collect()
+    (0..FILES)
+        .map(|f| FileDiff {
+            path: format!("src/module_{f}.rs"),
+            old_path: None,
+            status: Status::Modified,
+            binary: false,
+            content_id: Some(format!("{f}")),
+            added: LINES as u32,
+            removed: 0,
+            hunks: vec![Hunk {
+                header: format!("@@ -0,0 +1,{LINES} @@"),
+                lines: (0..LINES)
+                    .map(|i| Line {
+                        kind: LineKind::Added,
+                        old_no: None,
+                        new_no: Some(i as u32 + 1),
+                        text: format!("let value_{i} = compute({i});"),
+                    })
+                    .collect(),
+            }],
+        })
+        .collect()
 }
 
 fn loaded_app() -> App {
     let mut a = App::new("develop".into());
-    let wts: Vec<Worktree> = (0..WORKTREES).map(|i| Worktree {
-        path: format!("/r/w{i}").into(), head: "h".into(), branch: Some(format!("w{i}")),
-    }).collect();
+    let wts: Vec<Worktree> = (0..WORKTREES)
+        .map(|i| Worktree { path: format!("/r/w{i}").into(), head: "h".into(), branch: Some(format!("w{i}")) })
+        .collect();
     a.handle_msg(Msg::Worktrees(Ok(wts)));
     let diffs = Arc::new(big_diff());
     for i in 0..WORKTREES {
@@ -55,12 +66,14 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 
 fn timed(app: &mut App, key: KeyCode) -> Duration {
     let mut t = Terminal::new(TestBackend::new(200, 60)).unwrap();
-    let samples = (0..50).map(|_| {
-        let start = Instant::now();
-        app.handle_key(KeyEvent::from(key));
-        t.draw(|f| ui::draw(f, app)).unwrap();
-        start.elapsed()
-    }).collect();
+    let samples = (0..50)
+        .map(|_| {
+            let start = Instant::now();
+            app.handle_key(KeyEvent::from(key));
+            t.draw(|f| ui::draw(f, app)).unwrap();
+            start.elapsed()
+        })
+        .collect();
     median(samples)
 }
 
@@ -83,14 +96,24 @@ fn keypress_to_redraw_is_within_budget() {
 
 fn app_of(worktrees: usize, files: usize) -> App {
     let mut a = App::new("develop".into());
-    let wts: Vec<Worktree> = (0..worktrees).map(|i| Worktree {
-        path: format!("/r/w{i}").into(), head: "h".into(), branch: Some(format!("w{i}")),
-    }).collect();
+    let wts: Vec<Worktree> = (0..worktrees)
+        .map(|i| Worktree { path: format!("/r/w{i}").into(), head: "h".into(), branch: Some(format!("w{i}")) })
+        .collect();
     a.handle_msg(Msg::Worktrees(Ok(wts)));
-    let diffs: Arc<Vec<FileDiff>> = Arc::new((0..files).map(|f| FileDiff {
-        path: format!("src/module_{f}.rs"), old_path: None, status: Status::Modified, binary: false, content_id: Some(format!("{f}")),
-        added: 1, removed: 0, hunks: Vec::new(),
-    }).collect());
+    let diffs: Arc<Vec<FileDiff>> = Arc::new(
+        (0..files)
+            .map(|f| FileDiff {
+                path: format!("src/module_{f}.rs"),
+                old_path: None,
+                status: Status::Modified,
+                binary: false,
+                content_id: Some(format!("{f}")),
+                added: 1,
+                removed: 0,
+                hunks: Vec::new(),
+            })
+            .collect(),
+    );
     for i in 0..worktrees {
         let path: PathBuf = format!("/r/w{i}").into();
         let key = CacheKey { worktree: path.clone(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
@@ -113,11 +136,13 @@ fn frame_time_does_not_grow_with_list_length() {
 #[ignore]
 fn help_output_starts_within_the_first_frame_budget() {
     let exe = env!("CARGO_BIN_EXE_branchdiff");
-    let samples: Vec<Duration> = (0..10).map(|_| {
-        let start = Instant::now();
-        std::process::Command::new(exe).arg("--version").output().unwrap();
-        start.elapsed()
-    }).collect();
+    let samples: Vec<Duration> = (0..10)
+        .map(|_| {
+            let start = Instant::now();
+            std::process::Command::new(exe).arg("--version").output().unwrap();
+            start.elapsed()
+        })
+        .collect();
     let d = median(samples);
     assert!(d < Duration::from_millis(100), "startup took {d:?}");
 }

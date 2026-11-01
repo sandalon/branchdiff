@@ -569,9 +569,8 @@ fn untracked_hunk_headers_match_git() {
     let wt = repo.add_worktree("feat");
     std::fs::write(wt.join("one.txt"), "only\n").unwrap();
     std::fs::write(wt.join("two.txt"), "x\ny\n").unwrap();
-    let headers = |files: Vec<diff::FileDiff>| -> Vec<String> {
-        files.iter().map(|f| f.hunks[0].header.clone()).collect()
-    };
+    let headers =
+        |files: Vec<diff::FileDiff>| -> Vec<String> { files.iter().map(|f| f.hunks[0].header.clone()).collect() };
     let untracked = headers(loaded(&wt));
     assert_eq!(untracked, vec!["@@ -0,0 +1 @@", "@@ -0,0 +1,2 @@"]);
     run(&wt, &["add", "-N", "."]);
@@ -699,7 +698,10 @@ fn a_worktree_keeps_its_branch_during_a_rebase() {
     let wt = repo.add_worktree("feat");
     stop_at_a_rebase_conflict(&repo, &wt, &[]);
     assert_eq!(branch_of(&wt).as_deref(), Some("feat"));
-    assert_eq!(git::list_worktrees(&repo.main).unwrap().iter().filter(|w| w.branch.as_deref() == Some("feat")).count(), 1);
+    assert_eq!(
+        git::list_worktrees(&repo.main).unwrap().iter().filter(|w| w.branch.as_deref() == Some("feat")).count(),
+        1
+    );
 
     run(&wt, &["rebase", "--abort"]);
     assert_eq!(branch_of(&wt).as_deref(), Some("feat"));

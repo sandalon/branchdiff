@@ -106,7 +106,10 @@ pub fn repo_with_submodule(repo: &Repo) -> (PathBuf, PathBuf) {
     git(&superproject, &["config", "user.name", "Test"]);
     git(&superproject, &["commit", "-qm", "init", "--allow-empty"]);
     let source = base.join("main");
-    git(&superproject, &["-c", "protocol.file.allow=always", "submodule", "--quiet", "add", source.to_str().unwrap(), "sub"]);
+    git(
+        &superproject,
+        &["-c", "protocol.file.allow=always", "submodule", "--quiet", "add", source.to_str().unwrap(), "sub"],
+    );
     let sub = superproject.join("sub");
     git(&sub, &["config", "user.email", "test@example.com"]);
     git(&sub, &["config", "user.name", "Test"]);

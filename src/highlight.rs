@@ -53,22 +53,29 @@ fn highlight_within(file: &FileDiff, budget: Duration) -> HighlightedFile {
         other => other,
     };
     let syntax = syntaxes.find_syntax_by_extension(name).or_else(|| syntaxes.find_syntax_by_extension(ext));
-    let hunks = file.hunks.iter().map(|hunk| {
-        // Each side is its own text, so a removed `/*` must not colour the lines
-        // after it. Context is in both and shows as the new side has it.
-        let mut old = syntax.map(|s| HighlightLines::new(s, theme));
-        let mut new = syntax.map(|s| HighlightLines::new(s, theme));
-        hunk.lines.iter().map(|line| {
-            (started.elapsed() < budget).then(|| match line.kind {
-                LineKind::Removed => colour(&mut old, &line.text),
-                LineKind::Added => colour(&mut new, &line.text),
-                LineKind::Context => {
-                    colour(&mut old, &line.text);
-                    colour(&mut new, &line.text)
-                }
-            })
-        }).collect::<Option<_>>()
-    }).collect::<Option<_>>();
+    let hunks = file
+        .hunks
+        .iter()
+        .map(|hunk| {
+            // Each side is its own text, so a removed `/*` must not colour the lines
+            // after it. Context is in both and shows as the new side has it.
+            let mut old = syntax.map(|s| HighlightLines::new(s, theme));
+            let mut new = syntax.map(|s| HighlightLines::new(s, theme));
+            hunk.lines
+                .iter()
+                .map(|line| {
+                    (started.elapsed() < budget).then(|| match line.kind {
+                        LineKind::Removed => colour(&mut old, &line.text),
+                        LineKind::Added => colour(&mut new, &line.text),
+                        LineKind::Context => {
+                            colour(&mut old, &line.text);
+                            colour(&mut new, &line.text)
+                        }
+                    })
+                })
+                .collect::<Option<_>>()
+        })
+        .collect::<Option<_>>();
     hunks.map(|hunks| HighlightedFile { hunks }).unwrap_or_default()
 }
 
@@ -80,17 +87,21 @@ fn colour(state: &mut Option<HighlightLines>, text: &str) -> Vec<Span> {
     let with_newline = format!("{text}\n");
     let spans = state.as_mut().and_then(|h| h.highlight_line(&with_newline, syntaxes).ok());
     match spans {
-        Some(spans) => spans.iter().map(|(style, text)| {
-            // Only foregrounds are drawn, and an `invalid` token's is the theme's
-            // background, meant to sit on red. In a hunk cut from the middle of
-            // a file, such a token is usually just an unmatched closing brace.
-            let c = if Some(style.foreground) == theme.settings.background {
-                theme.settings.foreground.unwrap_or(style.foreground)
-            } else {
-                style.foreground
-            };
-            (Color::Rgb(c.r, c.g, c.b), text.trim_end_matches('\n').to_string())
-        }).filter(|(_, t)| !t.is_empty()).collect(),
+        Some(spans) => spans
+            .iter()
+            .map(|(style, text)| {
+                // Only foregrounds are drawn, and an `invalid` token's is the theme's
+                // background, meant to sit on red. In a hunk cut from the middle of
+                // a file, such a token is usually just an unmatched closing brace.
+                let c = if Some(style.foreground) == theme.settings.background {
+                    theme.settings.foreground.unwrap_or(style.foreground)
+                } else {
+                    style.foreground
+                };
+                (Color::Rgb(c.r, c.g, c.b), text.trim_end_matches('\n').to_string())
+            })
+            .filter(|(_, t)| !t.is_empty())
+            .collect(),
         None => plain(text),
     }
 }
@@ -106,7 +117,13 @@ mod tests {
 
     fn file(path: &str, text: &str) -> FileDiff {
         FileDiff {
-            path: path.into(), old_path: None, status: Status::Added, binary: false, content_id: None, added: 1, removed: 0,
+            path: path.into(),
+            old_path: None,
+            status: Status::Added,
+            binary: false,
+            content_id: None,
+            added: 1,
+            removed: 0,
             hunks: vec![Hunk {
                 header: "@@ -0,0 +1 @@".into(),
                 lines: vec![Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: text.into() }],
@@ -158,20 +175,27 @@ mod tests {
 
     #[test]
     fn finds_the_language_from_a_whole_file_name_in_any_directory() {
-        let files = [("src/Makefile", "a: b"), ("docker/Dockerfile", "FROM rust"), (".bashrc", "export A=1"), ("home/.bashrc", "export A=1")];
+        let files = [
+            ("src/Makefile", "a: b"),
+            ("docker/Dockerfile", "FROM rust"),
+            (".bashrc", "export A=1"),
+            ("home/.bashrc", "export A=1"),
+        ];
         for (path, text) in files {
             assert!(highlight_file(&file(path, text)).hunks[0][0].len() > 1, "{path}");
         }
     }
 
     fn lines(path: &str, lines: &[(LineKind, &str)]) -> FileDiff {
-        let lines = lines.iter().map(|&(kind, text)| Line { kind, old_no: None, new_no: None, text: text.into() }).collect();
+        let lines =
+            lines.iter().map(|&(kind, text)| Line { kind, old_no: None, new_no: None, text: text.into() }).collect();
         FileDiff { hunks: vec![Hunk { header: "@@".into(), lines }], ..file(path, "") }
     }
 
     #[test]
     fn a_removed_comment_opener_does_not_colour_the_lines_after_it() {
-        let diff = lines("a.c", &[(LineKind::Removed, "/* old"), (LineKind::Added, "int b;"), (LineKind::Context, "int c;")]);
+        let diff =
+            lines("a.c", &[(LineKind::Removed, "/* old"), (LineKind::Added, "int b;"), (LineKind::Context, "int c;")]);
         let out = highlight_file(&diff);
         assert!(out.hunks[0][1].len() > 1);
         assert!(out.hunks[0][2].len() > 1);
@@ -226,7 +250,9 @@ mod tests {
 
     #[test]
     fn colours_typescript_tsx_and_toml() {
-        for (path, text) in [("a.ts", "const x: number = 1;"), ("a.tsx", "const a = <div>hi</div>;"), ("a.toml", "a = \"b\"")] {
+        for (path, text) in
+            [("a.ts", "const x: number = 1;"), ("a.tsx", "const a = <div>hi</div>;"), ("a.toml", "a = \"b\"")]
+        {
             assert!(highlight_file(&file(path, text)).hunks[0][0].len() > 1, "{path}");
         }
     }

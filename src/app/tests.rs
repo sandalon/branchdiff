@@ -11,7 +11,16 @@ fn wt(name: &str) -> Worktree {
 }
 
 fn file(path: &str) -> FileDiff {
-    FileDiff { path: path.into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0, hunks: vec![] }
+    FileDiff {
+        path: path.into(),
+        old_path: None,
+        status: Status::Modified,
+        binary: false,
+        content_id: None,
+        added: 1,
+        removed: 0,
+        hunks: vec![],
+    }
 }
 
 /// A file showing `rows` rows: one hunk header and `rows - 1` lines.
@@ -91,7 +100,13 @@ fn assert_kept(a: &App, name: &str) {
 
 fn file_with_line(text: &str) -> FileDiff {
     FileDiff {
-        path: "a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 0,
+        path: "a.rs".into(),
+        old_path: None,
+        status: Status::Modified,
+        binary: false,
+        content_id: None,
+        added: 1,
+        removed: 0,
         hunks: vec![Hunk {
             header: "@@ -0,0 +1 @@".into(),
             lines: vec![Line { kind: LineKind::Added, old_no: None, new_no: Some(1), text: text.into() }],
@@ -531,7 +546,11 @@ fn a_reload_follows_the_current_file_past_an_inserted_file() {
 #[test]
 fn a_reload_follows_the_current_file_past_a_removed_file() {
     let mut a = app(&["a"]);
-    deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("b", 100), file_with_rows("c", 100), file_with_rows("d", 100)]);
+    deliver(
+        &mut a,
+        "a",
+        vec![file_with_rows("a", 5), file_with_rows("b", 100), file_with_rows("c", 100), file_with_rows("d", 100)],
+    );
     press(&mut a, 'n');
     press(&mut a, 'n');
     set_cursor_scroll(&mut a, 50, 40);
@@ -579,7 +598,11 @@ fn a_file_that_changed_status_falls_back_to_the_first_path_match() {
     deliver(&mut a, "a", vec![file_with_rows("a", 5), file_with_rows("t", 10)]);
     press(&mut a, 'n');
     set_cursor_scroll(&mut a, 5, 2);
-    deliver(&mut a, "a", vec![file_with_rows("0", 5), file_with_rows("a", 5), side(Status::Deleted), side(Status::Added)]);
+    deliver(
+        &mut a,
+        "a",
+        vec![file_with_rows("0", 5), file_with_rows("a", 5), side(Status::Deleted), side(Status::Added)],
+    );
     assert_eq!(position(&a), (2, 5, 2));
 }
 
@@ -807,7 +830,11 @@ fn d_deletes_only_the_comment_on_the_current_line() {
     type_comment(&mut a, "one");
     type_comment(&mut a, "two");
     a.states[0].review.comments.push(Comment {
-        path: "other.rs".into(), line: 1, side: Side::New, line_text: "x".into(), body: "keep".into(),
+        path: "other.rs".into(),
+        line: 1,
+        side: Side::New,
+        line_text: "x".into(),
+        body: "keep".into(),
     });
     let fx = press(&mut a, 'd');
     let bodies: Vec<_> = a.current().unwrap().review.comments.iter().map(|c| c.body.as_str()).collect();
@@ -898,8 +925,14 @@ fn comment_on_a_replaced_line_is_not_outdated() {
 #[test]
 fn changing_a_binary_file_resets_its_reviewed_mark() {
     let binary = |id: &str| FileDiff {
-        path: "b.dat".into(), old_path: None, status: Status::Modified, binary: true,
-        content_id: Some(id.into()), added: 0, removed: 0, hunks: vec![],
+        path: "b.dat".into(),
+        old_path: None,
+        status: Status::Modified,
+        binary: true,
+        content_id: Some(id.into()),
+        added: 0,
+        removed: 0,
+        hunks: vec![],
     };
     let mut a = app(&["a"]);
     deliver(&mut a, "a", vec![binary("1..2")]);
@@ -960,7 +993,10 @@ fn removing_the_worktree_cancels_an_open_clear() {
 
 #[test]
 fn e_on_a_removed_line_opens_the_following_line() {
-    let f = FileDiff { hunks: vec![hunk("@@ -40,3 +40,2 @@", vec![context(40, 40), removed(41), context(42, 41)])], ..file("m.rs") };
+    let f = FileDiff {
+        hunks: vec![hunk("@@ -40,3 +40,2 @@", vec![context(40, 40), removed(41), context(42, 41)])],
+        ..file("m.rs")
+    };
     assert_eq!(editor_line(f, 2), Some(41));
 }
 
@@ -972,7 +1008,10 @@ fn e_on_a_hunk_header_opens_the_hunks_first_new_line() {
 
 #[test]
 fn e_on_a_removed_block_ending_a_hunk_opens_the_line_before_it() {
-    let f = FileDiff { hunks: vec![hunk("@@ -40,4 +40,2 @@", vec![context(40, 40), context(41, 41), removed(42), removed(43)])], ..file("m.rs") };
+    let f = FileDiff {
+        hunks: vec![hunk("@@ -40,4 +40,2 @@", vec![context(40, 40), context(41, 41), removed(42), removed(43)])],
+        ..file("m.rs")
+    };
     assert_eq!(editor_line(f, 4), Some(41));
 }
 
@@ -998,7 +1037,8 @@ fn e_treats_a_new_side_start_of_zero_as_line_one() {
 #[test]
 fn e_on_a_deleted_file_says_so_and_opens_nothing() {
     let mut a = app(&["a"]);
-    let f = FileDiff { status: Status::Deleted, hunks: vec![hunk("@@ -1 +0,0 @@", vec![removed(1)])], ..file("gone.rs") };
+    let f =
+        FileDiff { status: Status::Deleted, hunks: vec![hunk("@@ -1 +0,0 @@", vec![removed(1)])], ..file("gone.rs") };
     deliver(&mut a, "a", vec![f]);
     assert!(press(&mut a, 'e').is_empty());
     assert!(a.notice.is_some());
@@ -1261,7 +1301,10 @@ fn missing_base_opens_the_base_picker() {
 fn a_missing_older_base_does_not_reopen_the_picker() {
     let mut a = app(&["a"]);
     a.base = "main".into();
-    let fx = a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(crate::git::GitError::BaseMissing("develop".into())) });
+    let fx = a.handle_msg(Msg::Loaded {
+        path: "/r/a".into(),
+        result: Err(crate::git::GitError::BaseMissing("develop".into())),
+    });
     assert!(fx.is_empty());
 }
 
@@ -1398,10 +1441,13 @@ fn every_load_after_a_base_change_uses_the_new_base() {
     a.handle_msg(Msg::Branches(Ok(vec!["main".into()])));
     press(&mut a, 'm');
     let fx = a.handle_key(KeyEvent::from(KeyCode::Enter));
-    assert_eq!(fx, vec![
-        Effect::Load { path: "/r/a".into(), base: "main".into() },
-        Effect::Load { path: "/r/b".into(), base: "main".into() },
-    ]);
+    assert_eq!(
+        fx,
+        vec![
+            Effect::Load { path: "/r/a".into(), base: "main".into() },
+            Effect::Load { path: "/r/b".into(), base: "main".into() },
+        ]
+    );
 }
 
 #[test]

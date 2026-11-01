@@ -27,9 +27,7 @@ pub enum Command {
 /// Picks the deepest root containing `path`, so a nested worktree such as
 /// `.worktrees/a` is not reported as a change to the main worktree.
 fn owning_worktree(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    let root = roots.iter()
-        .filter(|r| path.starts_with(r))
-        .max_by_key(|r| r.components().count())?;
+    let root = roots.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.components().count())?;
     let rel = path.strip_prefix(root).ok()?;
     let git_internal = rel.iter().any(|c| c == ".git");
     if git_internal && !GIT_STATE.iter().any(|f| rel == Path::new(f)) {
@@ -124,7 +122,9 @@ impl Debouncer {
 
     fn due(&mut self, now: Instant) -> Vec<PathBuf> {
         let window = self.window;
-        let due: Vec<PathBuf> = self.pending.iter()
+        let due: Vec<PathBuf> = self
+            .pending
+            .iter()
             .filter(|(_, p)| now.duration_since(p.last) >= window || now.duration_since(p.first) >= MAX_WAIT)
             .map(|(k, _)| k.clone())
             .collect();
@@ -156,7 +156,12 @@ pub fn spawn(common_dir: PathBuf, msgs: Sender<Msg>) -> notify::Result<Sender<Co
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
     // Off, because `git check-ignore` fails for a path that goes through a symlink.
     let config = notify::Config::default().with_follow_symlinks(false);
-    let mut watcher = RecommendedWatcher::new(move |e| { let _ = fs_tx.send(e); }, config)?;
+    let mut watcher = RecommendedWatcher::new(
+        move |e| {
+            let _ = fs_tx.send(e);
+        },
+        config,
+    )?;
     // Recursive, because `worktrees` may not exist yet, is deleted along with the
     // last linked worktree, and holds their index files. A bare repository has
     // no worktree of its own to cover it.
@@ -365,7 +370,11 @@ impl Tracker {
 
     fn wait(&self) -> Duration {
         let idle = self.unchecked.is_empty() && self.bursts.is_empty() && self.list_changed.is_empty();
-        if idle { IDLE } else { TICK }
+        if idle {
+            IDLE
+        } else {
+            TICK
+        }
     }
 }
 

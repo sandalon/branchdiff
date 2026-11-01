@@ -10,8 +10,8 @@ use branchdiff::worker::Msg;
 use common::{git as run, real, repo_with_submodule, Repo, SeparateGitDir};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::{Child, Command as Process, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

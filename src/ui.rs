@@ -67,9 +67,8 @@ fn display_text(s: &str) -> Cow<'_, str> {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let side = (f.area().width / 5).clamp(16, 30);
-    let [left, files, diff] = Layout::horizontal([
-        Constraint::Length(side), Constraint::Length(side), Constraint::Min(0),
-    ]).areas(main);
+    let [left, files, diff] =
+        Layout::horizontal([Constraint::Length(side), Constraint::Length(side), Constraint::Min(0)]).areas(main);
 
     // The three panes are the same height.
     keep_selection_visible(app, (main.height as usize).saturating_sub(BORDERS));
@@ -95,7 +94,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// Nearest 256-colour entry, for terminals that don't advertise truecolor.
 fn fit_color(color: Color) -> Color {
     let Color::Rgb(r, g, b) = color else { return color };
-    let cube = |v: u8| if v < 48 { 0 } else if v < 115 { 1 } else { (v - 35) / 40 };
+    let cube = |v: u8| {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            (v - 35) / 40
+        }
+    };
     Color::Indexed(16 + 36 * cube(r) + 6 * cube(g) + cube(b))
 }
 
@@ -132,25 +139,39 @@ fn keep_selection_visible(app: &mut App, visible: usize) {
 fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
     let visible = (area.height as usize).saturating_sub(BORDERS);
     let first = app.worktree_offset;
-    let items: Vec<ListItem> = app.worktrees.iter().zip(&app.states).skip(first).take(visible).map(|(w, s)| {
-        let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
-        let comments = match s.review.comments.len() {
-            0 => String::new(),
-            n => format!(" c{n}"),
-        };
-        let mut warnings = String::new();
-        if s.stale { warnings.push_str(" ●"); }
-        if s.op.is_some() { warnings.push_str(" !"); }
-        if s.error.is_some() { warnings.push_str(" ✗"); }
-        // The name shortens first, then the counts go, least useful first, so
-        // the warnings stay. Only a pane under 10 cells wide can cut those.
-        let room = (area.width as usize).saturating_sub(BORDERS + SYMBOL);
-        let badges = [format!(" +{added}{comments}{warnings}"), format!("{comments}{warnings}")].into_iter()
-            .find(|b| b.width() + MIN_NAME <= room)
-            .unwrap_or(warnings);
-        let name = room.saturating_sub(badges.width());
-        ListItem::new(format!("{}{badges}", elide(&worktree_label(w), name)))
-    }).collect();
+    let items: Vec<ListItem> = app
+        .worktrees
+        .iter()
+        .zip(&app.states)
+        .skip(first)
+        .take(visible)
+        .map(|(w, s)| {
+            let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
+            let comments = match s.review.comments.len() {
+                0 => String::new(),
+                n => format!(" c{n}"),
+            };
+            let mut warnings = String::new();
+            if s.stale {
+                warnings.push_str(" ●");
+            }
+            if s.op.is_some() {
+                warnings.push_str(" !");
+            }
+            if s.error.is_some() {
+                warnings.push_str(" ✗");
+            }
+            // The name shortens first, then the counts go, least useful first, so
+            // the warnings stay. Only a pane under 10 cells wide can cut those.
+            let room = (area.width as usize).saturating_sub(BORDERS + SYMBOL);
+            let badges = [format!(" +{added}{comments}{warnings}"), format!("{comments}{warnings}")]
+                .into_iter()
+                .find(|b| b.width() + MIN_NAME <= room)
+                .unwrap_or(warnings);
+            let name = room.saturating_sub(badges.width());
+            ListItem::new(format!("{}{badges}", elide(&worktree_label(w), name)))
+        })
+        .collect();
     let mut state = ListState::default().with_selected(Some(app.selected.saturating_sub(first)));
     let list = List::new(items)
         .block(block("Worktrees", app.focus == Focus::Worktrees))
@@ -169,10 +190,16 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
     let first = s.file_offset;
     let room = (area.width as usize).saturating_sub(BORDERS + FILE_PREFIX);
     let files = s.diffs.as_ref().map_or(&[][..], |d| d.as_slice());
-    let items: Vec<ListItem> = files.iter().enumerate().skip(first).take(visible).map(|(i, x)| {
-        let mark = if app.is_reviewed(i) { "✓" } else { " " };
-        ListItem::new(format!("{mark}{} {}", x.status.letter(), elide(&x.path, room)))
-    }).collect();
+    let items: Vec<ListItem> = files
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+        .map(|(i, x)| {
+            let mark = if app.is_reviewed(i) { "✓" } else { " " };
+            ListItem::new(format!("{mark}{} {}", x.status.letter(), elide(&x.path, room)))
+        })
+        .collect();
     let mut state = ListState::default().with_selected(Some(s.file.saturating_sub(first)));
     let list = List::new(items)
         .block(block("Files", app.focus == Focus::Files))
@@ -219,7 +246,11 @@ fn message<'a>(text: impl Into<ratatui::text::Text<'a>>) -> Paragraph<'a> {
 
 /// A span's style. `Reset` means no colour of its own, so the row's shows.
 fn span_style(color: Color) -> Style {
-    if color == Color::Reset { Style::new() } else { Style::new().fg(color) }
+    if color == Color::Reset {
+        Style::new()
+    } else {
+        Style::new().fg(color)
+    }
 }
 
 fn line_style(kind: LineKind) -> Style {
@@ -232,7 +263,11 @@ fn line_style(kind: LineKind) -> Style {
 
 /// Gutter mark for a line that has a comment.
 fn comment_mark(commented: &HashSet<(u32, Side)>, line: &Line) -> &'static str {
-    if line_position(line).is_some_and(|p| commented.contains(&p)) { "*" } else { " " }
+    if line_position(line).is_some_and(|p| commented.contains(&p)) {
+        "*"
+    } else {
+        " "
+    }
 }
 
 fn unified_rows<'a>(
@@ -252,7 +287,11 @@ fn unified_rows<'a>(
             continue;
         }
         if row >= scroll {
-            rows.push(finish_row(TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)), row == cursor, width));
+            rows.push(finish_row(
+                TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)),
+                row == cursor,
+                width,
+            ));
         }
         row += 1;
         for (li, line) in hunk.lines.iter().enumerate() {
@@ -269,7 +308,9 @@ fn unified_rows<'a>(
                 let gutter = comment_mark(commented, line);
                 let mut spans = vec![Span::raw(format!("{gutter}{number:>5} {prefix}"))];
                 match highlight.and_then(|h| h.hunks.get(hi)).and_then(|h| h.get(li)) {
-                    Some(parts) => spans.extend(parts.iter().map(|(c, t)| Span::styled(display_text(t), span_style(*c)))),
+                    Some(parts) => {
+                        spans.extend(parts.iter().map(|(c, t)| Span::styled(display_text(t), span_style(*c))))
+                    }
                     None => spans.push(Span::raw(display_text(&line.text))),
                 }
                 rows.push(finish_row(TextLine::from(spans).style(line_style(line.kind)), row == cursor, width));
@@ -300,7 +341,11 @@ fn split_rows<'a>(
             break;
         }
         if row >= scroll {
-            rows.push(finish_row(TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)), row == cursor, width));
+            rows.push(finish_row(
+                TextLine::from(display_text(&hunk.header)).style(Style::new().fg(Color::Cyan)),
+                row == cursor,
+                width,
+            ));
         }
         row += 1;
         for (li, line) in hunk.lines.iter().enumerate() {
@@ -367,7 +412,11 @@ fn finish_row(mut line: TextLine<'_>, selected: bool, width: usize) -> TextLine<
         }
     }
     line.spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    if selected { line.patch_style(Style::new().add_modifier(Modifier::REVERSED)) } else { line }
+    if selected {
+        line.patch_style(Style::new().add_modifier(Modifier::REVERSED))
+    } else {
+        line
+    }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -394,10 +443,16 @@ fn status_summary(app: &App, width: usize) -> String {
         return format!(" base: {}", app.base);
     };
     let mut warnings = String::new();
-    if let Some(op) = s.op { warnings.push_str(&format!("! {op} in progress{GAP}")); }
-    if s.stale { warnings.push_str(&format!("● changed{GAP}")); }
+    if let Some(op) = s.op {
+        warnings.push_str(&format!("! {op} in progress{GAP}"));
+    }
+    if s.stale {
+        warnings.push_str(&format!("● changed{GAP}"));
+    }
     let outdated = app.outdated_comments();
-    if outdated > 0 { warnings.push_str(&format!("({outdated} outdated){GAP}")); }
+    if outdated > 0 {
+        warnings.push_str(&format!("({outdated} outdated){GAP}"));
+    }
     let counts = format!("{}{GAP}{}", plural(app.file_count(), "file"), plural(s.review.comments.len(), "comment"));
 
     // What's left for the two names, which share it.
@@ -414,7 +469,11 @@ fn status_summary(app: &App, width: usize) -> String {
 }
 
 fn plural(count: usize, noun: &str) -> String {
-    if count == 1 { format!("1 {noun}") } else { format!("{count} {noun}s") }
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -479,7 +538,9 @@ fn draw_input(f: &mut Frame, app: &App) {
     let Some(input) = &app.input else { return };
     let (title, text, options) = match input {
         Input::Comment { text, .. } => ("Comment (Enter saves, Esc cancels)", text.as_str(), Vec::new()),
-        Input::ConfirmClear => ("Clear all comments for this worktree?", "y to clear, any other key cancels", Vec::new()),
+        Input::ConfirmClear => {
+            ("Clear all comments for this worktree?", "y to clear, any other key cancels", Vec::new())
+        }
         Input::Worktree { query } => ("Find worktree", query.as_str(), best_matches(query, &app.worktree_labels())),
         Input::Base { query, branches } => ("Base branch", query.as_str(), best_matches(query, branches)),
     };

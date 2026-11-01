@@ -34,12 +34,22 @@ pub struct Loaded {
 #[derive(Debug)]
 pub enum Msg {
     Worktrees(Result<Vec<Worktree>, GitError>),
-    Loaded { path: PathBuf, result: Result<Loaded, GitError> },
+    Loaded {
+        path: PathBuf,
+        result: Result<Loaded, GitError>,
+    },
     Branches(Result<Vec<String>, GitError>),
-    Highlighted { key: CacheKey, file_index: usize, lines: crate::highlight::HighlightedFile },
+    Highlighted {
+        key: CacheKey,
+        file_index: usize,
+        lines: crate::highlight::HighlightedFile,
+    },
     Stale(PathBuf),
     /// Answers `Job::Probe`. `changed` means the worktree no longer matches its key.
-    Probed { path: PathBuf, changed: bool },
+    Probed {
+        path: PathBuf,
+        changed: bool,
+    },
     WorktreesChanged,
     WatchLimit,
 }
@@ -292,7 +302,9 @@ where
 /// One short line for a worktree row. `main`'s panic hook skips workers, so
 /// this is all anyone sees of a worker panic.
 fn panic_text(payload: &(dyn Any + Send)) -> String {
-    let message = payload.downcast_ref::<&str>().copied()
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .and_then(|text| text.lines().next())
         .filter(|line| !line.trim().is_empty());
@@ -770,7 +782,9 @@ mod tests {
         assert!(loads.request(path.clone(), "develop".into()).is_none());
 
         for _ in 0..2 {
-            let Msg::Loaded { path, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() else { panic!("not a load") };
+            let Msg::Loaded { path, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+                panic!("not a load")
+            };
             if let Some(job) = loads.finished(&path).next {
                 pool.submit(job);
             }

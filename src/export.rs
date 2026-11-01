@@ -135,7 +135,12 @@ mod tests {
     #[test]
     fn removed_comments_on_a_line_come_first_and_keep_their_order() {
         let at = |side, body| Comment { side, ..c("a.rs", 4, body) };
-        let comments = [at(Side::New, "added 1"), at(Side::Old, "removed 1"), at(Side::New, "added 2"), at(Side::Old, "removed 2")];
+        let comments = [
+            at(Side::New, "added 1"),
+            at(Side::Old, "removed 1"),
+            at(Side::New, "added 2"),
+            at(Side::Old, "removed 2"),
+        ];
         let md = render("feat", "develop", &comments);
         let positions = ["removed 1", "removed 2", "added 1", "added 2"].map(|body| md.find(body).unwrap());
         assert!(positions.is_sorted(), "{md}");

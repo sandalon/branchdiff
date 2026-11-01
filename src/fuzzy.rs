@@ -9,7 +9,9 @@ pub fn filter(query: &str, items: &[String]) -> Vec<usize> {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let pattern = Pattern::new(query, CaseMatching::Smart, Normalization::Smart, AtomKind::Fuzzy);
     let mut buf = Vec::new();
-    let mut scored: Vec<(usize, u32)> = items.iter().enumerate()
+    let mut scored: Vec<(usize, u32)> = items
+        .iter()
+        .enumerate()
         .filter_map(|(i, s)| pattern.score(Utf32Str::new(s, &mut buf), &mut matcher).map(|score| (i, score)))
         .collect();
     // The prompts can't move through the list, so any name that loses every

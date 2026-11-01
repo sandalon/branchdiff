@@ -9,10 +9,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus { Worktrees, Files, Diff }
+pub enum Focus {
+    Worktrees,
+    Files,
+    Diff,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiffView { Unified, SideBySide }
+pub enum DiffView {
+    Unified,
+    SideBySide,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -94,7 +101,9 @@ impl WorktreeState {
     /// between them. A file whose status changed still matches by path.
     fn find_file(&self, wanted: &FileDiff) -> Option<usize> {
         let diffs = self.diffs.as_ref()?;
-        diffs.iter().position(|f| f.path == wanted.path && f.status == wanted.status)
+        diffs
+            .iter()
+            .position(|f| f.path == wanted.path && f.status == wanted.status)
             .or_else(|| diffs.iter().position(|f| f.path == wanted.path))
     }
 
@@ -169,7 +178,8 @@ impl App {
     /// git dir.
     pub fn repo_dir(&self, start: &Path, common_dir: &Path) -> PathBuf {
         let worktrees = self.worktrees.iter().map(|w| w.path.as_path());
-        std::iter::once(start).chain(worktrees)
+        std::iter::once(start)
+            .chain(worktrees)
             .find(|dir| dir.join(".git").exists())
             .unwrap_or(common_dir)
             .to_path_buf()
@@ -424,10 +434,8 @@ impl App {
     fn apply_worktrees(&mut self, list: Vec<Worktree>) -> Vec<Effect> {
         let selected_path = self.selected_worktree().map(|w| w.path.clone());
 
-        let mut old: Vec<(PathBuf, WorktreeState)> = self.worktrees.drain(..)
-            .map(|w| w.path)
-            .zip(self.states.drain(..))
-            .collect();
+        let mut old: Vec<(PathBuf, WorktreeState)> =
+            self.worktrees.drain(..).map(|w| w.path).zip(self.states.drain(..)).collect();
 
         let mut effects = Vec::new();
         for w in &list {
@@ -500,7 +508,9 @@ impl App {
         let Some(text) = self.input.as_mut().and_then(Input::text_mut) else { return Vec::new() };
         match key.code {
             KeyCode::Char(c) => text.push(c),
-            KeyCode::Backspace => { text.pop(); }
+            KeyCode::Backspace => {
+                text.pop();
+            }
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => return self.submit_input(),
             _ => {}
@@ -561,8 +571,7 @@ impl App {
     pub fn comment_at_cursor(&self) -> Option<&Comment> {
         let path = &self.current_file()?.path;
         let (line, side) = line_position(self.line_at_cursor()?)?;
-        self.current()?.review.comments.iter().rev()
-            .find(|c| &c.path == path && c.line == line && c.side == side)
+        self.current()?.review.comments.iter().rev().find(|c| &c.path == path && c.line == line && c.side == side)
     }
 
     /// Positions in the current file that have comments, for the diff's markers.
@@ -701,7 +710,9 @@ fn single_line(text: &str) -> String {
 /// has no line of its own in the new file. `index` is `None` on the header.
 fn nearest_new_line(hunk: &Hunk, index: Option<usize>) -> u32 {
     let (before, after) = hunk.lines.split_at(index.unwrap_or(0));
-    after.iter().find_map(|l| l.new_no)
+    after
+        .iter()
+        .find_map(|l| l.new_no)
         .or_else(|| before.iter().rev().find_map(|l| l.new_no))
         .unwrap_or_else(|| new_side_start(&hunk.header))
 }
@@ -734,10 +745,14 @@ fn content_hash(file: &crate::diff::FileDiff) -> u64 {
 /// `x` would otherwise queue saves faster than they finish.
 pub fn coalesce_saves(effects: Vec<Effect>) -> Vec<Effect> {
     let mut seen = HashSet::new();
-    let mut kept: Vec<Effect> = effects.into_iter().rev().filter(|e| match e {
-        Effect::SaveReview { id, .. } => seen.insert(id.clone()),
-        _ => true,
-    }).collect();
+    let mut kept: Vec<Effect> = effects
+        .into_iter()
+        .rev()
+        .filter(|e| match e {
+            Effect::SaveReview { id, .. } => seen.insert(id.clone()),
+            _ => true,
+        })
+        .collect();
     kept.reverse();
     kept
 }
@@ -755,18 +770,23 @@ pub fn line_position(line: &crate::diff::Line) -> Option<(u32, Side)> {
 /// Counts comments whose line text is no longer at that line in the diff.
 fn count_outdated(s: &WorktreeState) -> usize {
     let Some(diffs) = s.diffs.as_ref() else { return 0 };
-    s.review.comments.iter().filter(|c| {
-        // Filter rather than find: a typechange gives two entries with one path.
-        let current = diffs.iter()
-            .filter(|f| f.path == c.path)
-            .flat_map(|f| f.hunks.iter().flat_map(|h| &h.lines))
-            .find(|l| match c.side {
-                Side::New => l.new_no == Some(c.line),
-                Side::Old => l.new_no.is_none() && l.old_no == Some(c.line),
-            })
-            .map(|l| l.text.as_str());
-        c.is_outdated(current)
-    }).count()
+    s.review
+        .comments
+        .iter()
+        .filter(|c| {
+            // Filter rather than find: a typechange gives two entries with one path.
+            let current = diffs
+                .iter()
+                .filter(|f| f.path == c.path)
+                .flat_map(|f| f.hunks.iter().flat_map(|h| &h.lines))
+                .find(|l| match c.side {
+                    Side::New => l.new_no == Some(c.line),
+                    Side::Old => l.new_no.is_none() && l.old_no == Some(c.line),
+                })
+                .map(|l| l.text.as_str());
+            c.is_outdated(current)
+        })
+        .count()
 }
 
 #[cfg(test)]

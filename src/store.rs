@@ -1,6 +1,6 @@
+use crate::git::Worktree;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use crate::git::Worktree;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -14,7 +14,10 @@ const MAX_ENCODED_LEN: usize = 200;
 /// Which file version `Comment::line` counts in. A replaced line has the
 /// same number on both sides, so the number alone is ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Side { Old, New }
+pub enum Side {
+    Old,
+    New,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
@@ -313,7 +316,8 @@ mod tests {
     fn long_branch_names_save_and_stay_distinct() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
-        let names = ["語".repeat(27), "語".repeat(250), "語".repeat(250) + "x", "a".repeat(201), "a/".repeat(130) + "b"];
+        let names =
+            ["語".repeat(27), "語".repeat(250), "語".repeat(250) + "x", "a".repeat(201), "a/".repeat(130) + "b"];
         for name in &names {
             let mut r = Review::default();
             r.comments.push(comment(name));
@@ -484,7 +488,8 @@ mod tests {
 
     #[test]
     fn review_id_follows_the_branch_or_else_the_commit() {
-        let worktree = |branch: Option<&str>| Worktree { path: "wt".into(), head: "abc".into(), branch: branch.map(Into::into) };
+        let worktree =
+            |branch: Option<&str>| Worktree { path: "wt".into(), head: "abc".into(), branch: branch.map(Into::into) };
         assert_eq!(ReviewId::of(&worktree(Some("feat"))), ReviewId::Branch("feat".into()));
         assert_eq!(ReviewId::of(&worktree(None)), ReviewId::Commit("abc".into()));
     }

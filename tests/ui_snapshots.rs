@@ -18,7 +18,13 @@ const HEART: &str = "❤\u{fe0f}";
 
 fn sample_file() -> FileDiff {
     FileDiff {
-        path: "src/a.rs".into(), old_path: None, status: Status::Modified, binary: false, content_id: None, added: 1, removed: 1,
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: Status::Modified,
+        binary: false,
+        content_id: None,
+        added: 1,
+        removed: 1,
         hunks: vec![Hunk {
             header: "@@ -1,2 +1,2 @@".into(),
             lines: vec![
@@ -32,9 +38,11 @@ fn sample_file() -> FileDiff {
 
 /// A file of one hunk holding `texts` as added lines.
 fn file_of(texts: &[&str]) -> FileDiff {
-    let lines = texts.iter().enumerate().map(|(i, t)| {
-        Line { kind: LineKind::Added, old_no: None, new_no: Some(i as u32 + 1), text: (*t).into() }
-    }).collect();
+    let lines = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| Line { kind: LineKind::Added, old_no: None, new_no: Some(i as u32 + 1), text: (*t).into() })
+        .collect();
     FileDiff { hunks: vec![Hunk { header: "@@ -0,0 +1 @@".into(), lines }], ..sample_file() }
 }
 
@@ -68,23 +76,32 @@ fn key() -> CacheKey {
 }
 
 fn worktrees(count: usize) -> Vec<Worktree> {
-    (0..count).map(|i| {
-        let name = format!("wt-{i:03}");
-        Worktree { path: format!("/r/{name}").into(), head: "h".into(), branch: Some(name) }
-    }).collect()
+    (0..count)
+        .map(|i| {
+            let name = format!("wt-{i:03}");
+            Worktree { path: format!("/r/{name}").into(), head: "h".into(), branch: Some(name) }
+        })
+        .collect()
 }
 
 fn comments(count: u32, path: &str) -> Vec<Comment> {
-    (0..count).map(|i| Comment {
-        path: path.into(), line: i, side: Side::New, line_text: String::new(), body: "b".into(),
-    }).collect()
+    (0..count)
+        .map(|i| Comment { path: path.into(), line: i, side: Side::New, line_text: String::new(), body: "b".into() })
+        .collect()
 }
 
 fn app_with(files: Vec<FileDiff>) -> App {
     let mut a = App::new("develop".into());
-    let wts = ["feat-auth", "fix-cache"].map(|n| Worktree { path: format!("/r/{n}").into(), head: "h".into(), branch: Some(n.into()) });
+    let wts = ["feat-auth", "fix-cache"].map(|n| Worktree {
+        path: format!("/r/{n}").into(),
+        head: "h".into(),
+        branch: Some(n.into()),
+    });
     a.handle_msg(Msg::Worktrees(Ok(wts.to_vec())));
-    let _: Vec<Effect> = a.handle_msg(Msg::Loaded { path: "/r/feat-auth".into(), result: Ok(Loaded { key: key(), diffs: Arc::new(files), op: None }) });
+    let _: Vec<Effect> = a.handle_msg(Msg::Loaded {
+        path: "/r/feat-auth".into(),
+        result: Ok(Loaded { key: key(), diffs: Arc::new(files), op: None }),
+    });
     a
 }
 
@@ -95,7 +112,11 @@ fn app() -> App {
 /// An app listing one worktree at `/r/w` called `name`, with nothing loaded.
 fn one_worktree(name: &str) -> App {
     let mut a = App::new("develop".into());
-    a.handle_msg(Msg::Worktrees(Ok(vec![Worktree { path: "/r/w".into(), head: "h".into(), branch: Some(name.into()) }])));
+    a.handle_msg(Msg::Worktrees(Ok(vec![Worktree {
+        path: "/r/w".into(),
+        head: "h".into(),
+        branch: Some(name.into()),
+    }])));
     a
 }
 
@@ -104,7 +125,10 @@ fn badged(name: &str, added: u32, comment_count: u32) -> App {
     let mut a = one_worktree(name);
     let key = CacheKey { worktree: "/r/w".into(), ..key() };
     let file = FileDiff { added, ..sample_file() };
-    a.handle_msg(Msg::Loaded { path: "/r/w".into(), result: Ok(Loaded { key, diffs: Arc::new(vec![file]), op: Some("rebase") }) });
+    a.handle_msg(Msg::Loaded {
+        path: "/r/w".into(),
+        result: Ok(Loaded { key, diffs: Arc::new(vec![file]), op: Some("rebase") }),
+    });
     a.handle_msg(Msg::Stale("/r/w".into()));
     a.handle_msg(Msg::Loaded { path: "/r/w".into(), result: Err(GitError::NoMergeBase) });
     a.states[0].review.comments = comments(comment_count, "src/a.rs");
@@ -161,9 +185,7 @@ fn pane_width(terminal: u16) -> u16 {
 /// Columns of the side-by-side divider on each diff row with one.
 fn divider_columns(buffer: &Buffer) -> Vec<u16> {
     let (left, right, bottom) = (2 * pane_width(buffer.area.width) + 1, buffer.area.width - 1, buffer.area.height - 2);
-    (1..bottom).flat_map(|y| {
-        (left..right).filter(move |&x| buffer[(x, y)].symbol() == "│")
-    }).collect()
+    (1..bottom).flat_map(|y| (left..right).filter(move |&x| buffer[(x, y)].symbol() == "│")).collect()
 }
 
 /// Checks that the divider is on all of three diff rows, in one column.
@@ -181,9 +203,10 @@ fn is_reversed(cell: &Cell) -> bool {
 fn reversed_file_rows(buffer: &Buffer) -> Vec<(u16, String)> {
     let pane = pane_width(buffer.area.width);
     let (left, right) = (pane + 1, 2 * pane - 1);
-    (1..buffer.area.height - 2).filter(|&y| is_reversed(&buffer[(left, y)])).map(|y| {
-        (y, (left..right).map(|x| buffer[(x, y)].symbol()).collect())
-    }).collect()
+    (1..buffer.area.height - 2)
+        .filter(|&y| is_reversed(&buffer[(left, y)]))
+        .map(|y| (y, (left..right).map(|x| buffer[(x, y)].symbol()).collect()))
+        .collect()
 }
 
 /// The cells inside the diff pane on screen row `y`, skipping the second half
@@ -232,7 +255,9 @@ fn help_overlay_lists_every_hotkey() {
     let mut a = app();
     press(&mut a, "?");
     let out = render_sized(&mut a, 80, 24);
-    for label in ["next worktree", "fuzzy", "comment", "reviewed", "base branch", "this help", "esc", "close help or a prompt"] {
+    for label in
+        ["next worktree", "fuzzy", "comment", "reviewed", "base branch", "this help", "esc", "close help or a prompt"]
+    {
         assert!(out.to_lowercase().contains(label), "missing {label}");
     }
     insta::assert_snapshot!(out);
@@ -406,7 +431,9 @@ fn a_long_worktree_name_leaves_room_for_its_badges() {
 
 #[test]
 fn the_selected_file_stays_visible_among_thousands_with_its_own_reviewed_mark() {
-    let files = (0..5000).map(|i| FileDiff { path: format!("f{i}.rs"), content_id: Some(i.to_string()), ..sample_file() }).collect();
+    let files = (0..5000)
+        .map(|i| FileDiff { path: format!("f{i}.rs"), content_id: Some(i.to_string()), ..sample_file() })
+        .collect();
     let mut a = app_with(files);
     a.focus = Focus::Files;
     press(&mut a, &"j".repeat(4990));
@@ -533,7 +560,10 @@ fn a_list_that_shrinks_leaves_a_valid_offset() {
     render(&mut a);
     assert_eq!(a.current().unwrap().file_offset, 31);
 
-    a.handle_msg(Msg::Loaded { path: "/r/feat-auth".into(), result: Ok(Loaded { key: key(), diffs: Arc::new(numbered_files(3)), op: None }) });
+    a.handle_msg(Msg::Loaded {
+        path: "/r/feat-auth".into(),
+        result: Ok(Loaded { key: key(), diffs: Arc::new(numbered_files(3)), op: None }),
+    });
     let out = render(&mut a);
     assert_eq!(a.current().unwrap().file_offset, 0);
     assert_eq!(row_of(&out, "f000.rs"), Some(1), "{out}");
@@ -566,7 +596,10 @@ fn a_taller_terminal_shows_as_much_of_the_list_as_fits() {
 fn the_file_offset_survives_switching_away_and_back() {
     let mut a = app_with(numbered_files(40));
     let other = CacheKey { worktree: "/r/fix-cache".into(), ..key() };
-    a.handle_msg(Msg::Loaded { path: "/r/fix-cache".into(), result: Ok(Loaded { key: other, diffs: Arc::new(numbered_files(2)), op: None }) });
+    a.handle_msg(Msg::Loaded {
+        path: "/r/fix-cache".into(),
+        result: Ok(Loaded { key: other, diffs: Arc::new(numbered_files(2)), op: None }),
+    });
     a.focus = Focus::Files;
     press(&mut a, &"j".repeat(20));
     render(&mut a);
@@ -663,7 +696,11 @@ fn the_status_bar_drops_its_help_hint_whole_when_it_does_not_fit() {
 #[test]
 fn counts_in_the_status_bar_are_pluralised() {
     let two = FileDiff { path: "src/b.rs".into(), ..sample_file() };
-    let cases = [(vec![sample_file()], 1, "1 file   1 comment"), (vec![sample_file(), two], 2, "2 files   2 comments"), (vec![], 0, "0 files   0 comments")];
+    let cases = [
+        (vec![sample_file()], 1, "1 file   1 comment"),
+        (vec![sample_file(), two], 2, "2 files   2 comments"),
+        (vec![], 0, "0 files   0 comments"),
+    ];
     for (files, count, expected) in cases {
         let mut a = app_with(files);
         a.states[0].review.comments = comments(count, "nowhere");
@@ -733,7 +770,8 @@ fn finder_rows_keep_the_end_of_names_that_share_a_prefix() {
     let shared = format!("feature/{}", "shared-prefix-".repeat(8));
     let [alpha, beta] = [format!("{shared}alpha"), format!("{shared}beta")];
     let mut a = App::new("develop".into());
-    let list = [&alpha, &beta].map(|n| Worktree { path: format!("/r/{n}").into(), head: "h".into(), branch: Some(n.clone()) });
+    let list =
+        [&alpha, &beta].map(|n| Worktree { path: format!("/r/{n}").into(), head: "h".into(), branch: Some(n.clone()) });
     a.handle_msg(Msg::Worktrees(Ok(list.to_vec())));
     press(&mut a, "wfeature");
     let out = render_sized(&mut a, 80, 24);
@@ -865,7 +903,10 @@ fn a_shrunk_diff_keeps_the_cursor_on_screen() {
     a.focus = Focus::Diff;
     press(&mut a, &"j".repeat(40));
     render(&mut a);
-    a.handle_msg(Msg::Loaded { path: "/r/feat-auth".into(), result: Ok(Loaded { key: key(), diffs: Arc::new(vec![long_file(3)]), op: None }) });
+    a.handle_msg(Msg::Loaded {
+        path: "/r/feat-auth".into(),
+        result: Ok(Loaded { key: key(), diffs: Arc::new(vec![long_file(3)]), op: None }),
+    });
     let out = render(&mut a);
     assert_eq!(a.current().unwrap().scroll, 0);
     assert_eq!(row_of(&out, "line1"), Some(2), "{out}");

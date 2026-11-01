@@ -266,7 +266,8 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
             }
             // A branch switch keeps the path but changes the review, and saving
             // the old one would overwrite the new branch's comments.
-            let reload: Vec<bool> = list.iter()
+            let reload: Vec<bool> = list
+                .iter()
                 .map(|w| !app.worktrees.iter().any(|o| o.path == w.path && ReviewId::of(o) == ReviewId::of(w)))
                 .collect();
             let effects = app.handle_msg(Msg::Worktrees(Ok(list)));
