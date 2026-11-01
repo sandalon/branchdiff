@@ -10,7 +10,7 @@ struct Config {
     base: Option<String>,
 }
 
-/// Reads `base` from the config. A missing file is no setting at all. `Err` holds
+/// Reads `base` from the config. A missing file or a blank value is no setting. `Err` holds
 /// a one-line notice for a file that exists but can't be used.
 pub fn configured_base(common_dir: &Path) -> Result<Option<String>, String> {
     let notice = |e: &dyn std::fmt::Display| {
@@ -23,7 +23,7 @@ pub fn configured_base(common_dir: &Path) -> Result<Option<String>, String> {
         Err(e) => return Err(notice(&e)),
     };
     let config: Config = toml::from_str(&text).map_err(|e| notice(&e))?;
-    Ok(config.base)
+    Ok(config.base.filter(|base| !base.trim().is_empty()))
 }
 
 #[cfg(test)]
@@ -55,6 +55,14 @@ mod tests {
     fn a_file_without_base_sets_nothing() {
         let dir = with_config(b"# nothing yet\n");
         assert_eq!(configured_base(dir.path()), Ok(None));
+    }
+
+    #[test]
+    fn a_blank_base_sets_nothing() {
+        for text in ["base = \"\"\n", "base = \"   \"\n", "base = \"\\t\\n\"\n"] {
+            let dir = with_config(text.as_bytes());
+            assert_eq!(configured_base(dir.path()), Ok(None), "{text}");
+        }
     }
 
     #[test]
