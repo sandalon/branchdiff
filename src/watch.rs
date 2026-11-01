@@ -327,6 +327,7 @@ impl Tracker {
             for root in &self.worktrees.watched {
                 self.bursts.record(root.clone(), now);
             }
+            self.list_changed.record(self.worktrees_dir.clone(), now);
         }
         if !is_change(&event.kind) {
             return;
@@ -524,8 +525,15 @@ mod tests {
     }
 
     #[test]
+    fn dropped_events_refresh_the_list_since_a_worktree_may_have_been_added() {
+        let (_, list_changed, _rx) = handled(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        assert!(list_changed);
+    }
+
+    #[test]
     fn ordinary_events_mark_nothing_wholesale() {
         assert!(handled(Ok(Event::new(EventKind::Other))).0.is_empty());
+        assert!(!handled(Ok(Event::new(EventKind::Other))).1);
         let edit = Event::new(EventKind::Remove(RemoveKind::File)).add_path("/r/a/x".into());
         assert!(handled(Ok(edit)).0.is_empty());
     }
