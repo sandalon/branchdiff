@@ -4345,7 +4345,9 @@ fn write_export(rt: &Runtime, md: &str) -> String {
 }
 
 fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut App, rt: &Runtime) -> Result<()> {
-    let (prog, args) = editor::command(&editor::default_editor(), path, line);
+    // Git's own rules: `GIT_EDITOR`, `core.editor`, `VISUAL`, then `EDITOR`.
+    let chosen = git::editor(&rt.repo).unwrap_or_else(editor::default_editor);
+    let (prog, args) = editor::command(&chosen, path, line);
     rt.paused.store(true, Ordering::SeqCst);
     set_bracketed_paste(false);
     ratatui::restore();
@@ -4356,8 +4358,10 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
     set_bracketed_paste(true);
     terminal.clear()?;
     rt.paused.store(false, Ordering::SeqCst);
-    if let Err(e) = status {
-        app.notice = Some(format!("Could not start {prog}: {e}"));
+    match status {
+        Ok(s) if !s.success() => app.notice = Some(format!("{prog} exited with {s}")),
+        Err(e) => app.notice = Some(format!("Could not start {prog}: {e}")),
+        Ok(_) => {}
     }
     Ok(())
 }
@@ -4381,6 +4385,10 @@ Add this method to `App` in `src/app.rs`, with a test in `src/app/tests.rs` that
 Also test that replacing the selected worktree's review cancels an open comment and clear prompt, and that replacing another worktree's leaves them open.
 
 Add change tracking to `Loads` in `src/worker.rs`, with tests: `pub fn mark_changed(&mut self, path: &Path)` records that a worktree changed while its load runs, and does nothing if no load is running. `Finished` gains `pub changed: bool`, which is true only when a change was marked and no waiting load follows, because a waiting load starts after the change and includes it. Promoting a waiting job clears the mark.
+
+Add `pub fn editor(cwd: &Path) -> Option<String>` to `src/git.rs`, running `git var GIT_EDITOR` and returning its trimmed output, or `None` on failure or blank output, with tests that `core.editor` is honoured and that a failure gives `None`.
+
+Ctrl-C while the editor runs: raw mode is off then, so SIGINT reaches this process too. Test it in a real terminal with a slow editor command. If it kills `branchdiff` or leaves the terminal broken, ignore SIGINT while the child runs, without adding a dependency if that's practical, and say what you did.
 
 Two behaviours to preserve while wiring this up:
 
@@ -4683,7 +4691,7 @@ The Linux build depends on the system libc. `arboard` is built with `wayland-dat
 
 **Step 3: Write `README.md`**
 
-Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from `HELP` in `src/ui.rs`, which adds `q` and `Esc` for prompts, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, that ignored files written inside a submodule can show it falsely, that the badge can also appear falsely after a first build or after renaming an ignored directory, that on Linux a low inotify limit makes the badge incomplete and shows a notice, that on macOS a worktree reached through a symlink created after it was added won't show the badge for file edits, that on Windows deleting a worktree's directory by hand isn't noticed until the list next refreshes, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside, and that colours assume a dark background, so context rows can be hard to read on a light terminal.
+Cover: what it does, install from a release binary or `cargo install --path .`, usage (`branchdiff`, `branchdiff --base main`), the base branch config file at `<git-common-dir>/branchdiff/config.toml` with `base = "main"`, the hotkey table from `HELP` in `src/ui.rs`, which adds `q` and `Esc` for prompts, the fact that comments are stored under `<git-common-dir>/branchdiff/` and never modify a worktree, and that on Linux without a clipboard manager, copied text is lost when `branchdiff` quits, that a commit inside a real submodule may not show the "changed" badge until `r` is pressed, that ignored files written inside a submodule can show it falsely, that the badge can also appear falsely after a first build or after renaming an ignored directory, that on Linux a low inotify limit makes the badge incomplete and shows a notice, that on macOS a worktree reached through a symlink created after it was added won't show the badge for file edits, that on Windows deleting a worktree's directory by hand isn't noticed until the list next refreshes, that on Windows VS Code may need `EDITOR=code.cmd`, and that two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save, that review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside, and that colours assume a dark background, so context rows can be hard to read on a light terminal.
 
 **Step 4: Verify the final state**
 
