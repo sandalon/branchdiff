@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cache;
+pub mod config;
 pub mod diff;
 pub mod editor;
 pub mod export;

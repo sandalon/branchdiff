@@ -5,7 +5,7 @@ use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{ReviewId, Store};
 use branchdiff::worker::{Job, Loads, Msg, Pool, WORKER_THREAD};
-use branchdiff::{editor, ui, watch};
+use branchdiff::{config, editor, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
@@ -26,17 +26,6 @@ struct Cli {
     base: Option<String>,
 }
 
-#[derive(serde::Deserialize, Default)]
-struct Config {
-    base: Option<String>,
-}
-
-/// Reads `base` from `<git-common-dir>/branchdiff/config.toml`.
-fn configured_base(info: &RepoInfo) -> Option<String> {
-    let text = std::fs::read_to_string(info.common_dir.join("branchdiff/config.toml")).ok()?;
-    toml::from_str::<Config>(&text).ok()?.base
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
@@ -45,12 +34,16 @@ fn main() -> Result<()> {
         Err(e @ (GitError::GitMissing | GitError::NotARepo)) => bail!("{e}"),
         Err(e) => return Err(e).context("could not read the repository"),
     };
-    let base = cli.base.or_else(|| configured_base(&info)).unwrap_or_else(|| "develop".into());
+    let (configured, config_problem) = match config::configured_base(&info.common_dir) {
+        Ok(base) => (base, None),
+        Err(notice) => (None, Some(notice)),
+    };
+    let base = cli.base.or(configured).unwrap_or_else(|| "develop".into());
 
     let mut terminal = ratatui::init();
     keep_terminal_on_worker_panic();
     set_bracketed_paste(true);
-    let result = run(&mut terminal, info, base);
+    let result = run(&mut terminal, info, base, config_problem);
     set_bracketed_paste(false);
     ratatui::restore();
     result
@@ -122,7 +115,7 @@ fn spawn_input(tx: Sender<Event>, paused: Arc<AtomicBool>) {
     });
 }
 
-fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<()> {
+fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Option<String>) -> Result<()> {
     let (msg_tx, msg_rx) = unbounded::<Msg>();
     let (key_tx, key_rx) = unbounded::<Event>();
     let paused = Arc::new(AtomicBool::new(false));
@@ -145,6 +138,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String) -> Result<(
     };
     let mut app = App::new(base);
     app.truecolor = supports_truecolor();
+    app.notice = notice;
     if watch_failed {
         app.notice = Some("File watching is unavailable, so the changed badge will not appear".into());
     }
