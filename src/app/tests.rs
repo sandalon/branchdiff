@@ -1487,3 +1487,21 @@ fn replacing_another_worktrees_review_leaves_prompts_open() {
     a.set_review(1, Review::default());
     assert!(matches!(a.input, Some(Input::ConfirmClear)));
 }
+
+#[test]
+fn repository_commands_run_in_the_first_directory_that_still_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let [start, one, two, common] = ["start", "one", "two", "common"].map(|n| dir.path().join(n));
+    for path in [&start, &two, &common] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let worktree = |path: &std::path::Path| Worktree { path: path.into(), head: "h".into(), branch: None };
+    let mut a = App::new("develop".into());
+    a.handle_msg(Msg::Worktrees(Ok(vec![worktree(&one), worktree(&two)])));
+
+    assert_eq!(a.repo_dir(&start, &common), start);
+    std::fs::remove_dir(&start).unwrap();
+    assert_eq!(a.repo_dir(&start, &common), two);
+    std::fs::remove_dir(&two).unwrap();
+    assert_eq!(a.repo_dir(&start, &common), common);
+}

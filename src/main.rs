@@ -98,6 +98,12 @@ struct Runtime {
     highlighting: HashSet<(CacheKey, usize)>,
 }
 
+impl Runtime {
+    fn repo_dir(&self, app: &App) -> PathBuf {
+        app.repo_dir(&self.repo, &self.common_dir)
+    }
+}
+
 /// Polls rather than blocking in `read`, so it can stop consuming keys while
 /// an editor owns the terminal.
 fn spawn_input(tx: Sender<Event>, paused: Arc<AtomicBool>) {
@@ -251,8 +257,8 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
                 rt.pool.submit(job);
             }
         }
-        Effect::ReloadWorktrees => rt.pool.submit(Job::ListWorktrees { cwd: rt.repo.clone() }),
-        Effect::ListBranches => rt.pool.submit(Job::ListBranches { cwd: rt.repo.clone() }),
+        Effect::ReloadWorktrees => rt.pool.submit(Job::ListWorktrees { cwd: rt.repo_dir(app) }),
+        Effect::ListBranches => rt.pool.submit(Job::ListBranches { cwd: rt.repo_dir(app) }),
         Effect::Highlight { key, file_index, diffs } => {
             // Holding `n` would otherwise queue a job per file passed and
             // bury refreshes. A skipped file is requested again on return.
@@ -294,7 +300,7 @@ fn write_export(rt: &Runtime, md: &str) -> String {
 }
 
 fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut App, rt: &Runtime) -> Result<()> {
-    let chosen = editor::default_editor(git::core_editor(&rt.repo));
+    let chosen = editor::default_editor(git::core_editor(&rt.repo_dir(app)));
     let (prog, args) = editor::command(&chosen, path, line);
     rt.paused.store(true, Ordering::SeqCst);
     let status = editor::without_interrupts(|| -> Result<_> {

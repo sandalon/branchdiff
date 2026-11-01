@@ -178,8 +178,8 @@ where
     catch_unwind(f).unwrap_or_else(|payload| Err(GitError::Failed(panic_text(payload.as_ref()))))
 }
 
-/// One short line for a worktree row. Once `main` installs the panic hook that
-/// skips workers (Task 16), this is all anyone sees of a worker panic.
+/// One short line for a worktree row. `main`'s panic hook skips workers, so
+/// this is all anyone sees of a worker panic.
 fn panic_text(payload: &(dyn Any + Send)) -> String {
     let message = payload.downcast_ref::<&str>().copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))

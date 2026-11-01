@@ -6,7 +6,7 @@ use crate::store::{fnv1a, Comment, Review, ReviewId, Side};
 use crate::worker::Msg;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus { Worktrees, Files, Diff }
@@ -160,6 +160,18 @@ impl App {
             s.review = review;
             s.outdated = count_outdated(s);
         }
+    }
+
+    /// Where to run git commands that concern the whole repository. `start`,
+    /// where the app started, can be a worktree removed since. The common dir is
+    /// the last resort, as `git::list_worktrees` needs a working tree for a
+    /// separate git dir.
+    pub fn repo_dir(&self, start: &Path, common_dir: &Path) -> PathBuf {
+        let worktrees = self.worktrees.iter().map(|w| w.path.as_path());
+        std::iter::once(start).chain(worktrees)
+            .find(|dir| dir.is_dir())
+            .unwrap_or(common_dir)
+            .to_path_buf()
     }
 
     pub fn selected_worktree(&self) -> Option<&Worktree> {
