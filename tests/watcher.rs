@@ -39,8 +39,11 @@ fn run_each_test_in_its_own_process() {
     let mut failed = Vec::new();
     for (name, child) in children {
         let out = child.wait_with_output().unwrap();
-        if !out.status.success() {
-            failed.push(format!("{name}:\n{}", String::from_utf8_lossy(&out.stdout)));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // A name that matches no test still exits 0.
+        if !out.status.success() || !stdout.contains(" 1 passed") {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            failed.push(format!("{name}: {}\n{stdout}\n{stderr}", out.status));
         }
     }
     assert!(failed.is_empty(), "{} of {} failed\n{}", failed.len(), names.len(), failed.join("\n"));

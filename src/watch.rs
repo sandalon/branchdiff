@@ -506,11 +506,18 @@ mod tests {
         notify::NullWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default()).unwrap()
     }
 
-    /// A tracker watching `/r/a` and `/r/b`, with what it would report after `event`.
-    fn handled(event: notify::Result<Event>) -> (Vec<PathBuf>, bool, Receiver<Msg>) {
+    /// A tracker watching `/r/a` and `/r/b`.
+    fn tracker() -> (Tracker, Receiver<Msg>) {
         let (tx, rx) = unbounded();
         let mut t = Tracker::new("/r/main/.git/worktrees".into(), tx);
-        t.worktrees.watched = HashSet::from([PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
+        t.worktrees.roots = vec!["/r/a".into(), "/r/b".into()];
+        t.worktrees.watched = t.worktrees.roots.iter().cloned().collect();
+        (t, rx)
+    }
+
+    /// What a tracker would report after `event`.
+    fn handled(event: notify::Result<Event>) -> (Vec<PathBuf>, bool, Receiver<Msg>) {
+        let (mut t, rx) = tracker();
         let now = Instant::now();
         t.handle_event(&mut null_watcher(), event, now);
         let mut stale = t.bursts.due(now + DEBOUNCE);
@@ -536,6 +543,20 @@ mod tests {
         assert!(!handled(Ok(Event::new(EventKind::Other))).1);
         let edit = Event::new(EventKind::Remove(RemoveKind::File)).add_path("/r/a/x".into());
         assert!(handled(Ok(edit)).0.is_empty());
+    }
+
+    #[test]
+    fn reading_a_path_in_a_known_root_records_nothing() {
+        use notify::event::{AccessKind, AccessMode, DataChange, ModifyKind};
+        let records = |kind, path: &str| {
+            let (mut t, _rx) = tracker();
+            t.handle_event(&mut null_watcher(), Ok(Event::new(kind).add_path(path.into())), Instant::now());
+            !(t.unchecked.is_empty() && t.bursts.is_empty() && t.list_changed.is_empty())
+        };
+        for path in ["/r/a/x", "/r/a/.git/index", "/r/a/.git/HEAD"] {
+            assert!(records(EventKind::Modify(ModifyKind::Data(DataChange::Any)), path), "{path}");
+            assert!(!records(EventKind::Access(AccessKind::Close(AccessMode::Read)), path), "{path}");
+        }
     }
 
     #[test]
