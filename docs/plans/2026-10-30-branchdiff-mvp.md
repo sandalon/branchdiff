@@ -4345,8 +4345,7 @@ fn write_export(rt: &Runtime, md: &str) -> String {
 }
 
 fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut App, rt: &Runtime) -> Result<()> {
-    // Git's own rules: `GIT_EDITOR`, `core.editor`, `VISUAL`, then `EDITOR`.
-    let chosen = git::editor(&rt.repo).unwrap_or_else(editor::default_editor);
+    let chosen = editor::default_editor(git::core_editor(&rt.repo));
     let (prog, args) = editor::command(&chosen, path, line);
     rt.paused.store(true, Ordering::SeqCst);
     set_bracketed_paste(false);
@@ -4386,7 +4385,7 @@ Also test that replacing the selected worktree's review cancels an open comment 
 
 Add change tracking to `Loads` in `src/worker.rs`, with tests: `pub fn mark_changed(&mut self, path: &Path)` records that a worktree changed while its load runs, and does nothing if no load is running. `Finished` gains `pub changed: bool`, which is true only when a change was marked and no waiting load follows, because a waiting load starts after the change and includes it. Promoting a waiting job clears the mark.
 
-Add `pub fn editor(cwd: &Path) -> Option<String>` to `src/git.rs`, running `git var GIT_EDITOR` and returning its trimmed output, or `None` on failure or blank output, with tests that `core.editor` is honoured and that a failure gives `None`.
+Add `pub fn core_editor(cwd: &Path) -> Option<String>` to `src/git.rs`, running `git config --get core.editor` and returning its trimmed output, or `None` on failure or blank output. Change `editor::default_editor` to take that value, and check in git's order: `GIT_EDITOR`, `core.editor`, `VISUAL`, `EDITOR`, then `FALLBACK`. Don't use `git var GIT_EDITOR`: it answers `vi` when nothing is set, so `FALLBACK`, which is `notepad` on Windows, would never run. Make the order testable without touching the process environment, for example a private function taking the values as arguments. Add tests that `core.editor` is honoured and that a missing value gives `None`.
 
 Ctrl-C while the editor runs: raw mode is off then, so SIGINT reaches this process too. Test it in a real terminal with a slow editor command. If it kills `branchdiff` or leaves the terminal broken, ignore SIGINT while the child runs, without adding a dependency if that's practical, and say what you did.
 
