@@ -89,6 +89,11 @@ where
         // Keeps non-ASCII paths readable. Names with tabs or quotes are still
         // C-quoted, and the patch parser handles those.
         .args(["-c", "core.quotePath=false"])
+        // Windows defaults to `core.autocrlf=true`, which strips `\r` from
+        // `git diff` output on a CRLF checkout; patch lines would then not
+        // match the raw bytes the untracked reader keeps. Force byte-faithful
+        // output everywhere so cached, commented line text agrees.
+        .args(["-c", "core.autocrlf=false"])
         // Stops `git diff` refreshing the index, which takes `index.lock` and
         // can race a concurrent `git add`. GIT_OPTIONAL_LOCKS does not cover it.
         .args(["-c", "diff.autoRefreshIndex=false"])
