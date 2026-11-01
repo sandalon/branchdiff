@@ -1,6 +1,7 @@
-//! These run one at a time, in their own test binary, because each `watch` call
-//! restarts an FSEvents stream. That takes about 200 ms when run from
-//! `target/debug/deps`, and several at once in one process stall for seconds.
+//! Each test runs in its own process, in parallel, because several watchers in
+//! one process stall in `FSEventStreamStart` for seconds, which loses events. So
+//! they are all `#[ignore]`d, and `run_each_test_in_its_own_process` runs them.
+//! To run one by hand: `cargo test --test watcher -- --ignored --exact <name>`.
 
 mod common;
 use branchdiff::git;
@@ -10,32 +11,51 @@ use common::{git as run, real, repo_with_submodule, Repo, SeparateGitDir};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::process::{Child, Command as Process, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const PATIENCE: Duration = Duration::from_secs(10);
+const PATIENCE: Duration = Duration::from_secs(30);
+
 /// Long enough for the watcher to report anything it was going to.
-const QUIET: Duration = Duration::from_millis(1000);
+/// `BRANCHDIFF_TEST_QUIET_MS` raises it for a slow machine.
+fn quiet() -> Duration {
+    let ms = std::env::var("BRANCHDIFF_TEST_QUIET_MS").ok().and_then(|ms| ms.parse().ok());
+    Duration::from_millis(ms.unwrap_or(1000))
+}
 
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn take_turn() -> MutexGuard<'static, ()> {
-    // A failed test poisons the lock, which says nothing about the next one.
-    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+#[test]
+fn run_each_test_in_its_own_process() {
+    let exe = std::env::current_exe().unwrap();
+    let list = Process::new(&exe).args(["--list", "--ignored"]).output().unwrap();
+    let list = String::from_utf8(list.stdout).unwrap();
+    let names: Vec<_> = list.lines().filter_map(|l| l.strip_suffix(": test")).collect();
+    assert!(!names.is_empty(), "no tests listed:\n{list}");
+    let spawn = |name: &&str| -> Child {
+        let args = ["--ignored", "--exact", name];
+        Process::new(&exe).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+    };
+    let children: Vec<_> = names.iter().map(|name| (*name, spawn(name))).collect();
+    let mut failed = Vec::new();
+    for (name, child) in children {
+        let out = child.wait_with_output().unwrap();
+        if !out.status.success() {
+            failed.push(format!("{name}:\n{}", String::from_utf8_lossy(&out.stdout)));
+        }
+    }
+    assert!(failed.is_empty(), "{} of {} failed\n{}", failed.len(), names.len(), failed.join("\n"));
 }
 
 struct Session {
     msgs: Receiver<Msg>,
     cmds: Sender<Command>,
-    _turn: MutexGuard<'static, ()>,
 }
 
 impl Session {
     fn start(common_dir: &Path, roots: &[&Path]) -> Self {
-        let turn = take_turn();
         let (tx, msgs) = crossbeam_channel::unbounded();
         let cmds = watch::spawn(common_dir.to_path_buf(), tx).unwrap();
-        let session = Self { msgs, cmds, _turn: turn };
+        let session = Self { msgs, cmds };
         session.set_roots(roots);
         session.settle();
         session
@@ -105,7 +125,7 @@ impl Session {
     fn assert_commit_marks_only(&self, root: &Path) {
         run(root, &["commit", "-qm", "work", "--allow-empty"]);
         assert_eq!(self.next_stale().as_deref(), Some(root));
-        while let Ok(msg) = self.msgs.recv_timeout(QUIET) {
+        while let Ok(msg) = self.msgs.recv_timeout(quiet()) {
             if let Msg::Stale(other) = msg {
                 assert_eq!(other, root);
             }
@@ -113,13 +133,13 @@ impl Session {
     }
 
     fn assert_no_msg(&self, context: &str) {
-        if let Ok(msg) = self.msgs.recv_timeout(QUIET) {
+        if let Ok(msg) = self.msgs.recv_timeout(quiet()) {
             panic!("{context}: {msg:?}");
         }
     }
 
     fn assert_list_unchanged(&self, context: &str) {
-        let deadline = Instant::now() + QUIET;
+        let deadline = Instant::now() + quiet();
         while let Ok(msg) = self.msgs.recv_deadline(deadline) {
             assert!(!matches!(msg, Msg::WorktreesChanged), "{context}");
         }
@@ -134,6 +154,7 @@ fn repo_with_main() -> (Repo, PathBuf, PathBuf) {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn commit_in_a_linked_worktree_marks_it_without_touching_the_list() {
     let (repo, main, common) = repo_with_main();
     let linked = real(&repo.add_worktree("feat"));
@@ -152,6 +173,7 @@ fn commit_in_a_linked_worktree_marks_it_without_touching_the_list() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn commit_with_an_untouched_index_marks_the_main_worktree() {
     let (_repo, main, common) = repo_with_main();
     let session = Session::start(&common, &[&main]);
@@ -160,6 +182,7 @@ fn commit_with_an_untouched_index_marks_the_main_worktree() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn switching_branch_refreshes_the_list_from_any_worktree() {
     let (repo, main, common) = repo_with_main();
     let linked = real(&repo.add_worktree("feat"));
@@ -172,6 +195,7 @@ fn switching_branch_refreshes_the_list_from_any_worktree() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn git_commands_in_a_linked_worktree_leave_the_list_alone() {
     let (repo, main, common) = repo_with_main();
     let linked = real(&repo.add_worktree("feat"));
@@ -183,6 +207,7 @@ fn git_commands_in_a_linked_worktree_leave_the_list_alone() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn every_ignore_source_is_respected() {
     let (_repo, main, common) = repo_with_main();
     let excludes = main.parent().unwrap().join("global-excludes");
@@ -207,6 +232,7 @@ fn every_ignore_source_is_respected() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn a_changed_gitignore_takes_effect_at_once() {
     let (_repo, main, common) = repo_with_main();
     std::fs::write(main.join(".gitignore"), "old/\n").unwrap();
@@ -224,6 +250,7 @@ fn a_changed_gitignore_takes_effect_at_once() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn edits_to_a_tracked_file_count_even_if_it_matches_an_ignore_rule() {
     let (_repo, main, common) = repo_with_main();
     std::fs::write(main.join(".gitignore"), "*.log\n").unwrap();
@@ -236,6 +263,7 @@ fn edits_to_a_tracked_file_count_even_if_it_matches_an_ignore_rule() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn steady_ignored_writes_do_not_hold_back_a_real_change() {
     let (_repo, main, common) = repo_with_main();
     std::fs::write(main.join(".gitignore"), "*.log\n").unwrap();
@@ -259,6 +287,7 @@ fn steady_ignored_writes_do_not_hold_back_a_real_change() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn a_root_missing_at_first_is_watched_once_it_exists() {
     let (repo, main, common) = repo_with_main();
     let later = main.parent().unwrap().join("later");
@@ -274,6 +303,7 @@ fn a_root_missing_at_first_is_watched_once_it_exists() {
 // Windows raises no event for the watched root itself.
 #[cfg(not(windows))]
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn deleting_a_worktree_without_git_refreshes_the_list() {
     let (repo, main, common) = repo_with_main();
     let linked = real(&repo.add_worktree("feat"));
@@ -283,6 +313,7 @@ fn deleting_a_worktree_without_git_refreshes_the_list() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn a_commit_in_a_nested_worktree_marks_only_that_worktree() {
     let (repo, main, common) = repo_with_main();
     std::fs::write(main.join(".gitignore"), ".worktrees/\n").unwrap();
@@ -292,12 +323,13 @@ fn a_commit_in_a_nested_worktree_marks_only_that_worktree() {
 
     run(&nested, &["commit", "-qm", "work", "--allow-empty"]);
     assert_eq!(session.next_stale(), Some(nested.clone()));
-    while let Ok(msg) = session.msgs.recv_timeout(QUIET) {
+    while let Ok(msg) = session.msgs.recv_timeout(quiet()) {
         assert!(!matches!(msg, Msg::Stale(p) if p == main));
     }
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn a_bare_repository_reports_every_new_worktree_and_their_commits() {
     let repo = Repo::new();
     let base = real(repo.main.parent().unwrap());
@@ -325,9 +357,9 @@ fn a_bare_repository_reports_every_new_worktree_and_their_commits() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn the_thread_ends_when_the_command_sender_is_dropped() {
     let (_repo, _main, common) = repo_with_main();
-    let _turn = take_turn();
     let (tx, rx) = crossbeam_channel::unbounded();
     let cmds = watch::spawn(common, tx).unwrap();
     drop(cmds);
@@ -336,6 +368,7 @@ fn the_thread_ends_when_the_command_sender_is_dropped() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn a_commit_in_a_normal_repository_marks_only_the_worktree_it_happened_in() {
     let (repo, main, common) = repo_with_main();
     let linked = real(&repo.add_worktree("feat"));
@@ -345,6 +378,7 @@ fn a_commit_in_a_normal_repository_marks_only_the_worktree_it_happened_in() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn a_commit_in_a_separate_git_dir_marks_its_main_worktree() {
     let repo = SeparateGitDir::new();
     run(&repo.worktree, &["add", "a.txt"]);
@@ -355,6 +389,7 @@ fn a_commit_in_a_separate_git_dir_marks_its_main_worktree() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn a_commit_in_a_submodule_marks_its_main_worktree() {
     let repo = Repo::new();
     let (_superproject, sub) = repo_with_submodule(&repo);
@@ -366,6 +401,7 @@ fn a_commit_in_a_submodule_marks_its_main_worktree() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn switching_branch_refreshes_the_list_when_dot_git_is_a_file() {
     let separate = SeparateGitDir::new();
     let repo = Repo::new();
@@ -379,6 +415,7 @@ fn switching_branch_refreshes_the_list_when_dot_git_is_a_file() {
 }
 
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn commits_in_a_separate_git_dir_mark_the_right_worktree() {
     let repo = SeparateGitDir::new();
     let linked = repo.worktree.parent().unwrap().join("linked");
@@ -391,6 +428,7 @@ fn commits_in_a_separate_git_dir_mark_the_right_worktree() {
 /// The linked worktree shares the name `sub` with the submodule's git dir, which
 /// is what the main worktree's `.git` file ends in.
 #[test]
+#[ignore = "run by run_each_test_in_its_own_process"]
 fn commits_in_a_submodule_mark_the_right_worktree_even_with_the_same_name() {
     let repo = Repo::new();
     let (superproject, sub) = repo_with_submodule(&repo);
