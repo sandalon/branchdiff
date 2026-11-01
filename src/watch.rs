@@ -2,7 +2,7 @@ use crate::git;
 use crate::worker::Msg;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use notify::event::{EventKind, RemoveKind};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ pub enum Command {
 
 /// Picks the deepest root containing `path`, so a nested worktree such as
 /// `.worktrees/a` is not reported as a change to the main worktree.
-pub fn owning_worktree(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+fn owning_worktree(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     let root = roots.iter()
         .filter(|r| path.starts_with(r))
         .max_by_key(|r| r.components().count())?;
@@ -62,7 +62,8 @@ fn classify(path: &Path, worktrees_dir: &Path, worktrees: &Worktrees) -> Option<
             _ => None,
         };
     }
-    if let (Some(main), Some(rel)) = (&worktrees.main_with_git_file, strip_common(path, worktrees_dir)) {
+    let in_common = worktrees_dir.parent().and_then(|common| path.strip_prefix(common).ok());
+    if let (Some(main), Some(rel)) = (&worktrees.main_with_git_file, in_common) {
         return if rel == Path::new("HEAD") {
             Some(Change::Head(main.clone()))
         } else if rel == Path::new("index") || rel == Path::new("logs/HEAD") {
@@ -88,10 +89,6 @@ fn is_change(kind: &EventKind) -> bool {
     !matches!(kind, EventKind::Access(_))
 }
 
-fn strip_common<'a>(path: &'a Path, worktrees_dir: &Path) -> Option<&'a Path> {
-    path.strip_prefix(worktrees_dir.parent()?).ok()
-}
-
 /// Where a worktree's `.git` file points, which a submodule gives as a relative
 /// path. `.git` is a directory in an ordinary main worktree, which gives `None`.
 fn git_dir_from_file(root: &Path) -> Option<PathBuf> {
@@ -107,25 +104,25 @@ struct Pending {
 
 /// Reports a key once no new event has arrived for the debounce window, or
 /// once it has been pending for `MAX_WAIT`, whichever comes first.
-pub struct Debouncer {
+struct Debouncer {
     window: Duration,
     pending: HashMap<PathBuf, Pending>,
 }
 
 impl Debouncer {
-    pub fn new(window: Duration) -> Self {
+    fn new(window: Duration) -> Self {
         Self { window, pending: HashMap::new() }
     }
 
-    pub fn record(&mut self, key: PathBuf, now: Instant) {
+    fn record(&mut self, key: PathBuf, now: Instant) {
         self.pending.entry(key).or_insert(Pending { first: now, last: now }).last = now;
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
 
-    pub fn due(&mut self, now: Instant) -> Vec<PathBuf> {
+    fn due(&mut self, now: Instant) -> Vec<PathBuf> {
         let window = self.window;
         let due: Vec<PathBuf> = self.pending.iter()
             .filter(|(_, p)| now.duration_since(p.last) >= window || now.duration_since(p.first) >= MAX_WAIT)
@@ -144,35 +141,16 @@ fn is_watch_limit(error: &notify::Error) -> bool {
 
 /// Tells the user about the watch limit, once, however often it is hit: a root
 /// that hit it is retried on every `SetWorktrees`.
-struct WatchLimit {
-    msgs: Sender<Msg>,
-    reported: bool,
-}
-
-impl WatchLimit {
-    fn new(msgs: Sender<Msg>) -> Self {
-        Self { msgs, reported: false }
-    }
-
-    fn note(&mut self, error: &notify::Error) {
-        if is_watch_limit(error) && !self.reported {
-            self.reported = true;
-            let _ = self.msgs.send(Msg::WatchLimit);
-        }
-    }
-}
-
-/// The OS dropped events, so a change anywhere may have gone unseen.
-fn roots_to_rescan(event: &Event, watched: &HashSet<PathBuf>) -> Vec<PathBuf> {
-    if event.need_rescan() {
-        watched.iter().cloned().collect()
-    } else {
-        Vec::new()
+fn report_limit(error: &notify::Error, reported: &mut bool, msgs: &Sender<Msg>) {
+    if is_watch_limit(error) && !*reported {
+        *reported = true;
+        let _ = msgs.send(Msg::WatchLimit);
     }
 }
 
 /// Starts the watcher thread. Send `SetWorktrees` whenever the list changes.
-/// The thread ends when the returned sender is dropped.
+/// The thread ends when the returned sender is dropped, or at its next message
+/// once the receiver for `msgs` is.
 pub fn spawn(common_dir: PathBuf, msgs: Sender<Msg>) -> notify::Result<Sender<Command>> {
     let (fs_tx, fs_rx) = unbounded::<notify::Result<Event>>();
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
@@ -182,18 +160,17 @@ pub fn spawn(common_dir: PathBuf, msgs: Sender<Msg>) -> notify::Result<Sender<Co
     // Recursive, because `worktrees` may not exist yet, is deleted along with the
     // last linked worktree, and holds their index files. A bare repository has
     // no worktree of its own to cover it.
-    let mut limit = WatchLimit::new(msgs.clone());
+    let mut tracker = Tracker::new(common_dir.join("worktrees"), msgs);
     if let Err(e) = watcher.watch(&common_dir, RecursiveMode::Recursive) {
         // The caller treats an error as having no watcher, which would hide the
         // limit, and whatever was watched before it was reached still works.
         if !is_watch_limit(&e) {
             return Err(e);
         }
-        limit.note(&e);
+        report_limit(&e, &mut tracker.limit_reported, &tracker.msgs);
     }
-    let worktrees_dir = common_dir.join("worktrees");
 
-    thread::spawn(move || run(watcher, worktrees_dir, fs_rx, cmd_rx, msgs, limit));
+    thread::spawn(move || run(watcher, fs_rx, cmd_rx, tracker));
     Ok(cmd_tx)
 }
 
@@ -211,7 +188,9 @@ struct Worktrees {
 }
 
 impl Worktrees {
-    fn set(&mut self, watcher: &mut RecommendedWatcher, next: Vec<PathBuf>, limit: &mut WatchLimit, worktrees_dir: &Path) {
+    /// Answers the errors from watching, so that the caller can spot the limit.
+    fn set(&mut self, watcher: &mut impl Watcher, next: Vec<PathBuf>, worktrees_dir: &Path) -> Vec<notify::Error> {
+        let mut errors = Vec::new();
         let gone: Vec<_> = self.watched.iter().filter(|r| !next.contains(r)).cloned().collect();
         for root in gone {
             self.forget(watcher, &root);
@@ -224,11 +203,12 @@ impl Worktrees {
                 Ok(()) => {
                     self.watched.insert(root.clone());
                 }
-                Err(e) => limit.note(&e),
+                Err(e) => errors.push(e),
             }
         }
         self.find_git_dirs(&next, worktrees_dir);
         self.roots = next;
+        errors
     }
 
     /// A `.git` file points at the common dir itself from the main worktree, and
@@ -248,18 +228,11 @@ impl Worktrees {
         }
     }
 
-    fn forget(&mut self, watcher: &mut RecommendedWatcher, root: &Path) {
+    fn forget(&mut self, watcher: &mut impl Watcher, root: &Path) {
         // Fails if the directory went first, which leaves nothing to undo.
         let _ = watcher.unwatch(root);
         self.watched.remove(root);
     }
-}
-
-/// `git::any_not_ignored` for one root's pending paths. A failure counts as a
-/// change, since a badge too many is better than a missed one.
-fn any_counts(root: &Path, paths: HashSet<PathBuf>) -> bool {
-    let paths: Vec<_> = paths.into_iter().collect();
-    git::any_not_ignored(root, &paths).unwrap_or(true)
 }
 
 /// A directory that is gone can only match a rule like `target/` with its
@@ -273,82 +246,147 @@ fn add_path(paths: &mut HashSet<PathBuf>, path: &Path, kind: &EventKind) {
     }
 }
 
+/// Paths waiting to be asked about, by root, in batches because each batch costs
+/// a process. A write to an ignored path must not extend a burst, or a busy log
+/// would hold back the badge for a real edit, so this runs ahead of `bursts`.
+struct IgnoreBatch {
+    paths: HashMap<PathBuf, HashSet<PathBuf>>,
+    first: Instant,
+}
+
+impl IgnoreBatch {
+    fn new() -> Self {
+        Self { paths: HashMap::new(), first: Instant::now() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    fn add(&mut self, root: PathBuf, path: &Path, kind: &EventKind, now: Instant) {
+        if self.is_empty() {
+            self.first = now;
+        }
+        add_path(self.paths.entry(root).or_default(), path, kind);
+    }
+
+    /// The roots with a path that counts, once the batch is due. A failure counts
+    /// as a change, since a badge too many is better than a missed one.
+    fn changed_roots(&mut self, now: Instant) -> Vec<PathBuf> {
+        if now.duration_since(self.first) < DEBOUNCE {
+            return Vec::new();
+        }
+        let mut changed = Vec::new();
+        for (root, paths) in self.paths.drain() {
+            let paths: Vec<_> = paths.into_iter().collect();
+            if git::any_not_ignored(&root, &paths).unwrap_or(true) {
+                changed.push(root);
+            }
+        }
+        changed
+    }
+}
+
+/// What the watcher thread knows between events.
+struct Tracker {
+    worktrees_dir: PathBuf,
+    worktrees: Worktrees,
+    unchecked: IgnoreBatch,
+    bursts: Debouncer,
+    list_changed: Debouncer,
+    limit_reported: bool,
+    msgs: Sender<Msg>,
+}
+
+impl Tracker {
+    fn new(worktrees_dir: PathBuf, msgs: Sender<Msg>) -> Self {
+        Self {
+            worktrees_dir,
+            worktrees: Worktrees::default(),
+            unchecked: IgnoreBatch::new(),
+            bursts: Debouncer::new(DEBOUNCE),
+            list_changed: Debouncer::new(DEBOUNCE),
+            limit_reported: false,
+            msgs,
+        }
+    }
+
+    fn set_worktrees(&mut self, watcher: &mut impl Watcher, next: Vec<PathBuf>) {
+        for e in self.worktrees.set(watcher, next, &self.worktrees_dir) {
+            report_limit(&e, &mut self.limit_reported, &self.msgs);
+        }
+    }
+
+    fn handle_event(&mut self, watcher: &mut impl Watcher, event: notify::Result<Event>, now: Instant) {
+        let event = match event {
+            Ok(event) => event,
+            Err(e) => return report_limit(&e, &mut self.limit_reported, &self.msgs),
+        };
+        if event.need_rescan() {
+            // The OS dropped events, so a change anywhere may have gone unseen.
+            for root in &self.worktrees.watched {
+                self.bursts.record(root.clone(), now);
+            }
+        }
+        if !is_change(&event.kind) {
+            return;
+        }
+        for path in &event.paths {
+            match classify(path, &self.worktrees_dir, &self.worktrees) {
+                Some(Change::File(root)) if path == &root && !root.exists() => {
+                    self.worktrees.forget(watcher, &root);
+                    self.list_changed.record(self.worktrees_dir.clone(), now);
+                }
+                Some(Change::File(root)) => self.unchecked.add(root, path, &event.kind, now),
+                Some(Change::State(root)) => self.bursts.record(root, now),
+                Some(Change::Head(root)) => {
+                    self.bursts.record(root, now);
+                    self.list_changed.record(self.worktrees_dir.clone(), now);
+                }
+                Some(Change::List) => self.list_changed.record(self.worktrees_dir.clone(), now),
+                None => {}
+            }
+        }
+    }
+
+    /// Answers false once nothing is listening.
+    fn send_due(&mut self, now: Instant) -> bool {
+        for root in self.unchecked.changed_roots(now) {
+            self.bursts.record(root, now);
+        }
+        for root in self.bursts.due(now) {
+            if self.msgs.send(Msg::Stale(root)).is_err() {
+                return false;
+            }
+        }
+        self.list_changed.due(now).is_empty() || self.msgs.send(Msg::WorktreesChanged).is_ok()
+    }
+
+    fn wait(&self) -> Duration {
+        let idle = self.unchecked.is_empty() && self.bursts.is_empty() && self.list_changed.is_empty();
+        if idle { IDLE } else { TICK }
+    }
+}
+
 fn run(
     mut watcher: RecommendedWatcher,
-    worktrees_dir: PathBuf,
     fs_rx: Receiver<notify::Result<Event>>,
     cmd_rx: Receiver<Command>,
-    msgs: Sender<Msg>,
-    mut limit: WatchLimit,
+    mut tracker: Tracker,
 ) {
-    let mut worktrees = Worktrees::default();
-    // Asked about in batches, because each batch costs a process. A write to an
-    // ignored path must not extend a burst, or a busy log would hold back the
-    // badge for a real edit, so this is checked ahead of `bursts` on a timer.
-    let mut unchecked: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-    let mut first_unchecked = Instant::now();
-    let mut bursts = Debouncer::new(DEBOUNCE);
-    let mut list_changed = Debouncer::new(DEBOUNCE);
-
     loop {
-        let idle = unchecked.is_empty() && bursts.is_empty() && list_changed.is_empty();
         select! {
             recv(cmd_rx) -> cmd => match cmd {
-                Ok(Command::SetWorktrees(next)) => worktrees.set(&mut watcher, next, &mut limit, &worktrees_dir),
+                Ok(Command::SetWorktrees(next)) => tracker.set_worktrees(&mut watcher, next),
                 Err(_) => return,
             },
             recv(fs_rx) -> event => {
                 let Ok(event) = event else { return };
-                let now = Instant::now();
-                match &event {
-                    Ok(event) => {
-                        for root in roots_to_rescan(event, &worktrees.watched) {
-                            bursts.record(root, now);
-                        }
-                    }
-                    Err(e) => limit.note(e),
-                }
-                for event in event.iter().filter(|e| is_change(&e.kind)) {
-                    for path in &event.paths {
-                        match classify(path, &worktrees_dir, &worktrees) {
-                            Some(Change::File(root)) if path == &root && !root.exists() => {
-                                worktrees.forget(&mut watcher, &root);
-                                list_changed.record(worktrees_dir.clone(), now);
-                            }
-                            Some(Change::File(root)) => {
-                                if unchecked.is_empty() {
-                                    first_unchecked = now;
-                                }
-                                add_path(unchecked.entry(root).or_default(), path, &event.kind);
-                            }
-                            Some(Change::State(root)) => bursts.record(root, now),
-                            Some(Change::Head(root)) => {
-                                bursts.record(root, now);
-                                list_changed.record(worktrees_dir.clone(), now);
-                            }
-                            Some(Change::List) => list_changed.record(worktrees_dir.clone(), now),
-                            None => {}
-                        }
-                    }
-                }
+                tracker.handle_event(&mut watcher, event, Instant::now());
             },
-            default(if idle { IDLE } else { TICK }) => {}
+            default(tracker.wait()) => {}
         }
-
-        let now = Instant::now();
-        if now.duration_since(first_unchecked) >= DEBOUNCE {
-            for (root, paths) in unchecked.drain() {
-                if any_counts(&root, paths) {
-                    bursts.record(root, now);
-                }
-            }
-        }
-        for root in bursts.due(now) {
-            if msgs.send(Msg::Stale(root)).is_err() {
-                return;
-            }
-        }
-        if !list_changed.due(now).is_empty() && msgs.send(Msg::WorktreesChanged).is_err() {
+        if !tracker.send_due(Instant::now()) {
             return;
         }
     }
@@ -454,30 +492,48 @@ mod tests {
     #[test]
     fn the_watch_limit_is_reported_once() {
         let (tx, rx) = unbounded();
-        let mut limit = WatchLimit::new(tx);
-        limit.note(&notify::Error::path_not_found());
+        let mut reported = false;
+        report_limit(&notify::Error::path_not_found(), &mut reported, &tx);
         assert_eq!(rx.try_iter().count(), 0, "not the limit");
-        limit.note(&notify::Error::new(notify::ErrorKind::MaxFilesWatch));
+        report_limit(&notify::Error::new(notify::ErrorKind::MaxFilesWatch), &mut reported, &tx);
         assert!(matches!(rx.try_recv(), Ok(Msg::WatchLimit)));
-        limit.note(&notify::Error::new(notify::ErrorKind::MaxFilesWatch));
+        report_limit(&notify::Error::new(notify::ErrorKind::MaxFilesWatch), &mut reported, &tx);
         assert_eq!(rx.try_iter().count(), 0, "already reported");
+    }
+
+    fn null_watcher() -> notify::NullWatcher {
+        notify::NullWatcher::new(|_: notify::Result<Event>| {}, notify::Config::default()).unwrap()
+    }
+
+    /// A tracker watching `/r/a` and `/r/b`, with what it would report after `event`.
+    fn handled(event: notify::Result<Event>) -> (Vec<PathBuf>, bool, Receiver<Msg>) {
+        let (tx, rx) = unbounded();
+        let mut t = Tracker::new("/r/main/.git/worktrees".into(), tx);
+        t.worktrees.watched = HashSet::from([PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
+        let now = Instant::now();
+        t.handle_event(&mut null_watcher(), event, now);
+        let mut stale = t.bursts.due(now + DEBOUNCE);
+        stale.sort();
+        (stale, !t.list_changed.due(now + DEBOUNCE).is_empty(), rx)
     }
 
     #[test]
     fn dropped_events_mark_every_watched_root() {
-        let watched = HashSet::from([PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
-        let rescan = Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        let mut roots = roots_to_rescan(&rescan, &watched);
-        roots.sort();
-        assert_eq!(roots, vec![PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
+        let (stale, _, _rx) = handled(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        assert_eq!(stale, vec![PathBuf::from("/r/a"), PathBuf::from("/r/b")]);
     }
 
     #[test]
     fn ordinary_events_mark_nothing_wholesale() {
-        let watched = HashSet::from([PathBuf::from("/r/a")]);
-        assert!(roots_to_rescan(&Event::new(EventKind::Other), &watched).is_empty());
+        assert!(handled(Ok(Event::new(EventKind::Other))).0.is_empty());
         let edit = Event::new(EventKind::Remove(RemoveKind::File)).add_path("/r/a/x".into());
-        assert!(roots_to_rescan(&edit, &watched).is_empty());
+        assert!(handled(Ok(edit)).0.is_empty());
+    }
+
+    #[test]
+    fn an_error_event_can_report_the_watch_limit() {
+        let (_, _, rx) = handled(Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch)));
+        assert!(matches!(rx.try_recv(), Ok(Msg::WatchLimit)));
     }
 
     #[test]
