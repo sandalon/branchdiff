@@ -163,13 +163,14 @@ impl App {
     }
 
     /// Where to run git commands that concern the whole repository. `start`,
-    /// where the app started, can be a worktree removed since. The common dir is
-    /// the last resort, as `git::list_worktrees` needs a working tree for a
-    /// separate git dir.
+    /// where the app started, can be a worktree removed since, or even recreated
+    /// empty, so a directory needs a `.git` entry to count. The common dir is the
+    /// last resort, as `git::list_worktrees` needs a working tree for a separate
+    /// git dir.
     pub fn repo_dir(&self, start: &Path, common_dir: &Path) -> PathBuf {
         let worktrees = self.worktrees.iter().map(|w| w.path.as_path());
         std::iter::once(start).chain(worktrees)
-            .find(|dir| dir.is_dir())
+            .find(|dir| dir.join(".git").exists())
             .unwrap_or(common_dir)
             .to_path_buf()
     }

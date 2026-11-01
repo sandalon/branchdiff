@@ -1488,22 +1488,50 @@ fn replacing_another_worktrees_review_leaves_prompts_open() {
     assert!(matches!(a.input, Some(Input::ConfirmClear)));
 }
 
+/// A directory that looks like a worktree: a linked one has a `.git` file.
+fn make_worktree(path: &std::path::Path) {
+    std::fs::create_dir(path).unwrap();
+    std::fs::write(path.join(".git"), "gitdir: elsewhere\n").unwrap();
+}
+
+fn app_on(paths: &[&std::path::PathBuf]) -> App {
+    let worktree = |path: &&std::path::PathBuf| Worktree { path: (*path).clone(), head: "h".into(), branch: None };
+    let mut a = App::new("develop".into());
+    a.handle_msg(Msg::Worktrees(Ok(paths.iter().map(worktree).collect())));
+    a
+}
+
 #[test]
 fn repository_commands_run_in_the_first_directory_that_still_exists() {
     let dir = tempfile::tempdir().unwrap();
     let [start, one, two, common] = ["start", "one", "two", "common"].map(|n| dir.path().join(n));
-    for path in [&start, &two, &common] {
-        std::fs::create_dir(path).unwrap();
-    }
-    let worktree = |path: &std::path::Path| Worktree { path: path.into(), head: "h".into(), branch: None };
-    let mut a = App::new("develop".into());
-    a.handle_msg(Msg::Worktrees(Ok(vec![worktree(&one), worktree(&two)])));
+    make_worktree(&start);
+    make_worktree(&two);
+    let a = app_on(&[&one, &two]);
 
     assert_eq!(a.repo_dir(&start, &common), start);
-    std::fs::remove_dir(&start).unwrap();
+    std::fs::remove_dir_all(&start).unwrap();
     assert_eq!(a.repo_dir(&start, &common), two);
-    std::fs::remove_dir(&two).unwrap();
+    std::fs::remove_dir_all(&two).unwrap();
     assert_eq!(a.repo_dir(&start, &common), common);
+}
+
+#[test]
+fn repository_commands_skip_a_directory_recreated_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let [start, other, common] = ["start", "other", "common"].map(|n| dir.path().join(n));
+    std::fs::create_dir(&start).unwrap();
+    make_worktree(&other);
+    assert_eq!(app_on(&[&start, &other]).repo_dir(&start, &common), other);
+}
+
+#[test]
+fn the_common_dir_is_used_whether_or_not_it_holds_a_git_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let [start, common] = ["start", "common"].map(|n| dir.path().join(n));
+    std::fs::create_dir(&start).unwrap();
+    std::fs::create_dir(&common).unwrap();
+    assert_eq!(app_on(&[&start]).repo_dir(&start, &common), common);
 }
 
 #[test]
