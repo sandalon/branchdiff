@@ -235,13 +235,8 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_open = true,
-            KeyCode::Tab => {
-                self.focus = match self.focus {
-                    Focus::Worktrees => Focus::Files,
-                    Focus::Files => Focus::Diff,
-                    Focus::Diff => Focus::Worktrees,
-                };
-            }
+            KeyCode::Tab | KeyCode::Right => self.step_focus(1),
+            KeyCode::BackTab | KeyCode::Left => self.step_focus(-1),
             KeyCode::Char('n') => self.step_file(1),
             KeyCode::Char('p') => self.step_file(-1),
             KeyCode::Char('j') | KeyCode::Down => self.move_vertical(1),
@@ -302,6 +297,16 @@ impl App {
         if n > 0 {
             self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
         }
+    }
+
+    /// Steps focus between the three panes in their left-to-right layout order,
+    /// wrapping at either end. `Tab` and `Right` go forward, `Shift+Tab` and
+    /// `Left` go back.
+    fn step_focus(&mut self, delta: isize) {
+        const ORDER: [Focus; 3] = [Focus::Worktrees, Focus::Files, Focus::Diff];
+        let n = ORDER.len() as isize;
+        let i = ORDER.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
+        self.focus = ORDER[(i + delta).rem_euclid(n) as usize];
     }
 
     fn step_file(&mut self, delta: isize) {

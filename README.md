@@ -36,7 +36,8 @@ A blank `base` counts as unset, and an unusable config file is ignored with a no
 | `[` / `]` | previous or next worktree |
 | `1`–`9` | jump to a worktree |
 | `w` | fuzzy find a worktree |
-| `Tab` | move between areas |
+| `Tab` / `Right` | next area |
+| `Shift+Tab` / `Left` | previous area |
 | `j` / `k` | move and scroll |
 | `n` / `p` | next or previous file |
 | `v` | unified or side-by-side diff |
