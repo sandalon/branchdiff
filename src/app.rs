@@ -124,6 +124,9 @@ pub struct App {
     pub worktree_offset: usize,
     pub focus: Focus,
     pub view: DiffView,
+    /// Whether the diff pane occupies all of the main area.
+    pub diff_fullscreen: bool,
+    focus_before_fullscreen: Focus,
     pub help_open: bool,
     pub input: Option<Input>,
     pub notice: Option<String>,
@@ -151,6 +154,8 @@ impl App {
             worktree_offset: 0,
             focus: Focus::Worktrees,
             view: DiffView::Unified,
+            diff_fullscreen: false,
+            focus_before_fullscreen: Focus::Worktrees,
             help_open: false,
             input: None,
             notice: None,
@@ -247,6 +252,7 @@ impl App {
                     DiffView::SideBySide => DiffView::Unified,
                 };
             }
+            KeyCode::Char('f') => self.toggle_diff_fullscreen(),
             KeyCode::Char('b') => return vec![Effect::ListBranches],
             KeyCode::Char('r') => return self.reload_selected(),
             KeyCode::Char('c') => self.start_comment(),
@@ -303,10 +309,24 @@ impl App {
     /// wrapping at either end. `Tab` and `Right` go forward, `Shift+Tab` and
     /// `Left` go back.
     fn step_focus(&mut self, delta: isize) {
+        if self.diff_fullscreen {
+            return;
+        }
         const ORDER: [Focus; 3] = [Focus::Worktrees, Focus::Files, Focus::Diff];
         let n = ORDER.len() as isize;
         let i = ORDER.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
         self.focus = ORDER[(i + delta).rem_euclid(n) as usize];
+    }
+
+    fn toggle_diff_fullscreen(&mut self) {
+        if self.diff_fullscreen {
+            self.diff_fullscreen = false;
+            self.focus = self.focus_before_fullscreen;
+        } else {
+            self.focus_before_fullscreen = self.focus;
+            self.diff_fullscreen = true;
+            self.focus = Focus::Diff;
+        }
     }
 
     fn step_file(&mut self, delta: isize) {

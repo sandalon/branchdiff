@@ -94,6 +94,15 @@ fn keypress_to_redraw_is_within_budget() {
     assert!(d < BUDGET, "redraw took {d:?}");
 }
 
+#[test]
+#[ignore]
+fn full_screen_keypress_to_redraw_is_within_budget() {
+    let mut a = loaded_app();
+    a.handle_key(KeyEvent::from(KeyCode::Char('f')));
+    let d = timed(&mut a, KeyCode::Char('j'));
+    assert!(d < BUDGET, "full-screen redraw took {d:?}");
+}
+
 fn app_of(worktrees: usize, files: usize) -> App {
     let mut a = App::new("develop".into());
     let wts: Vec<Worktree> = (0..worktrees)

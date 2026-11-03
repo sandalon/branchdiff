@@ -42,6 +42,7 @@ const HELP: &[(&str, &str)] = &[
     ("j / k", "move and scroll"),
     ("n / p", "next or previous file"),
     ("v", "unified or side-by-side diff"),
+    ("f", "toggle full-screen diff"),
     ("c", "comment on the current line"),
     ("d / D", "delete a comment, or clear all"),
     ("e", "open in $EDITOR"),
@@ -67,15 +68,21 @@ fn display_text(s: &str) -> Cow<'_, str> {
 /// list offsets and diff scroll, which depend on the size of this frame.
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
-    let side = (f.area().width / 5).clamp(16, 30);
-    let [left, files, diff] =
-        Layout::horizontal([Constraint::Length(side), Constraint::Length(side), Constraint::Min(0)]).areas(main);
+    let visible = (main.height as usize).saturating_sub(BORDERS);
+    if app.diff_fullscreen {
+        keep_diff_selection_visible(app, visible);
+        draw_diff(f, app, main);
+    } else {
+        let side = (f.area().width / 5).clamp(16, 30);
+        let [left, files, diff] =
+            Layout::horizontal([Constraint::Length(side), Constraint::Length(side), Constraint::Min(0)]).areas(main);
 
-    // The three panes are the same height.
-    keep_selection_visible(app, (main.height as usize).saturating_sub(BORDERS));
-    draw_worktrees(f, app, left);
-    draw_files(f, app, files);
-    draw_diff(f, app, diff);
+        // The three panes are the same height.
+        keep_selection_visible(app, visible);
+        draw_worktrees(f, app, left);
+        draw_files(f, app, files);
+        draw_diff(f, app, diff);
+    }
     draw_status(f, app, status);
 
     if app.help_open {
@@ -130,9 +137,18 @@ fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> us
 /// `visible` rows.
 fn keep_selection_visible(app: &mut App, visible: usize) {
     app.worktree_offset = list_offset(app.worktree_offset, app.selected, visible, app.worktrees.len());
-    let (files, rows) = (app.file_count(), app.diff_row_count());
+    let files = app.file_count();
     if let Some(s) = app.current_mut() {
         s.file_offset = list_offset(s.file_offset, s.file, visible, files);
+    }
+    keep_diff_selection_visible(app, visible);
+}
+
+/// Updates only the state needed by the full-screen pane. In particular, this
+/// avoids doing any work for the hidden worktree and file lists.
+fn keep_diff_selection_visible(app: &mut App, visible: usize) {
+    let rows = app.diff_row_count();
+    if let Some(s) = app.current_mut() {
         s.scroll = list_offset(s.scroll, s.cursor, visible, rows);
     }
 }
