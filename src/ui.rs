@@ -19,6 +19,8 @@ const SYMBOL: usize = 2;
 const FILE_PREFIX: usize = 3;
 /// Cells a side-by-side row spends on its comment mark and ` │ ` divider.
 const SPLIT_CHROME: usize = 4;
+/// Cells before source text in a unified row: comment, number, space and sign.
+const UNIFIED_GUTTER: usize = 8;
 /// Cells a prompt spends on `> `.
 const PROMPT_PREFIX: usize = 2;
 /// Rows a filtering prompt lists.
@@ -28,6 +30,7 @@ const MIN_NAME: usize = 4;
 /// Cells a base branch keeps, so that a usual name like `develop` stays whole.
 const MIN_BASE: usize = 16;
 const GAP: &str = "   ";
+const HELP_COLUMN_GAP: usize = 3;
 const HELP_HINT: &str = "   ? help";
 /// Text on the dark added and removed backgrounds, which must not take a light
 /// terminal's dark default. It's the foreground of the highlighting theme.
@@ -42,6 +45,7 @@ const HELP: &[(&str, &str)] = &[
     ("j / k", "move and scroll"),
     ("n / p", "next or previous file"),
     ("v", "unified or side-by-side diff"),
+    ("Shift+W", "toggle word wrap"),
     ("f", "toggle full-screen diff"),
     ("c", "comment on the current line"),
     ("d / D", "delete a comment, or clear all"),
@@ -70,7 +74,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let visible = (main.height as usize).saturating_sub(BORDERS);
     if app.diff_fullscreen {
-        keep_diff_selection_visible(app, visible);
+        let width = (main.width as usize).saturating_sub(BORDERS);
+        keep_diff_selection_visible(app, visible, width);
         draw_diff(f, app, main);
     } else {
         let side = (f.area().width / 5).clamp(16, 30);
@@ -78,7 +83,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Layout::horizontal([Constraint::Length(side), Constraint::Length(side), Constraint::Min(0)]).areas(main);
 
         // The three panes are the same height.
-        keep_selection_visible(app, visible);
+        let diff_width = (diff.width as usize).saturating_sub(BORDERS);
+        keep_selection_visible(app, visible, diff_width);
         draw_worktrees(f, app, left);
         draw_files(f, app, files);
         draw_diff(f, app, diff);
@@ -135,22 +141,155 @@ fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> us
 
 /// Moves the stored offsets of the lists and the diff, for panes that show
 /// `visible` rows.
-fn keep_selection_visible(app: &mut App, visible: usize) {
+fn keep_selection_visible(app: &mut App, visible: usize, diff_width: usize) {
     app.worktree_offset = list_offset(app.worktree_offset, app.selected, visible, app.worktrees.len());
     let files = app.file_count();
     if let Some(s) = app.current_mut() {
         s.file_offset = list_offset(s.file_offset, s.file, visible, files);
     }
-    keep_diff_selection_visible(app, visible);
+    keep_diff_selection_visible(app, visible, diff_width);
 }
 
 /// Updates only the state needed by the full-screen pane. In particular, this
 /// avoids doing any work for the hidden worktree and file lists.
-fn keep_diff_selection_visible(app: &mut App, visible: usize) {
+fn keep_diff_selection_visible(app: &mut App, visible: usize, width: usize) {
     let rows = app.diff_row_count();
+    if app.word_wrap {
+        let (view, file) = (app.view, app.current_file());
+        if let (Some(s), Some(file)) = (app.current(), file) {
+            let scroll = wrapped_scroll(file, s.scroll, s.cursor, visible, width, view);
+            if let Some(s) = app.current_mut() {
+                s.scroll = scroll;
+            }
+        }
+        return;
+    }
     if let Some(s) = app.current_mut() {
         s.scroll = list_offset(s.scroll, s.cursor, visible, rows);
     }
+}
+
+#[derive(Clone, Copy)]
+enum DiffRow<'a> {
+    Header(&'a str),
+    Line { hunk: usize, line: usize, value: &'a Line },
+}
+
+/// Logical diff rows from the model. Keeping this as an iterator means wrapped
+/// rendering allocates in proportion to the viewport, never the whole diff.
+fn diff_rows(file: &FileDiff) -> impl Iterator<Item = DiffRow<'_>> {
+    file.hunks.iter().enumerate().flat_map(|(hi, hunk)| {
+        std::iter::once(DiffRow::Header(hunk.header.as_str())).chain(
+            hunk.lines.iter().enumerate().map(move |(li, line)| DiffRow::Line { hunk: hi, line: li, value: line }),
+        )
+    })
+}
+
+/// Screen rows needed for one logical row, capped so a megabyte-long source
+/// line cannot make a frame expensive.
+fn wrapped_row_height(row: DiffRow<'_>, view: DiffView, width: usize, cap: usize) -> usize {
+    match row {
+        DiffRow::Header(text) => wrap_count(text, width, cap),
+        DiffRow::Line { value, .. } => {
+            let source_width = match view {
+                DiffView::Unified => width.saturating_sub(UNIFIED_GUTTER),
+                DiffView::SideBySide => width.saturating_sub(SPLIT_CHROME) / 2,
+            };
+            wrap_count(&value.text, source_width, cap)
+        }
+    }
+}
+
+fn wrap_count(text: &str, width: usize, cap: usize) -> usize {
+    let cap = cap.max(1);
+    if width == 0 {
+        return 1;
+    }
+    let shown = display_text(text);
+    let mut rows = 1;
+    let mut used = 0;
+    for grapheme in Span::raw(shown.as_ref()).styled_graphemes(Style::new()) {
+        let w = grapheme.symbol.width();
+        if used > 0 && used + w > width {
+            rows += 1;
+            if rows >= cap {
+                return rows;
+            }
+            used = 0;
+        }
+        used += w;
+    }
+    rows
+}
+
+fn capped_height<'a>(rows: impl Iterator<Item = DiffRow<'a>>, view: DiffView, width: usize, cap: usize) -> usize {
+    let mut height = 0usize;
+    for row in rows {
+        height = height.saturating_add(wrapped_row_height(row, view, width, cap.saturating_sub(height)));
+        if height >= cap {
+            return cap;
+        }
+    }
+    height
+}
+
+/// Keeps a logical-row cursor visible when logical rows occupy different
+/// numbers of screen rows. Work is bounded by the viewport, apart from the same
+/// walk to the logical offset that unwrapped rendering already performs.
+fn wrapped_scroll(
+    file: &FileDiff,
+    scroll: usize,
+    cursor: usize,
+    visible: usize,
+    width: usize,
+    view: DiffView,
+) -> usize {
+    if visible == 0 {
+        return scroll.min(cursor);
+    }
+
+    let mut first = scroll.min(cursor);
+    let heights: Vec<usize> = diff_rows(file)
+        .skip(first)
+        .take(cursor.saturating_sub(first) + 1)
+        .map(|row| wrapped_row_height(row, view, width, visible + 1))
+        .collect();
+    if heights.iter().fold(0usize, |sum, h| sum.saturating_add(*h)) > visible {
+        let original = scroll.min(cursor);
+        let mut used = 0usize;
+        first = cursor;
+        for (i, height) in heights.iter().enumerate().rev() {
+            if used > 0 && used.saturating_add(*height) > visible {
+                break;
+            }
+            used = used.saturating_add(*height);
+            first = original + i;
+            if used >= visible {
+                break;
+            }
+        }
+    }
+
+    // At the end of a diff, pull earlier rows back in so terminal growth does
+    // not leave avoidable blank space below the content.
+    let after = capped_height(diff_rows(file).skip(first), view, width, visible);
+    if after < visible && first > 0 {
+        let candidate = first.saturating_sub(visible);
+        let before: Vec<usize> = diff_rows(file)
+            .skip(candidate)
+            .take(first - candidate)
+            .map(|row| wrapped_row_height(row, view, width, visible + 1))
+            .collect();
+        let mut used = after;
+        for (i, height) in before.iter().enumerate().rev() {
+            if used.saturating_add(*height) > visible {
+                break;
+            }
+            used += *height;
+            first = candidate + i;
+        }
+    }
+    first
 }
 
 fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
@@ -245,9 +384,19 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
             let width = (area.width as usize).saturating_sub(BORDERS);
             let highlight = s.highlights.get(&s.file);
             let commented = app.commented_lines();
-            let rows = match app.view {
-                DiffView::Unified => unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
-                DiffView::SideBySide => split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width),
+            let rows = match (app.view, app.word_wrap) {
+                (DiffView::Unified, false) => {
+                    unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width)
+                }
+                (DiffView::SideBySide, false) => {
+                    split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width)
+                }
+                (DiffView::Unified, true) => {
+                    wrapped_unified_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width)
+                }
+                (DiffView::SideBySide, true) => {
+                    wrapped_split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width)
+                }
             };
             f.render_widget(Paragraph::new(rows).block(block("Diff", focused)), area);
             return;
@@ -383,6 +532,160 @@ fn split_rows<'a>(
                 rows.push(finish_row(TextLine::from(spans).style(line_style(line.kind)), row == cursor, width));
             }
             row += 1;
+        }
+    }
+    rows
+}
+
+fn highlighted_parts<'a>(
+    highlight: Option<&'a crate::highlight::HighlightedFile>,
+    hunk: usize,
+    index: usize,
+    line: &'a Line,
+) -> Vec<(Color, &'a str)> {
+    match highlight.and_then(|h| h.hunks.get(hunk)).and_then(|h| h.get(index)) {
+        Some(parts) => parts.iter().map(|(color, text)| (*color, text.as_str())).collect(),
+        None => vec![(Color::Reset, line.text.as_str())],
+    }
+}
+
+/// Soft-wraps coloured text by terminal cells. The result is limited to the
+/// remaining viewport height, so even an enormous generated line has bounded
+/// redraw cost.
+fn wrap_spans(parts: &[(Color, &str)], width: usize, limit: usize) -> Vec<Vec<Span<'static>>> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if width == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut rows = Vec::new();
+    let mut current: Vec<(Color, String)> = Vec::new();
+    let mut used = 0usize;
+    for (color, text) in parts {
+        let shown = display_text(text);
+        for grapheme in Span::raw(shown.as_ref()).styled_graphemes(Style::new()) {
+            let w = grapheme.symbol.width();
+            if used > 0 && used + w > width {
+                rows.push(owned_spans(std::mem::take(&mut current)));
+                if rows.len() == limit {
+                    return rows;
+                }
+                used = 0;
+            }
+            if current.last().is_some_and(|(previous, _)| previous == color) {
+                current.last_mut().unwrap().1.push_str(grapheme.symbol);
+            } else {
+                current.push((*color, grapheme.symbol.to_string()));
+            }
+            used += w;
+        }
+    }
+    rows.push(owned_spans(current));
+    rows
+}
+
+fn owned_spans(parts: Vec<(Color, String)>) -> Vec<Span<'static>> {
+    parts.into_iter().map(|(color, text)| Span::styled(text, span_style(color))).collect()
+}
+
+fn pad_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let used: usize =
+        spans.iter().flat_map(|span| span.styled_graphemes(Style::new())).map(|grapheme| grapheme.symbol.width()).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    spans
+}
+
+fn wrapped_unified_rows<'a>(
+    file: &'a FileDiff,
+    highlight: Option<&'a crate::highlight::HighlightedFile>,
+    commented: &HashSet<(u32, Side)>,
+    cursor: usize,
+    scroll: usize,
+    visible: usize,
+    width: usize,
+) -> Vec<TextLine<'static>> {
+    let mut rows = Vec::with_capacity(visible);
+    for (offset, row) in diff_rows(file).skip(scroll).enumerate() {
+        let logical = scroll + offset;
+        let remaining = visible.saturating_sub(rows.len());
+        if remaining == 0 {
+            break;
+        }
+        match row {
+            DiffRow::Header(text) => {
+                for spans in wrap_spans(&[(Color::Cyan, text)], width, remaining) {
+                    rows.push(finish_row(TextLine::from(spans), logical == cursor, width));
+                }
+            }
+            DiffRow::Line { hunk, line: index, value } => {
+                let sign = match value.kind {
+                    LineKind::Added => '+',
+                    LineKind::Removed => '-',
+                    LineKind::Context => ' ',
+                };
+                let number = value.new_no.or(value.old_no).unwrap_or(0);
+                let first_prefix = format!("{}{number:>5} {sign}", comment_mark(commented, value));
+                let continuation = " ".repeat(UNIFIED_GUTTER);
+                let parts = highlighted_parts(highlight, hunk, index, value);
+                for (i, spans) in
+                    wrap_spans(&parts, width.saturating_sub(UNIFIED_GUTTER), remaining).into_iter().enumerate()
+                {
+                    let prefix = if i == 0 { first_prefix.clone() } else { continuation.clone() };
+                    let mut line = vec![Span::raw(prefix)];
+                    line.extend(spans);
+                    rows.push(finish_row(TextLine::from(line).style(line_style(value.kind)), logical == cursor, width));
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn wrapped_split_rows<'a>(
+    file: &'a FileDiff,
+    highlight: Option<&'a crate::highlight::HighlightedFile>,
+    commented: &HashSet<(u32, Side)>,
+    cursor: usize,
+    scroll: usize,
+    visible: usize,
+    width: usize,
+) -> Vec<TextLine<'static>> {
+    let side = width.saturating_sub(SPLIT_CHROME) / 2;
+    let mut rows = Vec::with_capacity(visible);
+    for (offset, row) in diff_rows(file).skip(scroll).enumerate() {
+        let logical = scroll + offset;
+        let remaining = visible.saturating_sub(rows.len());
+        if remaining == 0 {
+            break;
+        }
+        match row {
+            DiffRow::Header(text) => {
+                for spans in wrap_spans(&[(Color::Cyan, text)], width, remaining) {
+                    rows.push(finish_row(TextLine::from(spans), logical == cursor, width));
+                }
+            }
+            DiffRow::Line { hunk, line: index, value } => {
+                let parts = highlighted_parts(highlight, hunk, index, value);
+                let chunks = wrap_spans(&parts, side, remaining);
+                let count = if value.old_no.is_some() || value.new_no.is_some() { chunks.len() } else { 1 };
+                for i in 0..count {
+                    let mut spans = vec![Span::raw(if i == 0 { comment_mark(commented, value) } else { " " })];
+                    let left =
+                        if value.old_no.is_some() { chunks.get(i).cloned().unwrap_or_default() } else { Vec::new() };
+                    spans.extend(pad_spans(left, side));
+                    spans.push(Span::raw(" │ "));
+                    let right =
+                        if value.new_no.is_some() { chunks.get(i).cloned().unwrap_or_default() } else { Vec::new() };
+                    spans.extend(pad_spans(right, side));
+                    rows.push(finish_row(
+                        TextLine::from(spans).style(line_style(value.kind)),
+                        logical == cursor,
+                        width,
+                    ));
+                }
+            }
         }
     }
     rows
@@ -540,8 +843,18 @@ fn elide(text: &str, width: usize) -> Cow<'_, str> {
 }
 
 fn draw_help(f: &mut Frame) {
-    let area = centered(f.area(), 50, (HELP.len() + BORDERS) as u16);
-    let rows: Vec<TextLine> = HELP.iter().map(|(k, d)| TextLine::from(format!(" {k:<7} {d}"))).collect();
+    let key_width = HELP.iter().map(|(key, _)| drawn_width(key)).max().unwrap_or(0);
+    let description_width = HELP.iter().map(|(_, description)| drawn_width(description)).max().unwrap_or(0);
+    // One cell of breathing room on both sides of the two text columns.
+    let width = 2 + key_width + HELP_COLUMN_GAP + description_width + BORDERS;
+    let rows: Vec<TextLine> = HELP
+        .iter()
+        .map(|(key, description)| {
+            let padding = " ".repeat(key_width.saturating_sub(drawn_width(key)) + HELP_COLUMN_GAP);
+            TextLine::from(format!(" {key}{padding}{description}"))
+        })
+        .collect();
+    let area = centered(f.area(), width as u16, (HELP.len() + BORDERS) as u16);
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(rows).block(block("Help", true)), area);
 }

@@ -124,6 +124,8 @@ pub struct App {
     pub worktree_offset: usize,
     pub focus: Focus,
     pub view: DiffView,
+    /// Whether long lines in the diff pane continue on following screen rows.
+    pub word_wrap: bool,
     /// Whether the diff pane occupies all of the main area.
     pub diff_fullscreen: bool,
     focus_before_fullscreen: Focus,
@@ -154,6 +156,7 @@ impl App {
             worktree_offset: 0,
             focus: Focus::Worktrees,
             view: DiffView::Unified,
+            word_wrap: false,
             diff_fullscreen: false,
             focus_before_fullscreen: Focus::Worktrees,
             help_open: false,
@@ -227,14 +230,22 @@ impl App {
         if self.input.is_some() {
             return self.handle_input_key(key);
         }
+        // Some terminals report shifted letters as an uppercase character,
+        // while others retain the lowercase character and set SHIFT.
+        let toggle_wrap = key.code == KeyCode::Char('W')
+            || (key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::SHIFT));
         // Switching works from any screen.
-        if self.switch_worktree(key.code) {
+        if !toggle_wrap && self.switch_worktree(key.code) {
             return Vec::new();
         }
         if self.help_open {
             if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
                 self.help_open = false;
             }
+            return Vec::new();
+        }
+        if toggle_wrap {
+            self.word_wrap = !self.word_wrap;
             return Vec::new();
         }
         match key.code {

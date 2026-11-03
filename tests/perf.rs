@@ -103,6 +103,13 @@ fn full_screen_keypress_to_redraw_is_within_budget() {
     assert!(d < BUDGET, "full-screen redraw took {d:?}");
 }
 
+#[test]
+#[ignore]
+fn word_wrap_toggle_and_redraw_is_within_budget() {
+    let d = timed(&mut loaded_app(), KeyCode::Char('W'));
+    assert!(d < BUDGET, "word-wrap toggle and redraw took {d:?}");
+}
+
 fn app_of(worktrees: usize, files: usize) -> App {
     let mut a = App::new("develop".into());
     let wts: Vec<Worktree> = (0..worktrees)

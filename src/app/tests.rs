@@ -692,6 +692,27 @@ fn shift_still_works() {
 }
 
 #[test]
+fn shift_w_toggles_diff_word_wrap_without_opening_the_finder() {
+    for key in [with('W', KeyModifiers::SHIFT), with('w', KeyModifiers::SHIFT), with('W', KeyModifiers::NONE)] {
+        let mut a = app(&["a"]);
+        assert!(!a.word_wrap);
+        assert!(a.handle_key(key).is_empty());
+        assert!(a.word_wrap && a.input.is_none());
+        a.handle_key(key);
+        assert!(!a.word_wrap && a.input.is_none());
+    }
+}
+
+#[test]
+fn shifted_w_is_text_inside_a_prompt() {
+    let mut a = app_on_line();
+    press(&mut a, 'c');
+    a.handle_key(with('W', KeyModifiers::SHIFT));
+    assert!(!a.word_wrap);
+    assert!(matches!(&a.input, Some(Input::Comment { text, .. }) if text == "W"));
+}
+
+#[test]
 fn j_and_k_stop_at_the_ends_of_the_worktree_list() {
     let mut a = app(&["a", "b"]);
     press(&mut a, 'k');

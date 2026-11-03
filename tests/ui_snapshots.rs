@@ -222,6 +222,10 @@ fn diff_row(buffer: &Buffer, y: u16) -> Vec<&Cell> {
     cells
 }
 
+fn buffer_text(buffer: &Buffer) -> String {
+    buffer.content.iter().map(|cell| cell.symbol()).collect()
+}
+
 /// The cell drawing `symbol`, which must be unique on screen.
 fn cell_of<'a>(buffer: &'a Buffer, symbol: &str) -> &'a Cell {
     buffer.content.iter().find(|c| c.symbol() == symbol).unwrap()
@@ -273,6 +277,13 @@ fn help_overlay_lists_every_hotkey() {
     {
         assert!(out.to_lowercase().contains(label), "missing {label}");
     }
+    let descriptions = ["previous or next worktree", "next area", "previous area", "toggle word wrap", "quit"];
+    let columns: Vec<usize> = descriptions
+        .iter()
+        .map(|description| out.lines().find(|line| line.contains(description)).unwrap().find(description).unwrap())
+        .collect();
+    assert!(columns.iter().all(|column| *column == columns[0]), "description columns: {columns:?}");
+    assert!(out.contains("Shift+Tab / Left   previous area"));
     insta::assert_snapshot!(out);
 }
 
@@ -363,6 +374,52 @@ fn a_crlf_line_has_no_stray_characters_and_stays_aligned_side_by_side() {
     press(&mut lf, "v");
     assert_eq!(render_sized(&mut crlf, 120, 12), render_sized(&mut lf, 120, 12));
     assert_divider_aligned(&render_buffer(&mut crlf, 120, 12));
+}
+
+#[test]
+fn shift_w_wraps_long_unified_lines_and_marks_every_continuation_as_selected() {
+    let text = format!("{}TAIL", "a".repeat(60));
+    let mut a = app_with(vec![file_of(&[&text])]);
+    a.focus = Focus::Diff;
+    press(&mut a, "j");
+    assert!(!render(&mut a).contains("TAIL"));
+
+    press(&mut a, "W");
+    let buffer = render_buffer(&mut a, 80, 12);
+    assert!(buffer_text(&buffer).contains("TAIL"));
+    assert!(diff_row(&buffer, 2).iter().all(|cell| is_reversed(cell)));
+    assert!(diff_row(&buffer, 3).iter().all(|cell| is_reversed(cell)));
+}
+
+#[test]
+fn word_wrap_keeps_the_side_by_side_divider_aligned() {
+    let text = format!("{}TAIL", "x".repeat(45));
+    let mut file = file_of(&[&text]);
+    file.hunks[0].lines[0].kind = LineKind::Context;
+    file.hunks[0].lines[0].old_no = Some(1);
+    let mut a = app_with(vec![file]);
+    press(&mut a, "vW");
+
+    let buffer = render_buffer(&mut a, 80, 12);
+    let columns = divider_columns(&buffer);
+    assert!(columns.len() >= 2, "{columns:?}");
+    assert!(columns.iter().all(|column| *column == columns[0]), "{columns:?}");
+    assert!(buffer_text(&buffer).matches("TAIL").count() >= 2);
+}
+
+#[test]
+fn wrapped_diff_scrolling_keeps_the_logical_cursor_visible() {
+    let text = "x".repeat(60);
+    let lines: Vec<String> = (1..=8).map(|i| format!("{i}{text}")).collect();
+    let mut a = app_with(vec![file_of(&lines.iter().map(String::as_str).collect::<Vec<_>>())]);
+    a.focus = Focus::Diff;
+    press(&mut a, "W");
+    press(&mut a, &"j".repeat(6));
+
+    let buffer = render_buffer(&mut a, 80, 12);
+    assert_eq!(a.current().unwrap().scroll, 3);
+    assert!(diff_row(&buffer, 7).iter().all(|cell| is_reversed(cell)));
+    assert!(diff_row(&buffer, 8).iter().all(|cell| is_reversed(cell)));
 }
 
 #[test]
