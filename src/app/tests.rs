@@ -749,6 +749,23 @@ fn question_mark_toggles_help_and_esc_closes_it() {
 }
 
 #[test]
+fn f_toggles_a_diff_only_view_and_restores_focus() {
+    let mut a = app(&["a"]);
+    a.focus = Focus::Files;
+
+    press(&mut a, 'f');
+    assert!(a.diff_fullscreen);
+    assert_eq!(a.focus, Focus::Diff);
+
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    assert_eq!(a.focus, Focus::Diff, "hidden panes cannot receive focus");
+
+    press(&mut a, 'f');
+    assert!(!a.diff_fullscreen);
+    assert_eq!(a.focus, Focus::Files);
+}
+
+#[test]
 fn keys_do_nothing_with_no_worktrees_loaded() {
     let mut a = App::new("develop".into());
     for c in [']', '[', 'n', 'p', 'j', 'k', 'c', 'e', 'x', 'y'] {

@@ -3,9 +3,8 @@ source: tests/ui_snapshots.rs
 expression: out
 ---
 "┌Worktrees─────┐┌Files─────────┐┌Diff──────────────────────────────────────────┐"
-"│▸ feat-auth +1││ M src/a.rs   ││@@ -1,2 +1,2 @@                               │"
-"│  fix-cache +0┌Help────────────────────────────────────────────┐              │"
-"│              │ [ / ]   previous or next worktree              │              │"
+"│▸ feat-auth +1┌Help────────────────────────────────────────────┐              │"
+"│  fix-cache +0│ [ / ]   previous or next worktree              │              │"
 "│              │ 1-9     jump to a worktree                     │              │"
 "│              │ w       fuzzy find a worktree                  │              │"
 "│              │ Tab / Right next area                          │              │"
@@ -13,6 +12,7 @@ expression: out
 "│              │ j / k   move and scroll                        │              │"
 "│              │ n / p   next or previous file                  │              │"
 "│              │ v       unified or side-by-side diff           │              │"
+"│              │ f       toggle full-screen diff                │              │"
 "│              │ c       comment on the current line            │              │"
 "│              │ d / D   delete a comment, or clear all         │              │"
 "│              │ e       open in $EDITOR                        │              │"
