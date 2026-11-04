@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 const TAB: &str = "    ";
@@ -27,6 +28,8 @@ const PROMPT_PREFIX: usize = 2;
 const MAX_OPTIONS: usize = 8;
 /// Cells a worktree name keeps before anything less important gives way.
 const MIN_NAME: usize = 4;
+/// Cells the launch directory keeps when its full path does not fit.
+const MIN_CWD: usize = 8;
 /// Cells a base branch keeps, so that a usual name like `develop` stays whole.
 const MIN_BASE: usize = 16;
 const GAP: &str = "   ";
@@ -68,9 +71,10 @@ fn display_text(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// Draws a frame. It needs `app` mutably because it also updates the stored
-/// list offsets and diff scroll, which depend on the size of this frame.
-pub fn draw(f: &mut Frame, app: &mut App) {
+/// Draws a frame for the directory the process was launched from. It needs
+/// `app` mutably because it also updates stored offsets and scroll positions,
+/// which depend on the size of this frame.
+pub fn draw(f: &mut Frame, app: &mut App, cwd: &Path) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let visible = (main.height as usize).saturating_sub(BORDERS);
     if app.diff_fullscreen {
@@ -89,7 +93,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_files(f, app, files);
         draw_diff(f, app, diff);
     }
-    draw_status(f, app, status);
+    draw_status(f, app, cwd, status);
 
     if app.help_open {
         draw_help(f);
@@ -739,16 +743,16 @@ fn finish_row(mut line: TextLine<'_>, selected: bool, width: usize) -> TextLine<
     }
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+fn draw_status(f: &mut Frame, app: &App, cwd: &Path, area: Rect) {
     let width = area.width as usize;
     let mut text = if let Some(e) = &app.fatal {
-        format!(" Could not list worktrees: {e}")
+        status_message(format!(" Could not list worktrees: {e}"), cwd, width)
     } else if let Some(n) = &app.notice {
-        format!(" {n}")
+        status_message(format!(" {n}"), cwd, width)
     } else if let Some(c) = app.comment_at_cursor() {
-        format!(" * {}", display_text(&c.body))
+        status_message(format!(" * {}", display_text(&c.body)), cwd, width)
     } else {
-        status_summary(app, width)
+        status_summary(app, cwd, width)
     };
     if drawn_width(&text) + drawn_width(HELP_HINT) <= width {
         text.push_str(HELP_HINT);
@@ -756,11 +760,31 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text), area);
 }
 
+/// Adds the launch directory to transient status messages when there is room.
+/// The message stays first because errors, notices and comments are more urgent.
+fn status_message(message: String, cwd: &Path, width: usize) -> String {
+    let fixed = drawn_width(&message) + drawn_width(GAP) + drawn_width("cwd: ");
+    let room = width.saturating_sub(fixed);
+    if room == 0 {
+        return message;
+    }
+    let cwd = cwd.to_string_lossy();
+    format!("{message}{GAP}cwd: {}", elide(&cwd, room))
+}
+
 /// Warnings first, since the end is what a narrow screen cuts. A long branch
 /// name shortens so that the counts after it and the help hint still fit.
-fn status_summary(app: &App, width: usize) -> String {
+fn status_summary(app: &App, cwd: &Path, width: usize) -> String {
+    let cwd = cwd.to_string_lossy();
     let (Some(w), Some(s)) = (app.selected_worktree(), app.current()) else {
-        return format!(" base: {}", app.base);
+        let fixed = 1 + drawn_width("cwd: ") + drawn_width(GAP) + drawn_width("base: ");
+        let spare = width.saturating_sub(fixed);
+        let desired = [drawn_width(&cwd), drawn_width(&app.base), 0];
+        let minimum = [MIN_CWD.min(desired[0]), MIN_BASE.min(desired[1]), 0];
+        let hint = drawn_width(HELP_HINT);
+        let room = if spare >= minimum.iter().sum::<usize>() + hint { spare - hint } else { spare };
+        let [cwd_room, base_room, _] = status_name_widths(room, desired, minimum);
+        return format!(" cwd: {}{GAP}base: {}", elide(&cwd, cwd_room), elide(&app.base, base_room));
     };
     let mut warnings = String::new();
     if let Some(op) = s.op {
@@ -775,17 +799,57 @@ fn status_summary(app: &App, width: usize) -> String {
     }
     let counts = format!("{}{GAP}{}", plural(app.file_count(), "file"), plural(s.review.comments.len(), "comment"));
 
-    // What's left for the two names, which share it.
-    let fixed = 1 + drawn_width(&warnings) + drawn_width("base: ") + drawn_width(GAP) * 2 + drawn_width(&counts);
+    // What's left for the three names, which share it.
+    let fixed = 1
+        + drawn_width(&warnings)
+        + drawn_width("cwd: ")
+        + drawn_width("base: ")
+        + drawn_width(GAP) * 3
+        + drawn_width(&counts);
     let spare = width.saturating_sub(fixed);
     let hint = drawn_width(HELP_HINT);
     let label = worktree_label(w);
-    let names = MIN_BASE.min(drawn_width(&app.base)) + MIN_NAME.min(drawn_width(&label));
-    let room = if spare >= names + hint { spare - hint } else { spare };
-    let base_room = room.saturating_sub(drawn_width(&label).min(room / 2)).max(MIN_BASE);
-    let base = elide(&app.base, base_room);
-    let label_room = room.saturating_sub(drawn_width(&base)).max(MIN_NAME);
-    format!(" {warnings}base: {base}{GAP}{}{GAP}{counts}", elide(&label, label_room))
+    let desired = [drawn_width(&cwd), drawn_width(&app.base), drawn_width(&label)];
+    let minimum = [MIN_CWD.min(desired[0]), MIN_BASE.min(desired[1]), MIN_NAME.min(desired[2])];
+    let room = if spare >= minimum.iter().sum::<usize>() + hint { spare - hint } else { spare };
+    let [cwd_room, base_room, label_room] = if fixed > width && !warnings.is_empty() {
+        // Let the terminal clip the less urgent fields after the warning, while
+        // still drawing useful values rather than empty field labels.
+        desired
+    } else {
+        status_name_widths(room, desired, minimum)
+    };
+    format!(
+        " {warnings}cwd: {}{GAP}base: {}{GAP}{}{GAP}{counts}",
+        elide(&cwd, cwd_room),
+        elide(&app.base, base_room),
+        elide(&label, label_room)
+    )
+}
+
+/// Shares the flexible part of the status bar between the launch directory,
+/// base branch and selected worktree. Each remains identifiable on narrow
+/// screens; extra room completes the short branch names before the long path.
+fn status_name_widths(room: usize, desired: [usize; 3], minimum: [usize; 3]) -> [usize; 3] {
+    let mut widths = [0; 3];
+    let mut left = room;
+    for i in 0..3 {
+        if desired[i] > 0 && left > 0 {
+            widths[i] = 1;
+            left -= 1;
+        }
+    }
+    for (i, target) in [(1, minimum[1]), (2, minimum[2]), (0, minimum[0])] {
+        let added = target.saturating_sub(widths[i]).min(left);
+        widths[i] += added;
+        left -= added;
+    }
+    for (i, target) in [(2, desired[2]), (1, desired[1]), (0, desired[0])] {
+        let added = target.saturating_sub(widths[i]).min(left);
+        widths[i] += added;
+        left -= added;
+    }
+    widths
 }
 
 fn plural(count: usize, noun: &str) -> String {
