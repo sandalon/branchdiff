@@ -157,14 +157,18 @@ fn render(a: &mut App) -> String {
 }
 
 fn render_sized(a: &mut App, width: u16, height: u16) -> String {
+    render_sized_at(a, width, height, std::path::Path::new("/r"))
+}
+
+fn render_sized_at(a: &mut App, width: u16, height: u16, cwd: &std::path::Path) -> String {
     let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
-    t.draw(|f| ui::draw(f, a)).unwrap();
+    t.draw(|f| ui::draw(f, a, cwd)).unwrap();
     t.backend().to_string()
 }
 
 fn render_buffer(a: &mut App, width: u16, height: u16) -> Buffer {
     let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
-    t.draw(|f| ui::draw(f, a)).unwrap();
+    t.draw(|f| ui::draw(f, a, std::path::Path::new("/r"))).unwrap();
     t.backend().buffer().clone()
 }
 
@@ -739,7 +743,7 @@ fn warnings_come_first_in_the_status_bar() {
     a.states[0].error = None;
     a.states[0].outdated = 2;
     let line = status_line(&render(&mut a));
-    assert!(line.starts_with(" ! rebase in progress   ● changed   (2 outdated)   base: develop"), "{line}");
+    assert!(line.starts_with(" ! rebase in progress   ● changed   (2 outdated)   cwd: /r"), "{line}");
 }
 
 #[test]
@@ -869,6 +873,15 @@ fn a_long_base_branch_leaves_the_worktree_name_and_counts_in_the_status_bar() {
 }
 
 #[test]
+fn a_long_working_directory_keeps_its_end_in_the_status_bar() {
+    let mut a = app();
+    let cwd = std::path::Path::new("/a/very/long/path/to/the/current/project-directory");
+    let line = status_line(&render_sized_at(&mut a, 80, 12, cwd));
+    assert!(line.contains("cwd: …ject-directory"), "{line}");
+    assert!(line.contains("base: develop   feat-auth   1 file   0 comments"), "{line}");
+}
+
+#[test]
 fn a_path_with_control_characters_stays_on_one_row() {
     let path = |p: &str| FileDiff { path: p.into(), ..sample_file() };
     let mut a = app_with(vec![path("a.rs"), path("b\nc\td.rs"), path("e.rs")]);
@@ -925,7 +938,7 @@ fn the_help_hint_is_whole_or_absent_beside_a_notice_or_a_comment() {
     commented.focus = Focus::Diff;
     press(&mut commented, "jcwhy");
     commented.handle_key(KeyEvent::from(KeyCode::Enter));
-    assert!(render_sized(&mut commented, 80, 12).contains(" * why   ? help"));
+    assert!(render_sized(&mut commented, 80, 12).contains(" * why   cwd: /r   ? help"));
     for a in [&mut noticed, &mut commented] {
         for width in 3..60 {
             let line = status_line(&render_sized(a, width, 12));
@@ -938,15 +951,15 @@ fn the_help_hint_is_whole_or_absent_beside_a_notice_or_a_comment() {
 fn the_status_bar_shortens_a_name_only_when_it_has_to() {
     let mut a = app();
     let name = "feat-auth";
-    for width in 40..70 {
+    for width in 48..75 {
         let line = status_line(&render_sized(&mut a, width, 12));
-        // 48 cells hold the bar without the hint, and 57 hold it with the hint.
+        // 58 cells hold the bar with its new cwd field; 67 also hold the hint.
         let whole = line.contains(name);
         let hint = line.ends_with("? help");
         match width {
-            ..48 => assert!(!whole && !hint, "{width}: {line}"),
-            48..52 => assert!(whole && !hint, "{width}: {line}"),
-            52..57 => assert!(hint, "{width}: {line}"),
+            ..58 => assert!(!whole && !hint, "{width}: {line}"),
+            58..62 => assert!(whole && !hint, "{width}: {line}"),
+            62..67 => assert!(!whole && hint, "{width}: {line}"),
             _ => assert!(whole && hint, "{width}: {line}"),
         }
     }

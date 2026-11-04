@@ -13,4 +13,4 @@ expression: render(&mut a)
 "│              ││              ││                                              │"
 "│              ││              ││                                              │"
 "└──────────────┘└──────────────┘└──────────────────────────────────────────────┘"
-" base: develop   fix-cache   0 files   0 comments   ? help                      "
+" cwd: /r   base: develop   fix-cache   0 files   0 comments   ? help            "

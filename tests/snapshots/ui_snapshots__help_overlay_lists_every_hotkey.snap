@@ -25,4 +25,4 @@ expression: out
 "│           │ Esc                close help or a prompt            │           │"
 "│           │ q                  quit                              │           │"
 "└───────────└──────────────────────────────────────────────────────┘───────────┘"
-" base: develop   feat-auth   1 file   0 comments   ? help                       "
+" cwd: /r   base: develop   feat-auth   1 file   0 comments   ? help             "
