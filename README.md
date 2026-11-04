@@ -4,6 +4,8 @@ A fast cross-platform terminal UI for reviewing git worktrees against a base bra
 
 What it does not do: it never modifies a worktree. It reads git, renders diffs, and stores your comments and reviewed marks under the git common dir, away from the files you are reviewing.
 
+The worktree pane is ordered by recent activity, with the newest HEAD commit or uncommitted file edit first.
+
 ## Install
 
 Download a binary for your platform from the latest release, or build from source:
