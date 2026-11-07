@@ -43,6 +43,7 @@ const HELP: &[(&str, &str)] = &[
     ("Tab / Right", "next area"),
     ("Shift+Tab / Left", "previous area"),
     ("j / k", "move and scroll"),
+    ("Page Up / Down", "scroll the diff one page"),
     ("n / p", "next or previous file"),
     ("v", "unified or side-by-side diff"),
     ("Shift+W", "toggle word wrap"),
@@ -73,6 +74,7 @@ fn display_text(s: &str) -> Cow<'_, str> {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let visible = (main.height as usize).saturating_sub(BORDERS);
+    app.set_diff_viewport_rows(visible);
     if app.diff_fullscreen {
         let width = (main.width as usize).saturating_sub(BORDERS);
         keep_diff_selection_visible(app, visible, width);
