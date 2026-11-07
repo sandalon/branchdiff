@@ -181,6 +181,18 @@ mod tests {
         assert_eq!(args(r#""C:\Program Files\Vim\gvim.exe" -f"#).0, r"C:\Program Files\Vim\gvim.exe");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_editor_launchers_keep_drive_paths_and_existing_arguments() {
+        let path = Path::new(r"C:\work trees\feature\café.rs");
+        for launcher in ["code.cmd", "Code.exe"] {
+            let editor = format!(r#""C:\Program Files\VS Code\{launcher}" --reuse-window"#);
+            let (program, args) = command(&editor, path, 12);
+            assert_eq!(program, format!(r"C:\Program Files\VS Code\{launcher}"));
+            assert_eq!(args, vec!["--reuse-window", "--wait", "--goto", r"C:\work trees\feature\café.rs:12"]);
+        }
+    }
+
     fn picked(visual: &str, editor: &str) -> String {
         let var = |name: &str| match name {
             "VISUAL" => Some(visual.to_string()),
