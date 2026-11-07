@@ -253,7 +253,11 @@ impl Worktrees {
 /// Windows sends `Any` for every removal, so that may be a directory too.
 fn add_path(paths: &mut HashSet<PathBuf>, path: &Path, kind: &EventKind) {
     if matches!(kind, EventKind::Remove(RemoveKind::Folder | RemoveKind::Any)) {
-        paths.replace(path.join(""));
+        // `join("")` would add `\` on Windows. git reads `/` as a directory
+        // on every platform, so the path can match dir-only rules.
+        let mut dir = path.as_os_str().to_owned();
+        dir.push("/");
+        paths.replace(PathBuf::from(dir));
     } else {
         paths.insert(path.to_path_buf());
     }

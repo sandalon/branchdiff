@@ -6,7 +6,6 @@ use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tempfile::NamedTempFile;
 
 /// Longest encoded name kept whole. File names are usually limited to 255
 /// bytes, and this leaves room for the prefix and every suffix the store adds.
@@ -177,27 +176,42 @@ impl Store {
                 (None, true)
             }
         };
-        let mut tmp = NamedTempFile::new_in(&self.dir)?;
-        // The fresh temp name, timestamp and process id make every saved
+        let conflict = current != *expected && !recovered;
+        let (mut file, written) = if conflict {
+            let prefix = format!("{}.conflict-", path.file_name().unwrap_or_default().to_string_lossy());
+            create_unique(&self.dir, &prefix, ".json")?
+        } else {
+            create_unique(&self.dir, ".tmp", "")?
+        };
+        // The fresh file name, timestamp and process id make every saved
         // revision distinct, including writes that restore identical notes.
         let revision = format!(
             "{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
-            tmp.path().file_name().unwrap_or_default().to_string_lossy()
+            written.file_name().unwrap_or_default().to_string_lossy()
         );
         let bytes = serde_json::to_vec_pretty(&PersistedReview { revision: &revision, review })?;
-        if current != *expected && !recovered {
-            let prefix = format!("{}.conflict-", path.file_name().unwrap_or_default().to_string_lossy());
-            tmp = tempfile::Builder::new().prefix(&prefix).suffix(".json").tempfile_in(&self.dir)?;
-            tmp.write_all(&bytes)?;
-            tmp.as_file().sync_all()?;
-            let (_, recovery) = tmp.keep().map_err(|e| e.error)?;
-            return Ok(SaveOutcome::Conflict(recovery));
+        // Otherwise a power loss can keep the rename but not the data, leaving
+        // an empty file in place of the review.
+        let durable = file.write_all(&bytes).and_then(|()| file.sync_all());
+        drop(file);
+        if conflict {
+            return match durable {
+                Ok(()) => Ok(SaveOutcome::Conflict(written)),
+                Err(e) => {
+                    let _ = fs::remove_file(&written);
+                    Err(e.into())
+                }
+            };
         }
-        tmp.write_all(&bytes)?;
-        tmp.as_file().sync_all()?;
-        tmp.persist(&path).map_err(|e| anyhow!("{}: {}", e.error, self.dir.display()))?;
+        // `std::fs::rename` rather than `tempfile`'s persist: on Windows that
+        // calls `MoveFileExW`, which fails for paths past MAX_PATH and when
+        // another handle has the review open. std handles both.
+        if let Err(e) = durable.and_then(|()| fs::rename(&written, &path)) {
+            let _ = fs::remove_file(&written);
+            return Err(anyhow!("{e}: {}", self.dir.display()));
+        }
         *expected = Some(bytes);
         Ok(SaveOutcome::Saved)
     }
@@ -235,6 +249,30 @@ impl Store {
         }
         lock_file(&file)?;
         Ok(file)
+    }
+}
+
+/// Creates a new owner-private file in `dir` with a name no other writer has.
+/// Unlike `tempfile`, std opens long Windows paths and sets no temporary
+/// attribute that a persisted review would keep.
+fn create_unique(dir: &Path, prefix: &str, suffix: &str) -> io::Result<(fs::File, PathBuf)> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("{prefix}{:x}-{nanos:x}-{n:x}{suffix}", std::process::id()));
+        let mut options = fs::File::options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
