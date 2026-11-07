@@ -261,6 +261,14 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
     }
     let effects = match msg {
         Msg::Worktrees(Ok(list)) => {
+            // A load already running at this path belongs to the earlier review,
+            // even if its base is unchanged. Retire it before any queued reply
+            // is handled; the replacement load effect may be performed later.
+            for previous in &app.worktrees {
+                if !list.iter().any(|w| w.path == previous.path && ReviewId::of(w) == ReviewId::of(previous)) {
+                    rt.loads.invalidate(&previous.path);
+                }
+            }
             if let Some(tx) = &rt.watch {
                 let _ = tx.send(watch::Command::SetWorktrees(list.iter().map(|w| w.path.clone()).collect()));
             }
@@ -371,4 +379,120 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
         Ok(_) => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use branchdiff::cache::Diffs;
+    use branchdiff::git::Worktree;
+    use branchdiff::worker::Loaded;
+
+    fn fixture() -> (tempfile::TempDir, App, Runtime) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _) = unbounded();
+        let rt = Runtime {
+            // Results are delivered explicitly to exercise their order.
+            pool: Pool::new(0, tx),
+            loads: Loads::default(),
+            probes: Probes::default(),
+            lists: Lists::default(),
+            store: Store::new(dir.path()),
+            common_dir: dir.path().into(),
+            clipboard: None,
+            paused: Arc::new(AtomicBool::new(false)),
+            repo: dir.path().into(),
+            watch: None,
+            highlighting: HashSet::new(),
+        };
+        let mut app = App::new("main".into());
+        app.handle_msg(list("a"));
+        (dir, app, rt)
+    }
+
+    fn list(branch: &str) -> Msg {
+        Msg::Worktrees(Ok(vec![Worktree { path: "/r/a".into(), head: "same".into(), branch: Some(branch.into()) }]))
+    }
+
+    fn loaded(diffs: Diffs) -> Msg {
+        Msg::Loaded {
+            path: "/r/a".into(),
+            result: Ok(Loaded {
+                key: CacheKey {
+                    worktree: "/r/a".into(),
+                    base_commit: "base".into(),
+                    head: "same".into(),
+                    fingerprint: 1,
+                },
+                diffs,
+                op: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_branch_switch_discards_an_in_flight_load_and_promotes_the_replacement() {
+        let (_dir, mut app, mut rt) = fixture();
+        let saved = branchdiff::store::Review {
+            comments: vec![branchdiff::store::Comment {
+                path: "new.rs".into(),
+                line: 1,
+                side: branchdiff::store::Side::New,
+                line_text: "new".into(),
+                body: "saved on b".into(),
+            }],
+            ..Default::default()
+        };
+        rt.store.save(&ReviewId::Branch("b".into()), &saved).unwrap();
+        app.handle_msg(loaded(Arc::new(branchdiff::diff::parse(
+            b"diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ b/old.rs\n@@ -0,0 +1 @@\n+old\n",
+        ))));
+        rt.loads.request("/r/a".into(), "main".into());
+        let effects = on_msg(&mut app, &mut rt, list("b"));
+        assert_eq!(app.current().unwrap().review, saved);
+        assert!(matches!(effects.as_slice(), [Effect::Load { .. }]));
+        // This is what performing the returned effect does while the old load runs.
+        assert!(rt.loads.request("/r/a".into(), "main".into()).is_none());
+        assert!(on_msg(&mut app, &mut rt, loaded(Arc::new(vec![]))).is_empty());
+        assert!(app.current().unwrap().diffs.is_none());
+        assert!(rt.loads.is_running(Path::new("/r/a")));
+        let current = Arc::new(branchdiff::diff::parse(
+            b"diff --git a/new.rs b/new.rs\n--- a/new.rs\n+++ b/new.rs\n@@ -0,0 +1 @@\n+new\n",
+        ));
+        on_msg(&mut app, &mut rt, loaded(current.clone()));
+        assert!(Arc::ptr_eq(app.current().unwrap().diffs.as_ref().unwrap(), &current));
+        app.current_mut().unwrap().cursor = 1;
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        app.paste("new comment");
+        let saves = app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let [Effect::SaveReview { id, review }] = saves.as_slice() else { panic!("missing save") };
+        assert_eq!(id, &ReviewId::Branch("b".into()));
+        assert_eq!(review.comments[0].body, "saved on b");
+        assert_eq!(review.comments[1].line_text, "new");
+    }
+
+    #[test]
+    fn a_late_error_is_discarded_before_the_replacement_effect_is_performed() {
+        let (_dir, mut app, mut rt) = fixture();
+        rt.loads.request("/r/a".into(), "main".into());
+        let effects = on_msg(&mut app, &mut rt, list("b"));
+        // next_effects can drain both messages before performing any effects.
+        let late = Msg::Loaded { path: "/r/a".into(), result: Err(GitError::BaseMissing("main".into())) };
+        assert!(on_msg(&mut app, &mut rt, late).is_empty());
+        assert!(app.current().unwrap().error.is_none());
+        assert!(app.input.is_none());
+        assert!(matches!(effects.as_slice(), [Effect::Load { .. }]));
+        assert!(rt.loads.request("/r/a".into(), "main".into()).is_some());
+    }
+
+    #[test]
+    fn removing_and_readding_a_path_does_not_revive_its_previous_load() {
+        let (_dir, mut app, mut rt) = fixture();
+        rt.loads.request("/r/a".into(), "main".into());
+        on_msg(&mut app, &mut rt, Msg::Worktrees(Ok(vec![])));
+        on_msg(&mut app, &mut rt, list("a"));
+        assert!(rt.loads.request("/r/a".into(), "main".into()).is_none());
+        on_msg(&mut app, &mut rt, loaded(Arc::new(vec![])));
+        assert!(app.current().unwrap().diffs.is_none());
+    }
 }

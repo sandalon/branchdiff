@@ -7,6 +7,7 @@ use crate::worker::Msg;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -452,8 +453,11 @@ impl App {
                 self.notice = Some(e.to_string());
                 Vec::new()
             }
-            Msg::Highlighted { key, file_index, lines } => {
-                if let Some(s) = self.states.iter_mut().find(|s| s.key.as_ref() == Some(&key)) {
+            Msg::Highlighted { key, source, file_index, lines } => {
+                if let Some(s) = self.states.iter_mut().find(|s| {
+                    s.key.as_ref() == Some(&key)
+                        && s.diffs.as_ref().is_some_and(|diffs| source.ptr_eq(&Arc::downgrade(diffs)))
+                }) {
                     s.highlights.insert(file_index, lines);
                 }
                 Vec::new()
@@ -470,14 +474,21 @@ impl App {
     fn apply_worktrees(&mut self, list: Vec<Worktree>) -> Vec<Effect> {
         let selected_path = self.selected_worktree().map(|w| w.path.clone());
 
-        let mut old: Vec<(PathBuf, WorktreeState)> =
-            self.worktrees.drain(..).map(|w| w.path).zip(self.states.drain(..)).collect();
+        let mut old: Vec<(Worktree, WorktreeState)> = self.worktrees.drain(..).zip(self.states.drain(..)).collect();
 
         let mut effects = Vec::new();
         for w in &list {
-            let state = match old.iter().position(|(p, _)| *p == w.path) {
-                Some(i) => old.swap_remove(i).1,
-                None => {
+            let previous = old.iter().position(|(previous, _)| previous.path == w.path).map(|i| old.swap_remove(i));
+            let state = match previous {
+                Some((previous, state)) if ReviewId::of(&previous) == ReviewId::of(w) => state,
+                _ => {
+                    // A path can now hold another branch or detached commit. Never
+                    // attach its review to the old diff, including an open comment.
+                    if selected_path.as_ref() == Some(&w.path)
+                        && matches!(self.input, Some(Input::Comment { .. } | Input::ConfirmClear))
+                    {
+                        self.input = None;
+                    }
                     effects.push(Effect::Load { path: w.path.clone(), base: self.base.clone() });
                     WorktreeState::default()
                 }
