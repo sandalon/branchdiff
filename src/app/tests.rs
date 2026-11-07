@@ -770,20 +770,35 @@ fn question_mark_toggles_help_and_esc_closes_it() {
 }
 
 #[test]
-fn f_toggles_a_diff_only_view_and_restores_focus() {
+fn f_makes_the_focused_pane_full_screen_and_keeps_focus() {
     let mut a = app(&["a"]);
     a.focus = Focus::Files;
 
     press(&mut a, 'f');
-    assert!(a.diff_fullscreen);
-    assert_eq!(a.focus, Focus::Diff);
-
-    a.handle_key(KeyEvent::from(KeyCode::Tab));
-    assert_eq!(a.focus, Focus::Diff, "hidden panes cannot receive focus");
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Files);
 
     press(&mut a, 'f');
-    assert!(!a.diff_fullscreen);
+    assert!(!a.fullscreen);
     assert_eq!(a.focus, Focus::Files);
+}
+
+#[test]
+fn tab_moves_the_full_screen_view_with_focus() {
+    let mut a = app(&["a"]);
+    press(&mut a, 'f');
+
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Files);
+
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(a.focus, Focus::Diff);
+
+    press(&mut a, 'f');
+    assert!(!a.fullscreen);
+    assert_eq!(a.focus, Focus::Diff, "leaving full screen keeps the pane last shown");
 }
 
 #[test]

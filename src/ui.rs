@@ -1,5 +1,6 @@
-use crate::app::{line_position, worktree_label, App, DiffView, Focus, Input};
+use crate::app::{line_position, worktree_label, App, DiffView, Focus, Input, WorktreeState};
 use crate::diff::{FileDiff, Line, LineKind};
+use crate::git::Worktree;
 use crate::store::Side;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -28,11 +29,16 @@ const PROMPT_PREFIX: usize = 2;
 const MAX_OPTIONS: usize = 8;
 /// Cells a worktree name keeps before anything less important gives way.
 const MIN_NAME: usize = 4;
+/// Cells a full-screen worktree path keeps before the row falls back to the
+/// narrow one.
+const MIN_PATH: usize = 8;
 /// Cells the launch directory keeps when its full path does not fit.
 const MIN_CWD: usize = 8;
 /// Cells a base branch keeps, so that a usual name like `develop` stays whole.
 const MIN_BASE: usize = 16;
 const GAP: &str = "   ";
+/// Cells between the columns of a full-screen list row.
+const COLUMN_GAP: usize = 2;
 const HELP_COLUMN_GAP: usize = 3;
 const HELP_HINT: &str = "   ? help";
 /// Text on the dark added and removed backgrounds, which must not take a light
@@ -50,7 +56,7 @@ const HELP: &[(&str, &str)] = &[
     ("n / p", "next or previous file"),
     ("v", "unified or side-by-side diff"),
     ("Shift+W", "toggle word wrap"),
-    ("f", "toggle full-screen diff"),
+    ("f", "toggle full-screen pane"),
     ("c", "comment on the current line"),
     ("d / D", "delete a comment, or clear all"),
     ("e", "open in $EDITOR"),
@@ -79,10 +85,22 @@ pub fn draw(f: &mut Frame, app: &mut App, cwd: &Path) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let visible = (main.height as usize).saturating_sub(BORDERS);
     app.set_diff_viewport_rows(visible);
-    if app.diff_fullscreen {
-        let width = (main.width as usize).saturating_sub(BORDERS);
-        keep_diff_selection_visible(app, visible, width);
-        draw_diff(f, app, main);
+    if app.fullscreen {
+        match app.focus {
+            Focus::Worktrees => {
+                keep_worktree_selection_visible(app, visible);
+                draw_worktrees(f, app, main, true);
+            }
+            Focus::Files => {
+                keep_file_selection_visible(app, visible);
+                draw_files(f, app, main, true);
+            }
+            Focus::Diff => {
+                let width = (main.width as usize).saturating_sub(BORDERS);
+                keep_diff_selection_visible(app, visible, width);
+                draw_diff(f, app, main);
+            }
+        }
     } else {
         let side = (f.area().width / 5).clamp(16, 30);
         let [left, files, diff] =
@@ -91,8 +109,8 @@ pub fn draw(f: &mut Frame, app: &mut App, cwd: &Path) {
         // The three panes are the same height.
         let diff_width = (diff.width as usize).saturating_sub(BORDERS);
         keep_selection_visible(app, visible, diff_width);
-        draw_worktrees(f, app, left);
-        draw_files(f, app, files);
+        draw_worktrees(f, app, left, false);
+        draw_files(f, app, files, false);
         draw_diff(f, app, diff);
     }
     draw_status(f, app, cwd, status);
@@ -148,16 +166,24 @@ fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> us
 /// Moves the stored offsets of the lists and the diff, for panes that show
 /// `visible` rows.
 fn keep_selection_visible(app: &mut App, visible: usize, diff_width: usize) {
+    keep_worktree_selection_visible(app, visible);
+    keep_file_selection_visible(app, visible);
+    keep_diff_selection_visible(app, visible, diff_width);
+}
+
+fn keep_worktree_selection_visible(app: &mut App, visible: usize) {
     app.worktree_offset = list_offset(app.worktree_offset, app.selected, visible, app.worktrees.len());
+}
+
+fn keep_file_selection_visible(app: &mut App, visible: usize) {
     let files = app.file_count();
     if let Some(s) = app.current_mut() {
         s.file_offset = list_offset(s.file_offset, s.file, visible, files);
     }
-    keep_diff_selection_visible(app, visible, diff_width);
 }
 
-/// Updates only the state needed by the full-screen pane. In particular, this
-/// avoids doing any work for the hidden worktree and file lists.
+/// Moves the diff scroll only, so a full-screen diff does no work for the
+/// hidden lists.
 fn keep_diff_selection_visible(app: &mut App, visible: usize, width: usize) {
     let rows = app.diff_row_count();
     if app.word_wrap {
@@ -298,9 +324,16 @@ fn wrapped_scroll(
     first
 }
 
-fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
+fn draw_worktrees(f: &mut Frame, app: &App, area: Rect, full: bool) {
     let visible = (area.height as usize).saturating_sub(BORDERS);
     let first = app.worktree_offset;
+    let room = (area.width as usize).saturating_sub(BORDERS + SYMBOL);
+    // Over the whole list, so the columns stay put as it scrolls.
+    let name_width = if full {
+        app.worktrees.iter().map(|w| drawn_width(&worktree_label(w))).max().unwrap_or(0).min(room * 2 / 5)
+    } else {
+        0
+    };
     let items: Vec<ListItem> = app
         .worktrees
         .iter()
@@ -308,30 +341,8 @@ fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
         .skip(first)
         .take(visible)
         .map(|(w, s)| {
-            let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
-            let comments = match s.review.comments.len() {
-                0 => String::new(),
-                n => format!(" c{n}"),
-            };
-            let mut warnings = String::new();
-            if s.stale {
-                warnings.push_str(" ●");
-            }
-            if s.op.is_some() {
-                warnings.push_str(" !");
-            }
-            if s.error.is_some() {
-                warnings.push_str(" ✗");
-            }
-            // The name shortens first, then the counts go, least useful first, so
-            // the warnings stay. Only a pane under 10 cells wide can cut those.
-            let room = (area.width as usize).saturating_sub(BORDERS + SYMBOL);
-            let badges = [format!(" +{added}{comments}{warnings}"), format!("{comments}{warnings}")]
-                .into_iter()
-                .find(|b| b.width() + MIN_NAME <= room)
-                .unwrap_or(warnings);
-            let name = room.saturating_sub(badges.width());
-            ListItem::new(format!("{}{badges}", elide(&worktree_label(w), name)))
+            let row = full.then(|| full_worktree_row(w, s, room, name_width, app.home.as_deref())).flatten();
+            row.map_or_else(|| ListItem::new(worktree_row(w, s, room)), ListItem::new)
         })
         .collect();
     let mut state = ListState::default().with_selected(Some(app.selected.saturating_sub(first)));
@@ -342,7 +353,78 @@ fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_files(f: &mut Frame, app: &App, area: Rect) {
+/// A row of the narrow worktree list. The name shortens first, then the counts
+/// go, least useful first, so the warnings stay. Only a pane under 10 cells
+/// wide can cut those.
+fn worktree_row(w: &Worktree, s: &WorktreeState, room: usize) -> String {
+    let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
+    let comments = comment_badge(s);
+    let warnings = warning_badges(s);
+    let badges = [format!(" +{added}{comments}{warnings}"), format!("{comments}{warnings}")]
+        .into_iter()
+        .find(|b| b.width() + MIN_NAME <= room)
+        .unwrap_or(warnings);
+    let name = room.saturating_sub(badges.width());
+    format!("{}{badges}", elide(&worktree_label(w), name))
+}
+
+/// A row of the full-screen worktree list: the name in a column `name_width`
+/// wide, the dimmed path, and the counts and warnings at the right edge.
+/// `None` when the path has no room, so the list can use the narrow row.
+fn full_worktree_row(
+    w: &Worktree,
+    s: &WorktreeState,
+    room: usize,
+    name_width: usize,
+    home: Option<&Path>,
+) -> Option<TextLine<'static>> {
+    let diffs = s.diffs.as_ref().map_or(&[][..], |d| d.as_slice());
+    let (added, removed) = diffs.iter().fold((0u32, 0u32), |(a, r), x| (a + x.added, r + x.removed));
+    let badges =
+        format!("+{added} −{removed}  {}{}{}", plural(diffs.len(), "file"), comment_badge(s), warning_badges(s));
+    let path_room = room.checked_sub(name_width + 2 * COLUMN_GAP + drawn_width(&badges))?;
+    if path_room < MIN_PATH {
+        return None;
+    }
+    let label = worktree_label(w);
+    let name = elide(&label, name_width);
+    let path = display_path(&w.path, home);
+    let path = elide(&path, path_room);
+    let gap = " ".repeat(COLUMN_GAP);
+    Some(TextLine::from(vec![
+        Span::raw(format!("{name}{}{gap}", " ".repeat(name_width - drawn_width(&name)))),
+        Span::styled(
+            format!("{path}{}", " ".repeat(path_room - drawn_width(&path))),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+        Span::raw(format!("{gap}{badges}")),
+    ]))
+}
+
+fn comment_badge(s: &WorktreeState) -> String {
+    match s.review.comments.len() {
+        0 => String::new(),
+        n => format!(" c{n}"),
+    }
+}
+
+/// `●` for a diff that may be out of date, `!` for a git operation in
+/// progress and `✗` for an error.
+fn warning_badges(s: &WorktreeState) -> String {
+    let mut warnings = String::new();
+    if s.stale {
+        warnings.push_str(" ●");
+    }
+    if s.op.is_some() {
+        warnings.push_str(" !");
+    }
+    if s.error.is_some() {
+        warnings.push_str(" ✗");
+    }
+    warnings
+}
+
+fn draw_files(f: &mut Frame, app: &App, area: Rect, full: bool) {
     let Some(s) = app.current() else {
         f.render_widget(block("Files", false), area);
         return;
@@ -359,7 +441,12 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
         .take(visible)
         .map(|(i, x)| {
             let mark = if app.is_reviewed(i) { "✓" } else { " " };
-            ListItem::new(format!("{mark}{} {}", x.status.letter(), elide(&x.path, room)))
+            let prefix = format!("{mark}{} ", x.status.letter());
+            if full {
+                ListItem::new(full_file_row(prefix, x, room))
+            } else {
+                ListItem::new(format!("{prefix}{}", elide(&x.path, room)))
+            }
         })
         .collect();
     let mut state = ListState::default().with_selected(Some(s.file.saturating_sub(first)));
@@ -367,6 +454,28 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
         .block(block("Files", app.focus == Focus::Files))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// A row of the full-screen file list: the whole path with its folders
+/// dimmed, both paths of a rename, and the line counts at the right edge.
+fn full_file_row(prefix: String, file: &FileDiff, room: usize) -> TextLine<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let counts = if file.binary { "bin".to_string() } else { format!("+{} −{}", file.added, file.removed) };
+    let mut parts = Vec::new();
+    if let Some(old) = &file.old_path {
+        let (folder, name) = split_folder(old);
+        parts.extend([(folder, dim), (name, Style::new()), (" → ", Style::new())]);
+    }
+    let (folder, name) = split_folder(&file.path);
+    parts.extend([(folder, dim), (name, Style::new())]);
+
+    let path_room = room.saturating_sub(COLUMN_GAP + drawn_width(&counts));
+    let mut spans = vec![Span::raw(prefix)];
+    spans.extend(elide_styled(&parts, path_room));
+    let used: usize = spans[1..].iter().map(|s| drawn_width(&s.content)).sum();
+    spans.push(Span::raw(" ".repeat(path_room - used + COLUMN_GAP)));
+    spans.push(Span::raw(counts));
+    TextLine::from(spans)
 }
 
 /// Builds only the visible rows. Finding them still walks the lines of the
@@ -889,16 +998,21 @@ fn tail(text: &str, width: usize) -> String {
     graphemes[start..].iter().map(|g| g.symbol).collect()
 }
 
-/// `text` as one row: control characters become spaces, since git allows tabs
-/// and newlines in paths, and a list row must stay one line. If it doesn't fit
-/// in `width` cells, its end after an ellipsis, because the end of a path or
-/// branch name is usually the part that tells it from others.
-fn elide(text: &str, width: usize) -> Cow<'_, str> {
-    let line = if text.contains(char::is_control) {
+/// `text` with each control character as a space, since git allows tabs and
+/// newlines in paths, and a list row must stay one line.
+fn one_line(text: &str) -> Cow<'_, str> {
+    if text.contains(char::is_control) {
         Cow::Owned(text.replace(char::is_control, " "))
     } else {
         Cow::Borrowed(text)
-    };
+    }
+}
+
+/// `text` as one row. If it doesn't fit in `width` cells, its end after an
+/// ellipsis, because the end of a path or branch name is usually the part that
+/// tells it from others.
+fn elide(text: &str, width: usize) -> Cow<'_, str> {
+    let line = one_line(text);
     if drawn_width(&line) <= width {
         line
     } else if width == 0 {
@@ -906,6 +1020,49 @@ fn elide(text: &str, width: usize) -> Cow<'_, str> {
     } else {
         Cow::Owned(format!("…{}", tail(&line, width - 1)))
     }
+}
+
+/// `path` split after its last `/` into the folder part and the file name.
+/// Git writes `/` on every platform.
+fn split_folder(path: &str) -> (&str, &str) {
+    path.rfind('/').map_or(("", path), |i| path.split_at(i + 1))
+}
+
+/// `path` with the home directory written as `~`. A home of `/` is ignored,
+/// since every path would start with it.
+fn display_path(path: &Path, home: Option<&Path>) -> String {
+    match home.filter(|h| h.parent().is_some()).and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// `parts` as one row of styled spans, shortened from the left like `elide`
+/// to fit `width` cells. The ellipsis takes the style of the part it cuts.
+fn elide_styled(parts: &[(&str, Style)], width: usize) -> Vec<Span<'static>> {
+    let parts: Vec<(Cow<'_, str>, Style)> = parts.iter().map(|(text, style)| (one_line(text), *style)).collect();
+    let whole: String = parts.iter().map(|(text, _)| text.as_ref()).collect();
+    let shown = elide(&whole, width);
+    // `shown` is all of `whole`, nothing, or an ellipsis and the end of `whole`.
+    let (ellipsis, kept) = match shown.strip_prefix('…') {
+        Some(rest) if shown != whole => (true, rest.len()),
+        _ => (false, shown.len()),
+    };
+    let mut skip = whole.len() - kept;
+    let mut spans = Vec::new();
+    for (text, style) in &parts {
+        if skip >= text.len() {
+            skip -= text.len();
+            continue;
+        }
+        if ellipsis && spans.is_empty() {
+            spans.push(Span::styled("…", *style));
+        }
+        spans.push(Span::styled(text[skip..].to_string(), *style));
+        skip = 0;
+    }
+    spans
 }
 
 fn draw_help(f: &mut Frame) {
@@ -1004,5 +1161,55 @@ mod tests {
     #[test]
     fn fit_color_leaves_named_colours_alone() {
         assert_eq!(fit_color(Color::Cyan), Color::Cyan);
+    }
+    fn texts(spans: &[Span]) -> Vec<String> {
+        spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn display_path_writes_the_home_directory_as_a_tilde() {
+        let home = Some(Path::new("/home/me"));
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(display_path(Path::new("/home/me/app"), home), format!("~{sep}app"));
+        assert_eq!(display_path(Path::new("/home/me"), home), "~");
+        assert_eq!(display_path(Path::new("/home/meg/app"), home), "/home/meg/app");
+        assert_eq!(display_path(Path::new("/r/app"), None), "/r/app");
+        assert_eq!(display_path(Path::new("/r/app"), Some(Path::new("/"))), "/r/app", "a root home is ignored");
+    }
+
+    #[test]
+    fn split_folder_cuts_after_the_last_slash() {
+        assert_eq!(split_folder("a.rs"), ("", "a.rs"));
+        assert_eq!(split_folder("src/app/tests.rs"), ("src/app/", "tests.rs"));
+        assert_eq!(split_folder("dir/"), ("dir/", ""));
+        assert_eq!(split_folder("src/日本/語.rs"), ("src/日本/", "語.rs"));
+    }
+
+    #[test]
+    fn elide_styled_keeps_every_part_that_fits() {
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let spans = elide_styled(&[("src/", dim), ("a.rs", Style::new())], 8);
+        assert_eq!(texts(&spans), ["src/", "a.rs"]);
+        assert_eq!((spans[0].style, spans[1].style), (dim, Style::new()));
+    }
+
+    #[test]
+    fn elide_styled_cuts_from_the_left_across_parts() {
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let spans = elide_styled(&[("src/deep/", dim), ("a.rs", Style::new())], 8);
+        assert_eq!(texts(&spans), ["…", "ep/", "a.rs"]);
+        assert_eq!((spans[0].style, spans[1].style), (dim, dim));
+
+        // A cut inside a later part gives the ellipsis that part's style.
+        let spans = elide_styled(&[("src/", dim), ("long_name.rs", Style::new())], 6);
+        assert_eq!(texts(&spans), ["…", "me.rs"]);
+        assert_eq!(spans[0].style, Style::new());
+    }
+
+    #[test]
+    fn elide_styled_makes_one_line_and_fits_no_room() {
+        let spans = elide_styled(&[("a\nb/", Style::new()), ("c", Style::new())], 9);
+        assert_eq!(texts(&spans), ["a b/", "c"]);
+        assert!(elide_styled(&[("a/", Style::new()), ("b", Style::new())], 0).is_empty());
     }
 }

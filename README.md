@@ -45,7 +45,7 @@ A blank `base` counts as unset, and an unusable config file is ignored with a no
 | `n` / `p` | next or previous file |
 | `v` | unified or side-by-side diff |
 | `Shift+W` | toggle word wrap in the diff pane |
-| `f` | toggle the diff pane full screen |
+| `f` | toggle the focused pane full screen |
 | `c` | comment on the current line |
 | `d` / `D` | delete a comment, or clear all |
 | `e` | open in $EDITOR |

@@ -161,6 +161,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, cwd: &Path,
         highlighting: HashSet::new(),
     };
     let mut app = App::new(base);
+    app.home = std::env::home_dir();
     app.truecolor = supports_truecolor();
     app.notice = notice;
     if watch_failed {
