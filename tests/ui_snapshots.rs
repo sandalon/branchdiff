@@ -20,6 +20,8 @@ fn sample_file() -> FileDiff {
     FileDiff {
         path: "src/a.rs".into(),
         old_path: None,
+        old_mode: None,
+        new_mode: None,
         status: Status::Modified,
         binary: false,
         content_id: None,
@@ -426,6 +428,49 @@ fn wrapped_diff_scrolling_keeps_the_logical_cursor_visible() {
 fn a_file_with_no_hunks_says_so() {
     let mut a = app_with(vec![FileDiff { hunks: Vec::new(), ..sample_file() }]);
     assert!(render(&mut a).contains("No text changes to show"));
+}
+
+#[test]
+fn a_mode_only_change_shows_both_modes() {
+    let files = branchdiff::diff::parse(b"diff --git a/run b/run\nold mode 100644\nnew mode 100755\n");
+    let text = render(&mut app_with(files));
+    assert!(text.contains("Mode: 100644 → 100755"), "{text}");
+}
+
+#[test]
+fn a_pure_rename_shows_the_source_and_destination() {
+    let files = branchdiff::diff::parse(
+        b"diff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs\n",
+    );
+    let text = render(&mut app_with(files));
+    assert!(text.contains("Renamed: old.rs → new.rs"), "{text}");
+}
+
+#[test]
+fn metadata_stays_visible_beside_text_changes_in_both_views() {
+    for side_by_side in [false, true] {
+        let file = FileDiff {
+            old_path: Some("old.rs".into()),
+            old_mode: Some(0o100644),
+            new_mode: Some(0o100755),
+            ..sample_file()
+        };
+        let mut a = app_with(vec![file]);
+        if side_by_side {
+            press(&mut a, "v");
+        }
+        let text = render_sized(&mut a, 160, 12);
+        assert!(text.contains("Renamed: old.rs → src/a.rs"), "{text}");
+        assert!(text.contains("Mode: 100644 → 100755"), "{text}");
+        assert!(text.contains("retry();"), "{text}");
+    }
+}
+
+#[test]
+fn rename_metadata_cannot_insert_extra_terminal_rows() {
+    let file = FileDiff { old_path: Some("old\nname\tescape\x1b.rs".into()), ..sample_file() };
+    let text = render_sized(&mut app_with(vec![file]), 160, 12);
+    assert!(text.contains("Renamed: old name escape .rs → src/a.rs"), "{text}");
 }
 
 #[test]
