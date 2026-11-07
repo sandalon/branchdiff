@@ -289,7 +289,10 @@ pub const MAX_UNTRACKED_BYTES: u64 = 16 * 1024 * 1024;
 /// so the same files are read every time. Once it is spent, the remaining files
 /// show as over `MAX_UNTRACKED_BYTES` without being read. The file that spends
 /// the last of it is still kept, so one file's cost can come on top of this.
-pub const MAX_UNTRACKED_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_UNTRACKED_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Conservative allocation budget for one complete diff model.
+pub const MAX_DIFF_BYTES: usize = 64 * 1024 * 1024;
 
 /// Charged per line on top of its bytes: `size_of::<Line>()` plus the smallest heap block.
 const LINE_OVERHEAD_BYTES: usize = 64;
@@ -297,14 +300,32 @@ const LINE_OVERHEAD_BYTES: usize = 64;
 /// Everything the worktree changed since `merge_base`, including untracked
 /// files. `cwd` must be the worktree root, as for `git::untracked`.
 pub fn load(cwd: &Path, merge_base: &str) -> Result<Vec<FileDiff>, GitError> {
-    let mut files = parse(&git::diff(cwd, merge_base)?);
+    let patch = git::diff(cwd, merge_base)?;
+    check_patch_budget(&patch, MAX_DIFF_BYTES)?;
+    let mut files = parse(&patch);
+    drop(patch);
     files.extend(untracked_files(cwd, MAX_UNTRACKED_TOTAL_BYTES)?);
+    if crate::cache::diff_bytes(&files, files.capacity()) > MAX_DIFF_BYTES {
+        return Err(GitError::DiffTooLarge);
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
+/// Every patch line may allocate a model entry. Charging generously before
+/// parsing bounds patches containing millions of tiny lines, not just bytes.
+fn check_patch_budget(patch: &[u8], budget: usize) -> Result<(), GitError> {
+    let lines = patch.iter().filter(|b| **b == b'\n').count().saturating_add(1);
+    let cost = patch.len().saturating_mul(3).saturating_add(lines.saturating_mul(256));
+    if cost > budget {
+        Err(GitError::DiffTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
 fn untracked_files(cwd: &Path, mut budget: usize) -> Result<Vec<FileDiff>, GitError> {
-    Ok(git::untracked(cwd)?.into_iter().map(|path| untracked_file(cwd, path, &mut budget)).collect())
+    git::untracked(cwd)?.into_iter().map(|path| untracked_file(cwd, path, &mut budget)).collect()
 }
 
 /// Stands in for a hash of a file too large to read. Saved reviews depend on
@@ -314,7 +335,7 @@ fn metadata_id(m: &Metadata) -> u64 {
     fnv1a(format!("{} {nanos}", m.len()).as_bytes())
 }
 
-fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
+fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> Result<FileDiff, GitError> {
     let mut f = FileDiff::empty();
     f.status = Status::Untracked;
     let full = cwd.join(&path);
@@ -342,6 +363,9 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
     // Same heuristic git uses: a NUL in the first 8000 bytes means binary.
     f.binary |= bytes.iter().take(8000).any(|b| *b == 0);
     if !f.binary {
+        // Reject before allocating a potentially enormous Line vector. The
+        // whole load fails, so omitted text cannot acquire a reviewed mark.
+        check_patch_budget(&bytes, MAX_DIFF_BYTES)?;
         let text = String::from_utf8_lossy(&bytes);
         // Not `lines()`, which drops the `\r` of CRLF that patch lines keep.
         let mut lines: Vec<Line> = text
@@ -360,7 +384,7 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
         }
     }
     f.path = path;
-    f
+    Ok(f)
 }
 
 fn worktree_mode(metadata: &Metadata) -> Option<u32> {
@@ -429,6 +453,20 @@ fn open_untracked(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_patch_lines_are_charged_before_model_allocation() {
+        let lines = b"+a\n+a\n+a\n";
+        assert_eq!(check_patch_budget(lines, 100), Err(GitError::DiffTooLarge));
+        assert!(check_patch_budget(lines, 2048).is_ok());
+    }
+
+    #[test]
+    fn dense_untracked_file_is_rejected_without_a_line_vector() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("dense"), vec![b'\n'; MAX_DIFF_BYTES / 256]).unwrap();
+        assert_eq!(untracked_file(dir.path(), "dense".into(), &mut usize::MAX.clone()), Err(GitError::DiffTooLarge));
+    }
 
     #[cfg(unix)]
     fn mkfifo(path: &Path) {

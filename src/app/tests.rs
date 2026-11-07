@@ -1832,3 +1832,85 @@ fn a_late_highlight_cannot_attach_to_another_branch_with_the_same_cache_key() {
     a.handle_msg(Msg::Highlighted { key, source, file_index: 0, lines: Default::default() });
     assert!(a.current().unwrap().highlights.is_empty());
 }
+
+#[test]
+fn global_cache_evicts_independent_models_in_access_order() {
+    let mut a = app(&["a", "b", "c"]);
+    for name in ["a", "b", "c"] {
+        // Separate models and allocations, rather than sharing an Arc.
+        deliver(&mut a, name, vec![file_with_rows(name, 20)]);
+    }
+    let one = a.states[0].cached_bytes;
+    assert!(one > 0);
+    // Visiting b protects it ahead of c when the cache is trimmed.
+    press(&mut a, '2');
+    press(&mut a, '1');
+    a.trim_cache_to(one * 2);
+    assert!(a.states[0].diffs.is_some());
+    assert!(a.states[1].diffs.is_some());
+    assert!(a.states[2].diffs.is_none());
+    assert!(a.states.iter().map(|s| s.cached_bytes).sum::<usize>() <= one * 2);
+    let effects = press(&mut a, '3');
+    assert_eq!(effects, vec![Effect::Load { path: "/r/c".into(), base: "develop".into() }]);
+    assert!(press(&mut a, '3').is_empty(), "selection does not repeatedly queue an evicted load");
+    deliver(&mut a, "c", vec![file_with_rows("c", 20)]);
+    assert!(a.current_file().is_some());
+}
+
+#[test]
+fn cache_eviction_keeps_review_notes_and_reload_restores_navigation() {
+    let mut a = app(&["a", "b"]);
+    deliver(&mut a, "a", vec![file_with_rows("a", 20)]);
+    deliver(&mut a, "b", vec![file_with_rows("b", 20)]);
+    press(&mut a, '2');
+    set_cursor_scroll(&mut a, 5, 3);
+    press(&mut a, 'x');
+    let review = a.current().unwrap().review.clone();
+    press(&mut a, '1');
+    a.trim_cache_to(a.states[0].cached_bytes);
+    assert_eq!(a.states[1].review, review);
+    press(&mut a, '2');
+    deliver(&mut a, "b", vec![file_with_rows("b", 20)]);
+    assert_eq!(position(&a), (0, 5, 3));
+    assert!(a.is_reviewed(0));
+}
+
+#[test]
+fn oversized_refresh_clears_old_markable_diff_and_keeps_explicit_error() {
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![file_with_rows("a", 20)]);
+    press(&mut a, 'x');
+    a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(GitError::DiffTooLarge) });
+    assert!(a.current_file().is_none());
+    assert!(a.current().unwrap().stale);
+    assert!(!a.is_reviewed(0));
+    assert!(press(&mut a, 'x').is_empty());
+    assert_eq!(a.current().unwrap().error, Some(GitError::DiffTooLarge));
+}
+
+#[test]
+fn finder_and_vertical_selection_reload_evicted_worktrees() {
+    let mut a = app(&["a", "b", "c"]);
+    for name in ["a", "b", "c"] {
+        deliver(&mut a, name, vec![file_with_rows(name, 20)]);
+    }
+    a.trim_cache_to(a.states[0].cached_bytes);
+    a.focus = Focus::Worktrees;
+    assert_eq!(press(&mut a, 'j'), vec![Effect::Load { path: "/r/b".into(), base: "develop".into() }]);
+    press(&mut a, 'w');
+    type_text(&mut a, "c");
+    assert_eq!(
+        a.handle_key(KeyEvent::from(KeyCode::Enter)),
+        vec![Effect::Load { path: "/r/c".into(), base: "develop".into() }]
+    );
+}
+
+#[test]
+fn discarded_colours_do_not_request_the_same_highlight_forever() {
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![file_with_rows("a", 20)]);
+    assert!(a.highlight_effect().is_some());
+    a.trim_cache_to(0);
+    assert!(a.highlight_effect().is_none());
+    assert!(a.current_file().is_some(), "the selected diff remains usable");
+}

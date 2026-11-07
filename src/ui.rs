@@ -302,7 +302,11 @@ fn draw_worktrees(f: &mut Frame, app: &App, area: Rect) {
         .skip(first)
         .take(visible)
         .map(|(w, s)| {
-            let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
+            let added = if s.evicted {
+                "?".to_string()
+            } else {
+                s.diffs.as_ref().map_or(0u64, |d| d.iter().map(|x| u64::from(x.added)).sum()).to_string()
+            };
             let comments = match s.review.comments.len() {
                 0 => String::new(),
                 n => format!(" c{n}"),
