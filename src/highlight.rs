@@ -119,6 +119,8 @@ mod tests {
         FileDiff {
             path: path.into(),
             old_path: None,
+            old_mode: None,
+            new_mode: None,
             status: Status::Added,
             binary: false,
             content_id: None,

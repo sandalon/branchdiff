@@ -24,6 +24,8 @@ fn big_diff() -> Vec<FileDiff> {
         .map(|f| FileDiff {
             path: format!("src/module_{f}.rs"),
             old_path: None,
+            old_mode: None,
+            new_mode: None,
             status: Status::Modified,
             binary: false,
             content_id: Some(format!("{f}")),
@@ -133,6 +135,8 @@ fn app_of(worktrees: usize, files: usize) -> App {
             .map(|f| FileDiff {
                 path: format!("src/module_{f}.rs"),
                 old_path: None,
+                old_mode: None,
+                new_mode: None,
                 status: Status::Modified,
                 binary: false,
                 content_id: Some(format!("{f}")),

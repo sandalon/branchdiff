@@ -488,12 +488,27 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(message(text).block(block("Diff", focused)), area);
         return;
     };
+    let metadata = app.current_file().map(file_metadata).unwrap_or_default();
+    let diff_block = || {
+        let pane = block("Diff", focused);
+        if metadata.is_empty() {
+            pane
+        } else {
+            pane.title_bottom(elide(&metadata, (area.width as usize).saturating_sub(BORDERS)).into_owned())
+        }
+    };
     let notice = match (&s.error, &s.diffs, app.current_file()) {
         (Some(e), ..) => e.to_string(),
         (None, None, _) => "Loading…".to_string(),
         (None, _, None) => "No changes against the base branch".to_string(),
         (None, _, Some(file)) if file.binary => "Binary or very large file not shown".to_string(),
-        (None, _, Some(file)) if file.hunks.is_empty() => "No text changes to show".to_string(),
+        (None, _, Some(file)) if file.hunks.is_empty() => {
+            if metadata.is_empty() {
+                "No text changes to show".to_string()
+            } else {
+                format!("{metadata}\n\nNo text changes to show")
+            }
+        }
         (None, _, Some(file)) => {
             let visible = (area.height as usize).saturating_sub(BORDERS);
             let width = (area.width as usize).saturating_sub(BORDERS);
@@ -513,11 +528,27 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
                     wrapped_split_rows(file, highlight, &commented, s.cursor, s.scroll, visible, width)
                 }
             };
-            f.render_widget(Paragraph::new(rows).block(block("Diff", focused)), area);
+            f.render_widget(Paragraph::new(rows).block(diff_block()), area);
             return;
         }
     };
-    f.render_widget(message(notice).block(block("Diff", focused)), area);
+    f.render_widget(message(notice).block(diff_block()), area);
+}
+
+/// Metadata stays visible even when a rename or mode change has no text hunks.
+fn file_metadata(file: &FileDiff) -> String {
+    let mut parts = Vec::new();
+    if let Some(old) = &file.old_path {
+        let clean = |path: &str| path.replace(char::is_control, " ");
+        parts.push(format!("Renamed: {} → {}", clean(old), clean(&file.path)));
+    }
+    match (file.old_mode, file.new_mode) {
+        (Some(old), Some(new)) if old != new => parts.push(format!("Mode: {old:06o} → {new:06o}")),
+        (None, Some(new)) => parts.push(format!("New mode: {new:06o}")),
+        (Some(old), None) => parts.push(format!("Deleted mode: {old:06o}")),
+        _ => {}
+    }
+    parts.join(" · ")
 }
 
 /// Wrapped, because git's messages can be far wider than the diff area.
