@@ -38,10 +38,12 @@ fn git_diff_and_review_storage_handle_windows_paths_with_spaces_and_unicode() {
         }],
         ..Review::default()
     };
-    store.save(&id, &review).unwrap();
+    let version = store.load(&id).version;
+    store.save(&id, &review, &version).unwrap();
     assert_eq!(Store::new(&info.common_dir).load(&id).review, review);
     let lower = ReviewId::Branch("feature/con".into());
-    store.save(&lower, &Review::default()).unwrap();
+    let lower_version = store.load(&lower).version;
+    store.save(&lower, &Review::default(), &lower_version).unwrap();
     assert_eq!(store.load(&id).review, review, "case-insensitive paths must not merge review IDs");
     assert_ne!(store.path_for(&id), store.path_for(&lower));
 }

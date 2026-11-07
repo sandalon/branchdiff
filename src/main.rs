@@ -393,7 +393,7 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
 }
 
 #[cfg(test)]
-mod review_save_tests {
+mod runtime_tests {
     use super::*;
     use branchdiff::cache::Diffs;
     use branchdiff::git::Worktree;
