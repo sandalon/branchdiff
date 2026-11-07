@@ -107,6 +107,16 @@ fn full_screen_keypress_to_redraw_is_within_budget() {
 
 #[test]
 #[ignore]
+fn full_screen_file_list_keypress_to_redraw_is_within_budget() {
+    let mut a = loaded_app();
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    a.handle_key(KeyEvent::from(KeyCode::Char('f')));
+    let d = timed(&mut a, KeyCode::Char('j'));
+    assert!(d < BUDGET, "full-screen file list redraw took {d:?}");
+}
+
+#[test]
+#[ignore]
 fn word_wrap_toggle_and_redraw_is_within_budget() {
     let d = timed(&mut loaded_app(), KeyCode::Char('W'));
     assert!(d < BUDGET, "word-wrap toggle and redraw took {d:?}");

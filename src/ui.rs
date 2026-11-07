@@ -53,7 +53,7 @@ const HELP: &[(&str, &str)] = &[
     ("n / p", "next or previous file"),
     ("v", "unified or side-by-side diff"),
     ("Shift+W", "toggle word wrap"),
-    ("f", "toggle full-screen diff"),
+    ("f", "toggle full-screen pane"),
     ("c", "comment on the current line"),
     ("d / D", "delete a comment, or clear all"),
     ("e", "open in $EDITOR"),
