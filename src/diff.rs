@@ -44,6 +44,9 @@ pub struct Hunk {
 pub struct FileDiff {
     pub path: String,
     pub old_path: Option<String>,
+    /// Git modes include the object type, such as 100644, 100755 or 120000.
+    pub old_mode: Option<u32>,
+    pub new_mode: Option<u32>,
     pub status: Status,
     pub binary: bool,
     /// The `a..b` blob pair from the `index` line. Both sides are kept so a
@@ -60,6 +63,8 @@ impl FileDiff {
         Self {
             path: String::new(),
             old_path: None,
+            old_mode: None,
+            new_mode: None,
             status: Status::Modified,
             binary: false,
             content_id: None,
@@ -126,17 +131,28 @@ pub fn parse(input: &[u8]) -> Vec<FileDiff> {
             continue;
         }
         let Some(file) = cur.as_mut() else { continue };
-        if line.starts_with("new file mode") {
+        if let Some(mode) = line.strip_prefix("new file mode ") {
             file.status = Status::Added;
-        } else if line.starts_with("deleted file mode") {
+            file.new_mode = parse_mode(mode);
+        } else if let Some(mode) = line.strip_prefix("deleted file mode ") {
             file.status = Status::Deleted;
+            file.old_mode = parse_mode(mode);
+        } else if let Some(mode) = line.strip_prefix("old mode ") {
+            file.old_mode = parse_mode(mode);
+        } else if let Some(mode) = line.strip_prefix("new mode ") {
+            file.new_mode = parse_mode(mode);
         } else if let Some(p) = line.strip_prefix("rename from ") {
             file.status = Status::Renamed;
             file.old_path = Some(unquote(p));
         } else if let Some(p) = line.strip_prefix("rename to ") {
             file.path = unquote(p);
         } else if let Some(rest) = line.strip_prefix("index ") {
-            file.content_id = rest.split(' ').next().map(str::to_string);
+            let mut parts = rest.split(' ');
+            file.content_id = parts.next().map(str::to_string);
+            if let Some(mode) = parts.next().and_then(parse_mode) {
+                file.old_mode = Some(mode);
+                file.new_mode = Some(mode);
+            }
         } else if line.starts_with("Binary files ") {
             file.binary = true;
         } else if let Some(p) = line.strip_prefix("--- ").or_else(|| line.strip_prefix("+++ ")) {
@@ -152,6 +168,10 @@ pub fn parse(input: &[u8]) -> Vec<FileDiff> {
     }
     finish_file(&mut files, cur);
     files
+}
+
+fn parse_mode(mode: &str) -> Option<u32> {
+    u32::from_str_radix(mode, 8).ok()
 }
 
 fn finish_file(files: &mut Vec<FileDiff>, file: Option<FileDiff>) {
@@ -269,7 +289,10 @@ pub const MAX_UNTRACKED_BYTES: u64 = 16 * 1024 * 1024;
 /// so the same files are read every time. Once it is spent, the remaining files
 /// show as over `MAX_UNTRACKED_BYTES` without being read. The file that spends
 /// the last of it is still kept, so one file's cost can come on top of this.
-pub const MAX_UNTRACKED_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_UNTRACKED_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Conservative allocation budget for one complete diff model.
+pub const MAX_DIFF_BYTES: usize = 64 * 1024 * 1024;
 
 /// Charged per line on top of its bytes: `size_of::<Line>()` plus the smallest heap block.
 const LINE_OVERHEAD_BYTES: usize = 64;
@@ -277,14 +300,32 @@ const LINE_OVERHEAD_BYTES: usize = 64;
 /// Everything the worktree changed since `merge_base`, including untracked
 /// files. `cwd` must be the worktree root, as for `git::untracked`.
 pub fn load(cwd: &Path, merge_base: &str) -> Result<Vec<FileDiff>, GitError> {
-    let mut files = parse(&git::diff(cwd, merge_base)?);
+    let patch = git::diff(cwd, merge_base)?;
+    check_patch_budget(&patch, MAX_DIFF_BYTES)?;
+    let mut files = parse(&patch);
+    drop(patch);
     files.extend(untracked_files(cwd, MAX_UNTRACKED_TOTAL_BYTES)?);
+    if crate::cache::diff_bytes(&files, files.capacity()) > MAX_DIFF_BYTES {
+        return Err(GitError::DiffTooLarge);
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
+/// Every patch line may allocate a model entry. Charging generously before
+/// parsing bounds patches containing millions of tiny lines, not just bytes.
+fn check_patch_budget(patch: &[u8], budget: usize) -> Result<(), GitError> {
+    let lines = patch.iter().filter(|b| **b == b'\n').count().saturating_add(1);
+    let cost = patch.len().saturating_mul(3).saturating_add(lines.saturating_mul(256));
+    if cost > budget {
+        Err(GitError::DiffTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
 fn untracked_files(cwd: &Path, mut budget: usize) -> Result<Vec<FileDiff>, GitError> {
-    Ok(git::untracked(cwd)?.into_iter().map(|path| untracked_file(cwd, path, &mut budget)).collect())
+    git::untracked(cwd)?.into_iter().map(|path| untracked_file(cwd, path, &mut budget)).collect()
 }
 
 /// Stands in for a hash of a file too large to read. Saved reviews depend on
@@ -294,7 +335,7 @@ fn metadata_id(m: &Metadata) -> u64 {
     fnv1a(format!("{} {nanos}", m.len()).as_bytes())
 }
 
-fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
+fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> Result<FileDiff, GitError> {
     let mut f = FileDiff::empty();
     f.status = Status::Untracked;
     let full = cwd.join(&path);
@@ -302,7 +343,9 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
     // A symlink shows its target, as it does in a patch. Everything else goes
     // through one handle, and only a regular file is read. Other paths, such as
     // a nested repository's `nest/`, have no content.
-    let bytes = match std::fs::symlink_metadata(&full) {
+    let metadata = std::fs::symlink_metadata(&full);
+    f.new_mode = metadata.as_ref().ok().and_then(worktree_mode);
+    let bytes = match metadata {
         Ok(m) if m.is_symlink() => {
             std::fs::read_link(&full).map(|t| t.into_os_string().into_encoded_bytes()).unwrap_or_default()
         }
@@ -320,6 +363,9 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
     // Same heuristic git uses: a NUL in the first 8000 bytes means binary.
     f.binary |= bytes.iter().take(8000).any(|b| *b == 0);
     if !f.binary {
+        // Reject before allocating a potentially enormous Line vector. The
+        // whole load fails, so omitted text cannot acquire a reviewed mark.
+        check_patch_budget(&bytes, MAX_DIFF_BYTES)?;
         let text = String::from_utf8_lossy(&bytes);
         // Not `lines()`, which drops the `\r` of CRLF that patch lines keep.
         let mut lines: Vec<Line> = text
@@ -338,7 +384,25 @@ fn untracked_file(cwd: &Path, path: String, budget: &mut usize) -> FileDiff {
         }
     }
     f.path = path;
-    f
+    Ok(f)
+}
+
+fn worktree_mode(metadata: &Metadata) -> Option<u32> {
+    if metadata.is_symlink() {
+        Some(0o120000)
+    } else if metadata.is_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            Some(if metadata.permissions().mode() & 0o111 != 0 { 0o100755 } else { 0o100644 })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(0o100644)
+        }
+    } else {
+        None
+    }
 }
 
 enum Regular {
@@ -389,6 +453,20 @@ fn open_untracked(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_patch_lines_are_charged_before_model_allocation() {
+        let lines = b"+a\n+a\n+a\n";
+        assert_eq!(check_patch_budget(lines, 100), Err(GitError::DiffTooLarge));
+        assert!(check_patch_budget(lines, 2048).is_ok());
+    }
+
+    #[test]
+    fn dense_untracked_file_is_rejected_without_a_line_vector() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("dense"), vec![b'\n'; MAX_DIFF_BYTES / 256]).unwrap();
+        assert_eq!(untracked_file(dir.path(), "dense".into(), &mut usize::MAX.clone()), Err(GitError::DiffTooLarge));
+    }
 
     #[cfg(unix)]
     fn mkfifo(path: &Path) {
@@ -674,6 +752,35 @@ mod tests {
         let p = "diff --git a/big.txt b/moved.txt\nsimilarity index 100%\nrename from big.txt\nrename to moved.txt\ndiff --git a/m.sh b/m.sh\nold mode 100644\nnew mode 100755\n";
         let files = parse(p.as_bytes());
         assert_eq!((files[0].content_id.as_deref(), files[1].content_id.as_deref()), (None, None));
+    }
+
+    #[test]
+    fn preserves_modes_for_permission_and_type_changes() {
+        let patch = "diff --git a/run b/run\nold mode 100644\nnew mode 100755\ndiff --git a/link b/link\nold mode 100644\nnew mode 120000\nindex aaaaaaa..bbbbbbb\n";
+        let files = parse(patch.as_bytes());
+        assert_eq!((files[0].old_mode, files[0].new_mode), (Some(0o100644), Some(0o100755)));
+        assert_eq!((files[1].old_mode, files[1].new_mode), (Some(0o100644), Some(0o120000)));
+    }
+
+    #[test]
+    fn preserves_added_deleted_and_unchanged_modes() {
+        let patch = "diff --git a/new b/new\nnew file mode 100755\nindex 0000000..aaaaaaa\ndiff --git a/old b/old\ndeleted file mode 120000\nindex bbbbbbb..0000000\ndiff --git a/edit b/edit\nindex aaaaaaa..bbbbbbb 100644\n";
+        let files = parse(patch.as_bytes());
+        assert_eq!((files[0].old_mode, files[0].new_mode), (None, Some(0o100755)));
+        assert_eq!((files[1].old_mode, files[1].new_mode), (Some(0o120000), None));
+        assert_eq!((files[2].old_mode, files[2].new_mode), (Some(0o100644), Some(0o100644)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_files_preserve_executable_and_symlink_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = untracked_repo(&[("run", b"echo hi\n")]);
+        std::fs::set_permissions(dir.path().join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("run", dir.path().join("link")).unwrap();
+        let files = untracked_files(dir.path(), usize::MAX).unwrap();
+        assert_eq!((files[0].old_mode, files[0].new_mode), (None, Some(0o120000)));
+        assert_eq!((files[1].old_mode, files[1].new_mode), (None, Some(0o100755)));
     }
 
     #[test]

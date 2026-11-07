@@ -7,6 +7,7 @@ use crate::worker::Msg;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -19,6 +20,12 @@ pub enum Focus {
 pub enum DiffView {
     Unified,
     SideBySide,
+}
+
+#[derive(Clone, Copy)]
+enum Movement {
+    Vertical(isize),
+    DiffPage(isize),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +76,10 @@ pub struct WorktreeState {
     pub review_version: ReviewVersion,
     pub outdated: usize,
     pub highlights: HashMap<usize, HighlightedFile>,
+    /// Evicted models reload when selected; reviews and navigation survive.
+    pub(crate) evicted: bool,
+    last_used: u64,
+    cached_bytes: usize,
 }
 
 impl WorktreeState {
@@ -123,13 +134,15 @@ pub struct App {
     pub selected: usize,
     /// First row shown in the worktree list. `ui` keeps it around `selected`.
     pub worktree_offset: usize,
+    /// Screen rows in the diff pane on the most recently drawn frame. This is
+    /// zero before the first frame, and on a terminal too short for content.
+    diff_viewport_rows: usize,
     pub focus: Focus,
     pub view: DiffView,
     /// Whether long lines in the diff pane continue on following screen rows.
     pub word_wrap: bool,
-    /// Whether the diff pane occupies all of the main area.
-    pub diff_fullscreen: bool,
-    focus_before_fullscreen: Focus,
+    /// Whether the focused pane occupies all of the main area.
+    pub fullscreen: bool,
     pub help_open: bool,
     pub input: Option<Input>,
     pub notice: Option<String>,
@@ -137,6 +150,10 @@ pub struct App {
     pub should_quit: bool,
     /// Cleared on terminals without truecolor, so `ui` converts colours.
     pub truecolor: bool,
+    cache_clock: u64,
+    /// Shown as `~` at the start of worktree paths. `main` sets it, so tests
+    /// don't depend on the machine's home directory.
+    pub home: Option<PathBuf>,
 }
 
 /// Answers whether `modifiers` mark a shortcut rather than typed text.
@@ -155,17 +172,19 @@ impl App {
             states: Vec::new(),
             selected: 0,
             worktree_offset: 0,
+            diff_viewport_rows: 0,
             focus: Focus::Worktrees,
             view: DiffView::Unified,
             word_wrap: false,
-            diff_fullscreen: false,
-            focus_before_fullscreen: Focus::Worktrees,
+            fullscreen: false,
             help_open: false,
             input: None,
             notice: None,
             fatal: None,
             should_quit: false,
             truecolor: true,
+            cache_clock: 0,
+            home: None,
         }
     }
 
@@ -228,8 +247,9 @@ impl App {
         if is_shortcut(key.modifiers, cfg!(windows)) {
             return Vec::new();
         }
+        let movement = Self::movement(key.code);
         // Holding a movement key would otherwise wipe a notice before it's read.
-        if !matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down) {
+        if movement.is_none() {
             self.notice = None;
         }
         // Checked before switching, because `]` and digits are text here.
@@ -242,7 +262,7 @@ impl App {
             || (key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::SHIFT));
         // Switching works from any screen.
         if !toggle_wrap && self.switch_worktree(key.code) {
-            return Vec::new();
+            return self.selected_cache_effects();
         }
         if self.help_open {
             if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
@@ -254,6 +274,13 @@ impl App {
             self.word_wrap = !self.word_wrap;
             return Vec::new();
         }
+        if let Some(movement) = movement {
+            match movement {
+                Movement::Vertical(delta) => self.move_vertical(delta),
+                Movement::DiffPage(delta) => self.page_diff(delta),
+            }
+            return self.selected_cache_effects();
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_open = true,
@@ -261,15 +288,13 @@ impl App {
             KeyCode::BackTab | KeyCode::Left => self.step_focus(-1),
             KeyCode::Char('n') => self.step_file(1),
             KeyCode::Char('p') => self.step_file(-1),
-            KeyCode::Char('j') | KeyCode::Down => self.move_vertical(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_vertical(-1),
             KeyCode::Char('v') => {
                 self.view = match self.view {
                     DiffView::Unified => DiffView::SideBySide,
                     DiffView::SideBySide => DiffView::Unified,
                 };
             }
-            KeyCode::Char('f') => self.toggle_diff_fullscreen(),
+            KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('b') => return vec![Effect::ListBranches],
             KeyCode::Char('r') => return self.reload_selected(),
             KeyCode::Char('c') => self.start_comment(),
@@ -281,7 +306,65 @@ impl App {
             KeyCode::Char('Y') => return self.export(Effect::WriteExport),
             _ => {}
         }
-        Vec::new()
+        self.selected_cache_effects()
+    }
+
+    fn selected_cache_effects(&mut self) -> Vec<Effect> {
+        self.cache_clock = self.cache_clock.saturating_add(1);
+        let Some(s) = self.states.get_mut(self.selected) else { return Vec::new() };
+        s.last_used = self.cache_clock;
+        if !std::mem::take(&mut s.evicted) {
+            return Vec::new();
+        }
+        vec![Effect::Load { path: self.worktrees[self.selected].path.clone(), base: self.base.clone() }]
+    }
+
+    fn trim_cache(&mut self) {
+        self.trim_cache_to(crate::cache::MAX_CACHED_BYTES);
+    }
+
+    fn trim_cache_to(&mut self, limit: usize) {
+        let mut total: usize = self.states.iter().map(|s| s.cached_bytes).sum();
+        while total > limit {
+            let victim = self
+                .states
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| *i != self.selected && s.diffs.is_some())
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(i, _)| i);
+            let Some(i) = victim else {
+                // The selected model is bounded by MAX_DIFF_BYTES. Its optional
+                // colours may be discarded if they alone exceed the cache.
+                if let Some(s) = self.states.get_mut(self.selected) {
+                    s.highlights.clear();
+                    // Remember plain rendering for the current file; otherwise
+                    // a discarded result could be requested every frame.
+                    s.highlights.insert(s.file, HighlightedFile::default());
+                    s.cached_bytes = s.diffs.as_ref().map_or(0, |d| crate::cache::diff_bytes(d, d.capacity()));
+                }
+                break;
+            };
+            let s = &mut self.states[i];
+            total = total.saturating_sub(s.cached_bytes);
+            s.diffs = None;
+            s.key = None;
+            s.highlights.clear();
+            s.cached_bytes = 0;
+            s.evicted = true;
+        }
+    }
+
+    /// Classifies all keys that move a selection or viewport. Keeping this in
+    /// one place also defines which repeated keys preserve a notice.
+    fn movement(code: KeyCode) -> Option<Movement> {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => Some(Movement::Vertical(1)),
+            KeyCode::Char('k') | KeyCode::Up => Some(Movement::Vertical(-1)),
+            KeyCode::PageDown => Some(Movement::DiffPage(1)),
+            KeyCode::PageUp => Some(Movement::DiffPage(-1)),
+            _ => None,
+        }
     }
 
     /// Answers whether `code` is a worktree switching key.
@@ -326,24 +409,10 @@ impl App {
     /// wrapping at either end. `Tab` and `Right` go forward, `Shift+Tab` and
     /// `Left` go back.
     fn step_focus(&mut self, delta: isize) {
-        if self.diff_fullscreen {
-            return;
-        }
         const ORDER: [Focus; 3] = [Focus::Worktrees, Focus::Files, Focus::Diff];
         let n = ORDER.len() as isize;
         let i = ORDER.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
         self.focus = ORDER[(i + delta).rem_euclid(n) as usize];
-    }
-
-    fn toggle_diff_fullscreen(&mut self) {
-        if self.diff_fullscreen {
-            self.diff_fullscreen = false;
-            self.focus = self.focus_before_fullscreen;
-        } else {
-            self.focus_before_fullscreen = self.focus;
-            self.diff_fullscreen = true;
-            self.focus = Focus::Diff;
-        }
     }
 
     fn step_file(&mut self, delta: isize) {
@@ -374,6 +443,32 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Scrolls the diff pane by one viewport without changing which pane has
+    /// focus. Moving the cursor with the scroll keeps its screen-row position,
+    /// so commenting and editor actions continue to target a visible row.
+    fn page_diff(&mut self, delta: isize) {
+        let page = self.diff_viewport_rows;
+        if page == 0 {
+            return;
+        }
+        let rows = self.diff_row_count();
+        let last = rows.saturating_sub(1);
+        let last_scroll = rows.saturating_sub(page);
+        if let Some(s) = self.current_mut() {
+            if delta < 0 {
+                s.cursor = s.cursor.saturating_sub(page);
+                s.scroll = s.scroll.saturating_sub(page);
+            } else {
+                s.cursor = s.cursor.saturating_add(page).min(last);
+                s.scroll = s.scroll.saturating_add(page).min(last_scroll);
+            }
+        }
+    }
+
+    pub(crate) fn set_diff_viewport_rows(&mut self, rows: usize) {
+        self.diff_viewport_rows = rows;
     }
 
     /// Rows in the current file: one per hunk header plus one per line.
@@ -420,8 +515,23 @@ impl App {
                             s.op = l.op;
                             s.error = None;
                             s.stale = false;
+                            s.evicted = false;
+                            s.cached_bytes = s.diffs.as_ref().map_or(0, |d| crate::cache::diff_bytes(d, d.capacity()))
+                                + s.highlights.values().map(highlight_bytes).sum::<usize>();
+                            self.cache_clock = self.cache_clock.saturating_add(1);
+                            s.last_used = self.cache_clock;
                         }
                         Err(e) => {
+                            if e == GitError::DiffTooLarge {
+                                // Never let old, markable content stand in for
+                                // a new diff whose changes were omitted.
+                                s.diffs = None;
+                                s.key = None;
+                                s.highlights.clear();
+                                s.cached_bytes = 0;
+                                s.evicted = false;
+                                s.stale = true;
+                            }
                             // A result for an older base can arrive after the base has changed.
                             let missing = matches!(&e, GitError::BaseMissing(b) if *b == self.base);
                             s.error = Some(e);
@@ -431,6 +541,7 @@ impl App {
                         }
                     }
                 }
+                self.trim_cache();
                 Vec::new()
             }
             Msg::Stale(path) => {
@@ -458,10 +569,16 @@ impl App {
                 self.notice = Some(e.to_string());
                 Vec::new()
             }
-            Msg::Highlighted { key, file_index, lines } => {
-                if let Some(s) = self.states.iter_mut().find(|s| s.key.as_ref() == Some(&key)) {
+            Msg::Highlighted { key, source, file_index, lines } => {
+                if let Some(s) = self.states.iter_mut().find(|s| {
+                    s.key.as_ref() == Some(&key)
+                        && s.diffs.as_ref().is_some_and(|diffs| source.ptr_eq(&Arc::downgrade(diffs)))
+                }) {
                     s.highlights.insert(file_index, lines);
+                    s.cached_bytes = s.diffs.as_ref().map_or(0, |d| crate::cache::diff_bytes(d, d.capacity()))
+                        + s.highlights.values().map(highlight_bytes).sum::<usize>();
                 }
+                self.trim_cache();
                 Vec::new()
             }
         }
@@ -476,14 +593,21 @@ impl App {
     fn apply_worktrees(&mut self, list: Vec<Worktree>) -> Vec<Effect> {
         let selected_path = self.selected_worktree().map(|w| w.path.clone());
 
-        let mut old: Vec<(PathBuf, WorktreeState)> =
-            self.worktrees.drain(..).map(|w| w.path).zip(self.states.drain(..)).collect();
+        let mut old: Vec<(Worktree, WorktreeState)> = self.worktrees.drain(..).zip(self.states.drain(..)).collect();
 
         let mut effects = Vec::new();
         for w in &list {
-            let state = match old.iter().position(|(p, _)| *p == w.path) {
-                Some(i) => old.swap_remove(i).1,
-                None => {
+            let previous = old.iter().position(|(previous, _)| previous.path == w.path).map(|i| old.swap_remove(i));
+            let state = match previous {
+                Some((previous, state)) if ReviewId::of(&previous) == ReviewId::of(w) => state,
+                _ => {
+                    // A path can now hold another branch or detached commit. Never
+                    // attach its review to the old diff, including an open comment.
+                    if selected_path.as_ref() == Some(&w.path)
+                        && matches!(self.input, Some(Input::Comment { .. } | Input::ConfirmClear))
+                    {
+                        self.input = None;
+                    }
                     effects.push(Effect::Load { path: w.path.clone(), base: self.base.clone() });
                     WorktreeState::default()
                 }
@@ -506,6 +630,7 @@ impl App {
             },
             None => 0,
         };
+        effects.extend(self.selected_cache_effects());
         effects
     }
 
@@ -576,6 +701,7 @@ impl App {
             Some(Input::Worktree { query }) => {
                 if let Some(i) = top_match(&query, &self.worktree_labels()) {
                     self.selected = i;
+                    return self.selected_cache_effects();
                 }
             }
             Some(Input::Base { query, mut branches }) => {
@@ -721,6 +847,23 @@ impl App {
     }
 }
 
+fn highlight_bytes(file: &HighlightedFile) -> usize {
+    file.hunks.capacity() * std::mem::size_of::<Vec<Vec<crate::highlight::Span>>>()
+        + file
+            .hunks
+            .iter()
+            .map(|h| {
+                h.capacity() * std::mem::size_of::<Vec<crate::highlight::Span>>()
+                    + h.iter()
+                        .map(|line| {
+                            line.capacity() * std::mem::size_of::<crate::highlight::Span>()
+                                + line.iter().map(|(_, text)| text.capacity()).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+}
+
 /// What Enter takes in a filtering prompt. A blank query cancels.
 fn top_match(query: &str, items: &[String]) -> Option<usize> {
     if query.trim().is_empty() {
@@ -769,20 +912,39 @@ fn new_side_start(header: &str) -> u32 {
     start.and_then(|n| n.parse().ok()).unwrap_or(1).max(1)
 }
 
-/// Identifies a file's content cheaply, since this runs for every file on
-/// every frame. Files with no `content_id`, such as mode-only changes, pure
-/// renames and dirty submodules, fall back to hashing hunks.
+/// Identifies both content and metadata, including changes without hunks.
+/// Blob IDs avoid hashing whole tracked files on every frame. Files without
+/// one, such as dirty submodules, fall back to hashing hunk text.
 ///
-/// Saved in reviews, so it uses `fnv1a`, which is stable across Rust releases.
+/// The version prefix deliberately invalidates old content-only reviewed
+/// marks. The encoding and `fnv1a` stay stable across Rust releases.
 fn content_hash(file: &crate::diff::FileDiff) -> u64 {
-    if let Some(id) = &file.content_id {
-        return fnv1a(id.as_bytes());
+    fn field(bytes: &mut Vec<u8>, value: Option<&str>) {
+        bytes.push(u8::from(value.is_some()));
+        if let Some(value) = value {
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
     }
-    let mut bytes = Vec::new();
-    for line in file.hunks.iter().flat_map(|h| &h.lines) {
-        bytes.push(line.kind as u8);
-        bytes.extend_from_slice(line.text.as_bytes());
-        bytes.push(b'\n');
+    let mut bytes = b"branchdiff-reviewed-v2\0".to_vec();
+    bytes.push(file.status.letter() as u8);
+    bytes.push(u8::from(file.binary));
+    field(&mut bytes, Some(&file.path));
+    field(&mut bytes, file.old_path.as_deref());
+    for mode in [file.old_mode, file.new_mode] {
+        bytes.push(u8::from(mode.is_some()));
+        bytes.extend_from_slice(&mode.unwrap_or(0).to_le_bytes());
+    }
+    field(&mut bytes, file.content_id.as_deref());
+    if file.content_id.is_none() {
+        for line in file.hunks.iter().flat_map(|h| &h.lines) {
+            bytes.push(match line.kind {
+                crate::diff::LineKind::Context => b' ',
+                crate::diff::LineKind::Added => b'+',
+                crate::diff::LineKind::Removed => b'-',
+            });
+            field(&mut bytes, Some(&line.text));
+        }
     }
     fnv1a(&bytes)
 }

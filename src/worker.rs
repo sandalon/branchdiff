@@ -41,6 +41,9 @@ pub enum Msg {
     Branches(Result<Vec<String>, GitError>),
     Highlighted {
         key: CacheKey,
+        /// The exact diff this job coloured; a branch transition can recreate
+        /// the same cache key while retiring the original diff.
+        source: std::sync::Weak<Vec<crate::diff::FileDiff>>,
         file_index: usize,
         lines: crate::highlight::HighlightedFile,
     },
@@ -58,6 +61,7 @@ struct Running {
     base: String,
     waiting_base: Option<String>,
     changed: bool,
+    invalidated: bool,
 }
 
 /// What to do about a load that has just finished.
@@ -65,9 +69,9 @@ struct Running {
 pub struct Finished {
     /// The waiting job, which now counts as running. Submit it.
     pub next: Option<Job>,
-    /// The result is for a base the user has left, so drop it. Otherwise a late
-    /// `BaseMissing` would reopen the picker. A result for the same base is
-    /// valid and newer than what's on screen, so it's shown until `next` lands.
+    /// The result belongs to a retired review identity or a base the user has
+    /// left, so drop it. Otherwise a late `BaseMissing` would reopen the picker.
+    /// A same-base refresh of the current identity can show until `next` lands.
     pub superseded: bool,
     /// The worktree changed during this load, so the result may predate that
     /// change. Never set with `next`, which starts after the change.
@@ -91,9 +95,22 @@ impl Loads {
                 None
             }
             None => {
-                self.running.insert(path.clone(), Running { base: base.clone(), waiting_base: None, changed: false });
+                self.running.insert(
+                    path.clone(),
+                    Running { base: base.clone(), waiting_base: None, changed: false, invalidated: false },
+                );
                 Some(Job::Load { path, base })
             }
+        }
+    }
+
+    /// Retires a load for a removed worktree or an earlier review identity.
+    /// Keep it running so a replacement waits rather than racing it. Any
+    /// waiting request also predates the identity change and must be replaced.
+    pub fn invalidate(&mut self, path: &Path) {
+        if let Some(running) = self.running.get_mut(path) {
+            running.invalidated = true;
+            running.waiting_base = None;
         }
     }
 
@@ -114,11 +131,12 @@ impl Loads {
             return Finished::default();
         };
         let changed = std::mem::take(&mut running.changed);
+        let invalidated = std::mem::take(&mut running.invalidated);
         let Some(base) = running.waiting_base.take() else {
             self.running.remove(path);
-            return Finished { changed, ..Finished::default() };
+            return Finished { changed, superseded: invalidated, ..Finished::default() };
         };
-        let superseded = base != running.base;
+        let superseded = invalidated || base != running.base;
         running.base = base.clone();
         Finished { next: Some(Job::Load { path: path.to_path_buf(), base }), superseded, changed: false }
     }
@@ -274,7 +292,7 @@ fn run(job: Job) -> Msg {
                 Ok(diffs.get(file_index).map(crate::highlight::highlight_file).unwrap_or_default())
             };
             let lines = guarded(highlight).unwrap_or_default();
-            Msg::Highlighted { key, file_index, lines }
+            Msg::Highlighted { key, source: Arc::downgrade(&diffs), file_index, lines }
         }
         Job::Probe { key } => {
             let path = key.worktree.clone();
@@ -377,6 +395,29 @@ mod tests {
             Some(Job::Load { base, .. }) => base,
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_invalidated_load_is_discarded_even_with_the_same_waiting_base() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "main".into());
+        loads.invalidate(Path::new("a"));
+        assert!(loads.request("a".into(), "main".into()).is_none());
+        let done = loads.finished(Path::new("a"));
+        assert!(done.superseded);
+        assert_eq!(base_of(done.next), "main");
+        assert!(!loads.finished(Path::new("a")).superseded);
+    }
+
+    #[test]
+    fn invalidating_retires_waiting_work_from_the_previous_identity() {
+        let mut loads = Loads::default();
+        loads.request("a".into(), "main".into());
+        loads.request("a".into(), "develop".into());
+        loads.invalidate(Path::new("a"));
+        let done = loads.finished(Path::new("a"));
+        assert!(done.superseded && done.next.is_none());
+        assert!(loads.request("a".into(), "main".into()).is_some());
     }
 
     #[test]

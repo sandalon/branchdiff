@@ -29,6 +29,49 @@ fn lists_worktrees_with_branches() {
     assert_eq!(branches, vec!["develop", "feat"]);
 }
 
+fn commit_at(cwd: &std::path::Path, message: &str, seconds: u64) {
+    run(cwd, &["add", "."]);
+    let date = format!("@{seconds} +0000");
+    let mut command = std::process::Command::new("git");
+    for var in git::REPO_ENV_VARS {
+        command.env_remove(var);
+    }
+    let output = command
+        .current_dir(cwd)
+        .args(["commit", "-qm", message])
+        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git commit: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn worktrees_are_sorted_by_latest_commit_then_dirty_file() {
+    let repo = Repo::new();
+    let feat = repo.add_worktree("feat");
+    std::fs::write(repo.main.join("main.txt"), "main\n").unwrap();
+    commit_at(&repo.main, "main", 2_000_000_000);
+    std::fs::write(feat.join("feat.txt"), "feat\n").unwrap();
+    commit_at(&feat, "feat", 2_000_000_100);
+
+    let branches = || {
+        git::list_worktrees(&repo.main)
+            .unwrap()
+            .into_iter()
+            .map(|worktree| worktree.branch.unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(branches(), vec!["feat", "develop"]);
+
+    let dirty = repo.main.join("a.txt");
+    std::fs::write(&dirty, "newest uncommitted edit\n").unwrap();
+    set_mtime(&dirty, 3_000_000_000);
+    assert_eq!(branches(), vec!["develop", "feat"]);
+}
+
 #[test]
 fn lists_detached_head_without_branch() {
     let repo = Repo::new();
@@ -934,4 +977,23 @@ fn a_bare_repository_is_skipped_when_seen_from_its_linked_worktree() {
     let linked = base.join("linked");
     run(&base.join("bare.git"), &["worktree", "add", "-q", "-b", "linked", linked.to_str().unwrap()]);
     assert_eq!(paths(&git::list_worktrees(&linked).unwrap()), vec![linked]);
+}
+
+#[test]
+fn oversized_tracked_patch_is_rejected_and_a_later_refresh_recovers() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("a.txt"), vec![b'x'; git::MAX_PATCH_BYTES]).unwrap();
+    assert_eq!(branchdiff::diff::load(&repo.main, "HEAD"), Err(GitError::DiffTooLarge));
+    std::fs::write(repo.main.join("a.txt"), "small change\n").unwrap();
+    let files = branchdiff::diff::load(&repo.main, "HEAD").unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "a.txt");
+    assert!(!files[0].hunks.is_empty());
+}
+
+#[test]
+fn untracked_line_amplification_reports_the_same_explicit_load_error() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("dense.txt"), vec![b'\n'; branchdiff::diff::MAX_DIFF_BYTES / 256]).unwrap();
+    assert_eq!(branchdiff::diff::load(&repo.main, "HEAD"), Err(GitError::DiffTooLarge));
 }

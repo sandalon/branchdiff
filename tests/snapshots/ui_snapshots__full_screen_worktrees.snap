@@ -1,0 +1,16 @@
+---
+source: tests/ui_snapshots.rs
+expression: render(&mut a)
+---
+"┌Worktrees─────────────────────────────────────────────────────────────────────┐"
+"│▸ feat-auth  /r/feat-auth                                     +1 −1  1 file c2│"
+"│  fix-cache  /r/fix-cache                                       +0 −0  0 files│"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" cwd: /r   base: develop   feat-auth   1 file   2 comments   ? help             "
