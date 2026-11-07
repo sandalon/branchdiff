@@ -1,7 +1,7 @@
 use crate::git;
 use crate::worker::Msg;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
-use notify::event::{EventKind, RemoveKind};
+use notify::event::{EventKind, ModifyKind, RemoveKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -93,6 +93,16 @@ fn classify(path: &Path, worktrees_dir: &Path, worktrees: &Worktrees) -> Option<
 /// worktree would mark it as changed. A real write also sends a `Modify`.
 fn is_change(kind: &EventKind) -> bool {
     !matches!(kind, EventKind::Access(_))
+}
+
+/// Windows reports a directory as modified whenever an entry inside it is
+/// added, removed or written. Git tracks no directories, and each entry sends
+/// its own event, so this says nothing. Without this, `pkg/ignored/` would mark
+/// a worktree as changed through `pkg`, and `git status` would refresh the list
+/// through `.git/worktrees/<name>`. A rename is kept: it moves what it holds.
+fn is_directory_touch(kind: &EventKind, path: &Path) -> bool {
+    matches!(kind, EventKind::Modify(m) if !matches!(m, ModifyKind::Name(_)))
+        && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// Where a worktree's `.git` file points, which a submodule gives as a relative
@@ -350,6 +360,9 @@ impl Tracker {
             return;
         }
         for path in &event.paths {
+            if is_directory_touch(&event.kind, path) {
+                continue;
+            }
             match classify(path, &self.worktrees_dir, &self.worktrees) {
                 Some(Change::File(root)) if path == &root && !root.exists() => {
                     self.worktrees.forget(watcher, &root);
@@ -422,6 +435,21 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_non_rename_modification_of_a_directory_is_a_touch() {
+        use notify::event::{CreateKind, DataChange, RenameMode};
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let modified = EventKind::Modify(ModifyKind::Any);
+        assert!(is_directory_touch(&modified, dir.path()));
+        assert!(is_directory_touch(&EventKind::Modify(ModifyKind::Data(DataChange::Any)), dir.path()));
+        assert!(!is_directory_touch(&modified, &file));
+        assert!(!is_directory_touch(&modified, &dir.path().join("gone")));
+        assert!(!is_directory_touch(&EventKind::Modify(ModifyKind::Name(RenameMode::To)), dir.path()));
+        assert!(!is_directory_touch(&EventKind::Create(CreateKind::Folder), dir.path()));
+    }
     use notify::event::Flag;
     use std::path::Path;
 
