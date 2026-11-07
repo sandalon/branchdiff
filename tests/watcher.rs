@@ -158,7 +158,7 @@ fn repo_with_main() -> (Repo, PathBuf, PathBuf) {
 
 #[test]
 #[ignore = "run by run_each_test_in_its_own_process"]
-fn commit_in_a_linked_worktree_marks_it_without_touching_the_list() {
+fn commit_in_a_linked_worktree_marks_it_and_refreshes_its_list_position() {
     let (repo, main, common) = repo_with_main();
     let linked = real(&repo.add_worktree("feat"));
     std::fs::write(linked.join("new.txt"), "new\n").unwrap();
@@ -172,7 +172,7 @@ fn commit_in_a_linked_worktree_marks_it_without_touching_the_list() {
     session.settle();
     run(&linked, &["commit", "-qm", "nothing staged", "--allow-empty"]);
     assert!(session.saw_stale(&linked), "committing with an untouched index");
-    session.assert_list_unchanged("a commit is not a new worktree");
+    assert!(session.saw_list_change(), "a commit changes the worktree's recency");
 }
 
 #[test]
@@ -254,7 +254,7 @@ fn a_changed_gitignore_takes_effect_at_once() {
 
 #[test]
 #[ignore = "run by run_each_test_in_its_own_process"]
-fn edits_to_a_tracked_file_count_even_if_it_matches_an_ignore_rule() {
+fn edits_to_a_tracked_file_refresh_its_list_position_even_if_it_matches_an_ignore_rule() {
     let (_repo, main, common) = repo_with_main();
     std::fs::write(main.join(".gitignore"), "*.log\n").unwrap();
     std::fs::write(main.join("kept.log"), "x\n").unwrap();
@@ -263,6 +263,7 @@ fn edits_to_a_tracked_file_count_even_if_it_matches_an_ignore_rule() {
     let session = Session::start(&common, &[&main]);
     std::fs::write(main.join("kept.log"), "y\n").unwrap();
     assert!(session.saw_stale(&main));
+    assert!(session.saw_list_change());
 }
 
 #[test]

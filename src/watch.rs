@@ -41,8 +41,11 @@ fn owning_worktree(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
 enum Change {
     /// A file in this worktree, which counts unless git ignores it.
     File(PathBuf),
-    /// This worktree's index or reflog.
+    /// This worktree's index.
     State(PathBuf),
+    /// This worktree's reflog, which records commits even when HEAD itself is
+    /// still on the same branch.
+    Activity(PathBuf),
     /// This worktree's HEAD, so its branch may differ in the list as well.
     Head(PathBuf),
     /// The set of worktrees, or an unknown worktree's HEAD.
@@ -56,7 +59,8 @@ fn classify(path: &Path, worktrees_dir: &Path, worktrees: &Worktrees) -> Option<
         return match parts.as_slice() {
             [] | [_] | [_, "gitdir"] => Some(Change::List),
             [_, "HEAD"] => Some(owner.map_or(Change::List, Change::Head)),
-            [_, "index"] | [_, "logs", "HEAD"] => owner.map(Change::State),
+            [_, "index"] => owner.map(Change::State),
+            [_, "logs", "HEAD"] => owner.map(Change::Activity),
             _ => None,
         };
     }
@@ -64,7 +68,9 @@ fn classify(path: &Path, worktrees_dir: &Path, worktrees: &Worktrees) -> Option<
     if let (Some(main), Some(rel)) = (&worktrees.main_with_git_file, in_common) {
         return if rel == Path::new("HEAD") {
             Some(Change::Head(main.clone()))
-        } else if rel == Path::new("index") || rel == Path::new("logs/HEAD") {
+        } else if rel == Path::new("logs/HEAD") {
+            Some(Change::Activity(main.clone()))
+        } else if rel == Path::new("index") {
             Some(Change::State(main.clone()))
         } else {
             None
@@ -74,6 +80,8 @@ fn classify(path: &Path, worktrees_dir: &Path, worktrees: &Worktrees) -> Option<
     let rel = path.strip_prefix(&root).ok()?;
     Some(if rel == Path::new(".git/HEAD") {
         Change::Head(root)
+    } else if rel == Path::new(".git/logs/HEAD") {
+        Change::Activity(root)
     } else if rel.starts_with(".git") {
         Change::State(root)
     } else {
@@ -345,6 +353,10 @@ impl Tracker {
                 }
                 Some(Change::File(root)) => self.unchecked.add(root, path, &event.kind, now),
                 Some(Change::State(root)) => self.bursts.record(root, now),
+                Some(Change::Activity(root)) => {
+                    self.bursts.record(root.clone(), now);
+                    self.list_changed.record(root, now);
+                }
                 Some(Change::Head(root)) => {
                     self.bursts.record(root, now);
                     self.list_changed.record(self.worktrees_dir.clone(), now);
@@ -358,7 +370,8 @@ impl Tracker {
     /// Answers false once nothing is listening.
     fn send_due(&mut self, now: Instant) -> bool {
         for root in self.unchecked.changed_roots(now) {
-            self.bursts.record(root, now);
+            self.bursts.record(root.clone(), now);
+            self.list_changed.record(root, now);
         }
         for root in self.bursts.due(now) {
             if self.msgs.send(Msg::Stale(root)).is_err() {
@@ -613,7 +626,7 @@ mod tests {
     fn git_state_in_the_common_dir_belongs_to_a_main_worktree_whose_git_is_a_file() {
         let (wt, main) = (|| PathBuf::from("/r/wt"), Some("/r/wt"));
         assert_eq!(classified_with_git_file("/r/sep.git/index", main), Some(Change::State(wt())));
-        assert_eq!(classified_with_git_file("/r/sep.git/logs/HEAD", main), Some(Change::State(wt())));
+        assert_eq!(classified_with_git_file("/r/sep.git/logs/HEAD", main), Some(Change::Activity(wt())));
         assert_eq!(classified_with_git_file("/r/sep.git/HEAD", main), Some(Change::Head(wt())));
     }
 
@@ -640,7 +653,7 @@ mod tests {
     fn a_linked_worktrees_git_state_belongs_to_it_and_not_to_the_list() {
         let a = || PathBuf::from("/r/main/.worktrees/a");
         assert_eq!(classified("/r/main/.git/worktrees/a/index"), Some(Change::State(a())));
-        assert_eq!(classified("/r/main/.git/worktrees/a/logs/HEAD"), Some(Change::State(a())));
+        assert_eq!(classified("/r/main/.git/worktrees/a/logs/HEAD"), Some(Change::Activity(a())));
         assert_eq!(classified("/r/main/.git/worktrees/a/HEAD"), Some(Change::Head(a())));
     }
 
@@ -676,7 +689,7 @@ mod tests {
         let main = || PathBuf::from("/r/main");
         assert_eq!(classified("/r/main/src/x.rs"), Some(Change::File(main())));
         assert_eq!(classified("/r/main/.git/index"), Some(Change::State(main())));
-        assert_eq!(classified("/r/main/.git/logs/HEAD"), Some(Change::State(main())));
+        assert_eq!(classified("/r/main/.git/logs/HEAD"), Some(Change::Activity(main())));
         assert_eq!(classified("/r/main/.git/HEAD"), Some(Change::Head(main())));
     }
 

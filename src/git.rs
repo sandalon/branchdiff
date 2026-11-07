@@ -1,12 +1,13 @@
+use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
@@ -15,6 +16,7 @@ pub enum GitError {
     BaseMissing(String),
     NoMergeBase,
     NoCommits,
+    DiffTooLarge,
     Failed(String),
 }
 
@@ -26,6 +28,7 @@ impl fmt::Display for GitError {
             GitError::BaseMissing(b) => write!(f, "base branch '{b}' not found"),
             GitError::NoMergeBase => write!(f, "no common history with the base branch"),
             GitError::NoCommits => write!(f, "this branch has no commits yet"),
+            GitError::DiffTooLarge => write!(f, "Diff exceeds the memory limit; no changes are shown. Review it with git diff or reduce its size, then press r."),
             GitError::Failed(e) => write!(f, "{e}"),
         }
     }
@@ -179,7 +182,47 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, GitError> {
     for w in list.iter_mut().filter(|w| w.branch.is_none()) {
         w.branch = rebasing_branch(&w.path);
     }
+    // Git's native order always puts the main worktree first. For review it is
+    // more useful to put the worktree with the newest commit or in-progress
+    // edit first. The sort is stable, so equal or unavailable times retain
+    // Git's deterministic order.
+    list.sort_by_key(|w| Reverse(worktree_modified(w)));
     Ok(list)
+}
+
+/// The newest change represented by a worktree: its HEAD commit, or the mtime
+/// of a dirty path. Looking only at dirty paths avoids walking an entire large
+/// checkout while still noticing edits that have not been committed yet.
+fn worktree_modified(worktree: &Worktree) -> SystemTime {
+    let mut newest = commit_time(worktree).unwrap_or(UNIX_EPOCH);
+    let Ok(status) =
+        run(&worktree.path, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none"])
+    else {
+        return newest;
+    };
+    if status.code != Some(0) {
+        return newest;
+    }
+    for path in dirty_paths(&status.stdout) {
+        let path = worktree.path.join(path);
+        // Creating, renaming, or deleting a path updates its parent even when
+        // the path's own mtime is old or it no longer has metadata.
+        for candidate in std::iter::once(path.as_path()).chain(path.parent()) {
+            if let Ok(modified) = std::fs::symlink_metadata(candidate).and_then(|metadata| metadata.modified()) {
+                newest = newest.max(modified);
+            }
+        }
+    }
+    newest
+}
+
+fn commit_time(worktree: &Worktree) -> Option<SystemTime> {
+    if worktree.head.is_empty() {
+        return None;
+    }
+    let text = ok_stdout(run(&worktree.path, ["show", "-s", "--format=%ct", &worktree.head]).ok()?).ok()?;
+    let seconds = text.trim().parse().ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
 }
 
 /// The branch being rebased in a worktree, which git lists as detached until the
@@ -329,10 +372,20 @@ pub fn any_not_ignored(cwd: &Path, paths: &[PathBuf]) -> Result<bool, GitError> 
     Ok(ignored < paths.len())
 }
 
+/// Maximum buffered tracked patch. Larger patches are rejected in full.
+pub const MAX_PATCH_BYTES: usize = 8 * 1024 * 1024;
+
 /// Diff from `merge_base` to the working tree. Pins the config known to change
 /// the patch format, so the parser sees the same shape under most user config.
 pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
-    let out = run(
+    diff_with_limit(cwd, merge_base, MAX_PATCH_BYTES)
+}
+
+fn diff_with_limit(cwd: &Path, merge_base: &str, limit: usize) -> Result<Vec<u8>, GitError> {
+    if !cwd.is_dir() {
+        return Err(cwd_gone(cwd));
+    }
+    let mut cmd = command(
         cwd,
         [
             "-c",
@@ -357,11 +410,46 @@ pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
             merge_base,
             "--",
         ],
-    )?;
-    if out.code == Some(0) {
-        Ok(out.stdout)
+    );
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| spawn_error(cwd, e))?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    // Drain concurrently so diagnostics cannot fill the pipe and block git.
+    // Keep only a bounded prefix, even when a hook or filter is very noisy.
+    let diagnostics = thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut chunk = [0; 8192];
+        while let Ok(n) = stderr.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            let keep = n.min((64 * 1024usize).saturating_sub(kept.len()));
+            kept.extend_from_slice(&chunk[..keep]);
+        }
+        kept
+    });
+    let mut bytes = Vec::new();
+    let read = stdout.by_ref().take(limit.saturating_add(1) as u64).read_to_end(&mut bytes);
+    let too_large = bytes.len() > limit;
+    if too_large || read.is_err() {
+        let _ = child.kill();
+    }
+    drop(stdout);
+    let status = child.wait();
+    let stderr = diagnostics.join().unwrap_or_default();
+    if too_large {
+        return Err(GitError::DiffTooLarge);
+    }
+    read.map_err(|e| GitError::Failed(e.to_string()))?;
+    let status = status.map_err(|e| GitError::Failed(e.to_string()))?;
+    if status.success() {
+        Ok(bytes)
     } else {
-        Err(failed(out))
+        Err(failed(Output {
+            code: status.code(),
+            stdout: Vec::new(),
+            stderr: String::from_utf8_lossy(&stderr).trim().into(),
+        }))
     }
 }
 
@@ -395,6 +483,27 @@ pub fn in_progress_op(cwd: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracked_patch_limit_is_exact_and_never_returns_a_partial_patch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(run(dir.path(), ["init", "-q"]).unwrap().code, Some(0));
+        std::fs::write(dir.path().join("a"), "old\n").unwrap();
+        assert_eq!(run(dir.path(), ["add", "a"]).unwrap().code, Some(0));
+        assert_eq!(
+            run(dir.path(), ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"])
+                .unwrap()
+                .code,
+            Some(0)
+        );
+        std::fs::write(dir.path().join("a"), "new\n").unwrap();
+        let complete = diff_with_limit(dir.path(), "HEAD", 4096).unwrap();
+        assert!(!complete.is_empty());
+        assert_eq!(diff_with_limit(dir.path(), "HEAD", complete.len()).unwrap(), complete);
+        assert_eq!(diff_with_limit(dir.path(), "HEAD", complete.len() - 1), Err(GitError::DiffTooLarge));
+        // A rejected child was reaped and a later refresh can still succeed.
+        assert_eq!(diff_with_limit(dir.path(), "HEAD", 4096).unwrap(), complete);
+    }
 
     #[test]
     fn parse_worktrees_strips_the_ref_prefix_only_once() {

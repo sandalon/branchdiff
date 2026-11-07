@@ -14,6 +14,8 @@ fn file(path: &str) -> FileDiff {
     FileDiff {
         path: path.into(),
         old_path: None,
+        old_mode: None,
+        new_mode: None,
         status: Status::Modified,
         binary: false,
         content_id: None,
@@ -102,6 +104,8 @@ fn file_with_line(text: &str) -> FileDiff {
     FileDiff {
         path: "a.rs".into(),
         old_path: None,
+        old_mode: None,
+        new_mode: None,
         status: Status::Modified,
         binary: false,
         content_id: None,
@@ -365,7 +369,12 @@ fn a_reload_keeps_colours_only_while_the_key_is_unchanged() {
     deliver(&mut a, "a", vec![file("1")]);
     assert!(a.highlight_effect().is_some());
     let key = a.current().unwrap().key.clone().unwrap();
-    a.handle_msg(Msg::Highlighted { key: key.clone(), file_index: 0, lines: Default::default() });
+    a.handle_msg(Msg::Highlighted {
+        key: key.clone(),
+        source: Arc::downgrade(a.states[0].diffs.as_ref().unwrap()),
+        file_index: 0,
+        lines: Default::default(),
+    });
     assert_eq!(a.highlight_effect(), None);
 
     deliver(&mut a, "a", vec![file("1")]);
@@ -388,7 +397,12 @@ fn a_highlight_for_a_stale_key_changes_nothing() {
     let loaded = Loaded { key: current, diffs: Arc::new(vec![file("1")]), op: None };
     a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Ok(loaded) });
 
-    a.handle_msg(Msg::Highlighted { key: stale, file_index: 0, lines: Default::default() });
+    a.handle_msg(Msg::Highlighted {
+        key: stale,
+        source: Arc::downgrade(a.states[0].diffs.as_ref().unwrap()),
+        file_index: 0,
+        lines: Default::default(),
+    });
     assert!(a.states.iter().all(|s| s.highlights.is_empty()));
 }
 
@@ -400,7 +414,12 @@ fn a_highlight_reaches_its_own_worktree_when_another_is_selected() {
     assert_eq!(a.selected, 0);
     let key = a.states[1].key.clone().unwrap();
 
-    a.handle_msg(Msg::Highlighted { key, file_index: 0, lines: Default::default() });
+    a.handle_msg(Msg::Highlighted {
+        key,
+        source: Arc::downgrade(a.states[1].diffs.as_ref().unwrap()),
+        file_index: 0,
+        lines: Default::default(),
+    });
     assert!(a.states[0].highlights.is_empty());
     assert!(a.states[1].highlights.contains_key(&0));
 }
@@ -770,20 +789,35 @@ fn question_mark_toggles_help_and_esc_closes_it() {
 }
 
 #[test]
-fn f_toggles_a_diff_only_view_and_restores_focus() {
+fn f_makes_the_focused_pane_full_screen_and_keeps_focus() {
     let mut a = app(&["a"]);
     a.focus = Focus::Files;
 
     press(&mut a, 'f');
-    assert!(a.diff_fullscreen);
-    assert_eq!(a.focus, Focus::Diff);
-
-    a.handle_key(KeyEvent::from(KeyCode::Tab));
-    assert_eq!(a.focus, Focus::Diff, "hidden panes cannot receive focus");
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Files);
 
     press(&mut a, 'f');
-    assert!(!a.diff_fullscreen);
+    assert!(!a.fullscreen);
     assert_eq!(a.focus, Focus::Files);
+}
+
+#[test]
+fn tab_moves_the_full_screen_view_with_focus() {
+    let mut a = app(&["a"]);
+    press(&mut a, 'f');
+
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Files);
+
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(a.focus, Focus::Diff);
+
+    press(&mut a, 'f');
+    assert!(!a.fullscreen);
+    assert_eq!(a.focus, Focus::Diff, "leaving full screen keeps the pane last shown");
 }
 
 #[test]
@@ -869,18 +903,47 @@ fn a_save_records_the_review_it_was_made_for() {
     deliver(&mut a, "a", vec![file_with_line("x")]);
     let fx = press(&mut a, 'x');
     press(&mut a, ']');
-    assert!(matches!(&fx[0], Effect::SaveReview { id: ReviewId::Branch(b), review }
+    assert!(matches!(&fx[0], Effect::SaveReview { id: ReviewId::Branch(b), review, .. }
         if b == "a" && review.reviewed.len() == 1));
 }
 
 #[test]
 fn only_the_last_save_per_review_is_kept() {
+    let versions = [ReviewVersion::default(), ReviewVersion::default()];
     let save = |name: &str, marks: usize| Effect::SaveReview {
+        version: versions[usize::from(name != "a")].clone(),
         id: ReviewId::Branch(name.into()),
         review: Review { comments: vec![], reviewed: (0..marks).map(|i| (i.to_string(), 0)).collect() },
     };
     let kept = coalesce_saves(vec![save("a", 1), save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
     assert_eq!(kept, vec![save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
+}
+
+#[test]
+fn detached_worktrees_sharing_a_review_keep_both_editing_states_saves() {
+    let mut a = app(&["a", "b"]);
+    for worktree in &mut a.worktrees {
+        worktree.branch = None;
+        worktree.head = "shared-commit".into();
+    }
+    deliver(&mut a, "a", vec![file_with_line("x")]);
+    deliver(&mut a, "b", vec![file_with_line("y")]);
+    let mut effects = press(&mut a, 'x');
+    press(&mut a, ']');
+    effects.extend(press(&mut a, 'x'));
+    let kept = coalesce_saves(effects);
+    assert_eq!(kept.len(), 2, "neither independent snapshot can be silently dropped");
+    let sessions: Vec<_> = kept
+        .iter()
+        .map(|effect| match effect {
+            Effect::SaveReview { id, version, .. } => {
+                assert_eq!(id, &ReviewId::Commit("shared-commit".into()));
+                version.session_id()
+            }
+            other => panic!("unexpected effect {other:?}"),
+        })
+        .collect();
+    assert_ne!(sessions[0], sessions[1]);
 }
 
 #[test]
@@ -986,6 +1049,8 @@ fn changing_a_binary_file_resets_its_reviewed_mark() {
     let binary = |id: &str| FileDiff {
         path: "b.dat".into(),
         old_path: None,
+        old_mode: None,
+        new_mode: None,
         status: Status::Modified,
         binary: true,
         content_id: Some(id.into()),
@@ -1182,7 +1247,14 @@ fn a_save_from_a_later_worktree_holds_its_own_id_and_review() {
     let fx = type_comment(&mut a, "fix");
     assert_eq!(a.states[1].review.comments.len(), 1);
     assert_ne!(a.states[0].review, a.states[1].review);
-    assert_eq!(fx, vec![Effect::SaveReview { id: ReviewId::Branch("b".into()), review: a.states[1].review.clone() }]);
+    assert_eq!(
+        fx,
+        vec![Effect::SaveReview {
+            id: ReviewId::Branch("b".into()),
+            review: a.states[1].review.clone(),
+            version: a.states[1].review_version.clone()
+        }]
+    );
 }
 
 #[test]
@@ -1286,6 +1358,104 @@ fn content_hash_differs_when_only_a_lines_kind_differs() {
     let gone = numbered(LineKind::Removed, Some(1), None);
     let with_line = |l| FileDiff { hunks: vec![hunk("@@", vec![l])], ..file("a") };
     assert_ne!(content_hash(&with_line(added)), content_hash(&with_line(gone)));
+}
+
+#[test]
+fn a_mode_only_mark_does_not_review_an_unrelated_rename() {
+    let mut a = app(&["a"]);
+    let mode = crate::diff::parse(b"diff --git a/run b/run\nold mode 100644\nnew mode 100755\n");
+    deliver(&mut a, "a", mode);
+    press(&mut a, 'x');
+    assert!(a.is_reviewed(0));
+    let rename =
+        crate::diff::parse(b"diff --git a/other b/run\nsimilarity index 100%\nrename from other\nrename to run\n");
+    deliver(&mut a, "a", rename);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn mode_changes_reset_reviewed_marks_even_when_blob_ids_match() {
+    let original = FileDiff {
+        content_id: Some("aaaa..bbbb".into()),
+        old_mode: Some(0o100644),
+        new_mode: Some(0o100644),
+        ..file("run")
+    };
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![original.clone()]);
+    press(&mut a, 'x');
+    deliver(&mut a, "a", vec![original.clone()]);
+    assert!(a.is_reviewed(0), "an unchanged reload retains the mark");
+    deliver(&mut a, "a", vec![FileDiff { new_mode: Some(0o100755), ..original }]);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn changing_a_pure_renames_source_resets_its_reviewed_mark() {
+    let mut a = app(&["a"]);
+    let renamed = FileDiff { status: Status::Renamed, old_path: Some("old".into()), ..file("new") };
+    deliver(&mut a, "a", vec![renamed.clone()]);
+    press(&mut a, 'x');
+    deliver(&mut a, "a", vec![FileDiff { old_path: Some("different".into()), ..renamed }]);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn tracking_an_untracked_file_requires_a_new_review() {
+    let mut a = app(&["a"]);
+    let untracked = FileDiff { status: Status::Untracked, content_id: Some("same".into()), ..file("new") };
+    deliver(&mut a, "a", vec![untracked.clone()]);
+    press(&mut a, 'x');
+    deliver(&mut a, "a", vec![FileDiff { status: Status::Added, ..untracked }]);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn legacy_content_only_reviewed_marks_are_invalidated() {
+    let mut a = app(&["a"]);
+    let file = FileDiff { content_id: Some("aaaa..bbbb".into()), ..file("run") };
+    deliver(&mut a, "a", vec![file]);
+    a.states[0].review.reviewed.insert("run".into(), fnv1a(b"aaaa..bbbb"));
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn reviewed_fingerprints_stay_stable_between_builds() {
+    let file = FileDiff { content_id: Some("aaaa..bbbb".into()), ..file("run") };
+    assert_eq!(content_hash(&file), 0xfbc8c8028ca34e24);
+}
+
+#[cfg(unix)]
+#[test]
+fn untracked_permission_and_type_changes_require_review_even_with_identical_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    assert_eq!(crate::git::run(dir.path(), ["init", "-q"]).unwrap().code, Some(0));
+    let commit =
+        ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "base"];
+    assert_eq!(crate::git::run(dir.path(), commit).unwrap().code, Some(0));
+    let path = dir.path().join("untracked");
+    std::fs::write(&path, "target").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let original = crate::diff::load(dir.path(), "HEAD").unwrap();
+    let content_id = original[0].content_id.clone();
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", original);
+    press(&mut a, 'x');
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = crate::diff::load(dir.path(), "HEAD").unwrap();
+    assert_eq!(executable[0].content_id, content_id);
+    deliver(&mut a, "a", executable);
+    assert!(!a.is_reviewed(0), "the execute bit changed");
+    press(&mut a, 'x');
+
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("target", &path).unwrap();
+    let symlink = crate::diff::load(dir.path(), "HEAD").unwrap();
+    assert_eq!(symlink[0].content_id, content_id);
+    deliver(&mut a, "a", symlink);
+    assert!(!a.is_reviewed(0), "the object type changed");
 }
 
 #[test]
@@ -1654,4 +1824,161 @@ fn a_probe_result_alone_changes_nothing_in_the_app() {
     let mut a = app(&["a"]);
     assert!(a.handle_msg(Msg::Probed { path: "/r/a".into(), changed: true }).is_empty());
     assert!(!a.states[0].stale);
+}
+
+#[test]
+fn global_cache_evicts_independent_models_in_access_order() {
+    let mut a = app(&["a", "b", "c"]);
+    for name in ["a", "b", "c"] {
+        // Separate models and allocations, rather than sharing an Arc.
+        deliver(&mut a, name, vec![file_with_rows(name, 20)]);
+    }
+    let one = a.states[0].cached_bytes;
+    assert!(one > 0);
+    // Visiting b protects it ahead of c when the cache is trimmed.
+    press(&mut a, '2');
+    press(&mut a, '1');
+    a.trim_cache_to(one * 2);
+    assert!(a.states[0].diffs.is_some());
+    assert!(a.states[1].diffs.is_some());
+    assert!(a.states[2].diffs.is_none());
+    assert!(a.states.iter().map(|s| s.cached_bytes).sum::<usize>() <= one * 2);
+    let effects = press(&mut a, '3');
+    assert_eq!(effects, vec![Effect::Load { path: "/r/c".into(), base: "develop".into() }]);
+    assert!(press(&mut a, '3').is_empty(), "selection does not repeatedly queue an evicted load");
+    deliver(&mut a, "c", vec![file_with_rows("c", 20)]);
+    assert!(a.current_file().is_some());
+}
+
+#[test]
+fn cache_eviction_keeps_review_notes_and_reload_restores_navigation() {
+    let mut a = app(&["a", "b"]);
+    deliver(&mut a, "a", vec![file_with_rows("a", 20)]);
+    deliver(&mut a, "b", vec![file_with_rows("b", 20)]);
+    press(&mut a, '2');
+    set_cursor_scroll(&mut a, 5, 3);
+    press(&mut a, 'x');
+    let review = a.current().unwrap().review.clone();
+    press(&mut a, '1');
+    a.trim_cache_to(a.states[0].cached_bytes);
+    assert_eq!(a.states[1].review, review);
+    press(&mut a, '2');
+    deliver(&mut a, "b", vec![file_with_rows("b", 20)]);
+    assert_eq!(position(&a), (0, 5, 3));
+    assert!(a.is_reviewed(0));
+}
+
+#[test]
+fn oversized_refresh_clears_old_markable_diff_and_keeps_explicit_error() {
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![file_with_rows("a", 20)]);
+    press(&mut a, 'x');
+    a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Err(GitError::DiffTooLarge) });
+    assert!(a.current_file().is_none());
+    assert!(a.current().unwrap().stale);
+    assert!(!a.is_reviewed(0));
+    assert!(press(&mut a, 'x').is_empty());
+    assert_eq!(a.current().unwrap().error, Some(GitError::DiffTooLarge));
+}
+
+#[test]
+fn finder_and_vertical_selection_reload_evicted_worktrees() {
+    let mut a = app(&["a", "b", "c"]);
+    for name in ["a", "b", "c"] {
+        deliver(&mut a, name, vec![file_with_rows(name, 20)]);
+    }
+    a.trim_cache_to(a.states[0].cached_bytes);
+    a.focus = Focus::Worktrees;
+    assert_eq!(press(&mut a, 'j'), vec![Effect::Load { path: "/r/b".into(), base: "develop".into() }]);
+    press(&mut a, 'w');
+    type_text(&mut a, "c");
+    assert_eq!(
+        a.handle_key(KeyEvent::from(KeyCode::Enter)),
+        vec![Effect::Load { path: "/r/c".into(), base: "develop".into() }]
+    );
+}
+
+#[test]
+fn fullscreen_worktree_movement_reloads_an_evicted_model() {
+    let mut a = app(&["a", "b"]);
+    for name in ["a", "b"] {
+        deliver(&mut a, name, vec![file_with_rows(name, 20)]);
+    }
+    a.trim_cache_to(a.states[0].cached_bytes);
+    a.focus = Focus::Worktrees;
+    press(&mut a, 'f');
+    assert!(a.fullscreen);
+    assert_eq!(press(&mut a, 'j'), vec![Effect::Load { path: "/r/b".into(), base: "develop".into() }]);
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Worktrees);
+    deliver(&mut a, "b", vec![file_with_rows("b", 20)]);
+    assert!(a.current_file().is_some());
+}
+
+#[test]
+fn discarded_colours_do_not_request_the_same_highlight_forever() {
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![file_with_rows("a", 20)]);
+    assert!(a.highlight_effect().is_some());
+    a.trim_cache_to(0);
+    assert!(a.highlight_effect().is_none());
+    assert!(a.current_file().is_some(), "the selected diff remains usable");
+}
+
+#[test]
+fn switching_branch_at_the_same_path_reloads_and_cannot_comment_on_the_old_diff() {
+    let mut a = app_on_line();
+    type_comment(&mut a, "old review");
+    press(&mut a, 'x');
+    press(&mut a, 'c');
+    let mut next = wt("a");
+    next.branch = Some("b".into());
+    // Even two branches at the same commit have different reviews.
+    let effects = a.handle_msg(Msg::Worktrees(Ok(vec![next])));
+    assert_eq!(effects, vec![Effect::Load { path: "/r/a".into(), base: "develop".into() }]);
+    let s = a.current().unwrap();
+    assert!(s.key.is_none() && s.diffs.is_none() && s.highlights.is_empty());
+    assert_eq!(s.review, Review::default());
+    assert_eq!(position(&a), (0, 0, 0));
+    assert!(a.input.is_none());
+    assert!(type_comment(&mut a, "must not save").is_empty());
+    assert!(a.current().unwrap().review.comments.is_empty());
+}
+
+#[test]
+fn moving_a_detached_worktree_to_another_commit_reloads_its_diff() {
+    let mut a = app(&["a"]);
+    a.worktrees[0].branch = None;
+    deliver(&mut a, "a", vec![file_with_line("old commit")]);
+    let mut next = a.worktrees[0].clone();
+    next.head = "new commit".into();
+    let effects = a.handle_msg(Msg::Worktrees(Ok(vec![next])));
+    assert_eq!(effects.len(), 1);
+    assert!(a.current_file().is_none());
+}
+
+#[test]
+fn a_new_commit_on_the_same_branch_preserves_the_review_and_diff_until_refresh() {
+    let mut a = app_on_line();
+    type_comment(&mut a, "keep");
+    let diffs = a.current().unwrap().diffs.clone().unwrap();
+    let mut next = a.worktrees[0].clone();
+    next.head = "new commit".into();
+    assert!(a.handle_msg(Msg::Worktrees(Ok(vec![next]))).is_empty());
+    assert!(Arc::ptr_eq(a.current().unwrap().diffs.as_ref().unwrap(), &diffs));
+    assert_eq!(a.current().unwrap().review.comments[0].body, "keep");
+}
+
+#[test]
+fn a_late_highlight_cannot_attach_to_another_branch_with_the_same_cache_key() {
+    let mut a = app_on_line();
+    let key = a.current().unwrap().key.clone().unwrap();
+    let source = Arc::downgrade(a.current().unwrap().diffs.as_ref().unwrap());
+    let mut next = a.worktrees[0].clone();
+    next.branch = Some("b".into());
+    a.handle_msg(Msg::Worktrees(Ok(vec![next])));
+    deliver(&mut a, "a", vec![file_with_line("let x = 1;")]);
+    assert_eq!(a.current().unwrap().key.as_ref(), Some(&key));
+    a.handle_msg(Msg::Highlighted { key, source, file_index: 0, lines: Default::default() });
+    assert!(a.current().unwrap().highlights.is_empty());
 }

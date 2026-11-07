@@ -3,11 +3,11 @@ use arboard::Clipboard;
 use branchdiff::app::{coalesce_saves, App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
-use branchdiff::store::{ReviewId, Store};
+use branchdiff::store::{Review, ReviewId, ReviewVersion, SaveOutcome, Store};
 use branchdiff::worker::{Job, Lists, Loads, Msg, Pool, Probes, Reaction, WORKER_THREAD};
 use branchdiff::{config, editor, signals, ui, watch};
 use clap::Parser;
-use crossbeam_channel::{select, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::try_init().context("could not start the terminal")?;
     keep_terminal_on_worker_panic();
     set_bracketed_paste(true);
-    let result = run(&mut terminal, info, base, config_problem);
+    let result = run(&mut terminal, info, base, &cwd, config_problem);
     let _ = terminal.show_cursor();
     set_bracketed_paste(false);
     // Not `ratatui::restore` or the terminal's drop, which both panic writing
@@ -136,8 +136,10 @@ fn spawn_quit_watch(tx: Sender<Event>) {
     });
 }
 
-fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Option<String>) -> Result<()> {
-    let (msg_tx, msg_rx) = unbounded::<Msg>();
+fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, cwd: &Path, notice: Option<String>) -> Result<()> {
+    // Completed loads own diff models, so backpressure bounds results waiting
+    // while the UI is saving or an editor owns the terminal.
+    let (msg_tx, msg_rx) = bounded::<Msg>(4);
     let (key_tx, key_rx) = unbounded::<Event>();
     let paused = Arc::new(AtomicBool::new(false));
     spawn_quit_watch(key_tx.clone());
@@ -161,6 +163,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Opt
         highlighting: HashSet::new(),
     };
     let mut app = App::new(base);
+    app.home = std::env::home_dir();
     app.truecolor = supports_truecolor();
     app.notice = notice;
     if watch_failed {
@@ -169,7 +172,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Opt
     request_list(&app, &mut rt);
 
     loop {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|f| ui::draw(f, &mut app, cwd))?;
         if app.should_quit {
             return Ok(());
         }
@@ -261,6 +264,14 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
     }
     let effects = match msg {
         Msg::Worktrees(Ok(list)) => {
+            // A load already running at this path belongs to the earlier review,
+            // even if its base is unchanged. Retire it before any queued reply
+            // is handled; the replacement load effect may be performed later.
+            for previous in &app.worktrees {
+                if !list.iter().any(|w| w.path == previous.path && ReviewId::of(w) == ReviewId::of(previous)) {
+                    rt.loads.invalidate(&previous.path);
+                }
+            }
             if let Some(tx) = &rt.watch {
                 let _ = tx.send(watch::Command::SetWorktrees(list.iter().map(|w| w.path.clone()).collect()));
             }
@@ -280,7 +291,7 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
                     } else if let Some(path) = loaded.left_in_place {
                         app.notice = Some(format!("Review could not be read or moved, still at {}", path.display()));
                     }
-                    app.set_review(i, loaded.review);
+                    app.set_review_version(i, loaded.review, loaded.version);
                 }
             }
             effects
@@ -315,11 +326,7 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
                 rt.pool.submit(Job::Highlight { key, file_index, diffs });
             }
         }
-        Effect::SaveReview { id, review } => {
-            if let Err(e) = rt.store.save(&id, &review) {
-                app.notice = Some(format!("Could not save review: {e}"));
-            }
-        }
+        Effect::SaveReview { id, review, version } => save_review(app, &rt.store, &id, &review, &version),
         Effect::CopyExport(md) => {
             if rt.clipboard.is_none() {
                 rt.clipboard = Clipboard::new().ok();
@@ -335,6 +342,19 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
         Effect::OpenEditor { path, line } => open_editor(terminal, &path, line, app, rt)?,
     }
     Ok(())
+}
+
+fn save_review(app: &mut App, store: &Store, id: &ReviewId, review: &Review, version: &ReviewVersion) {
+    match store.save(id, review, version) {
+        Ok(SaveOutcome::Saved) => {}
+        Ok(SaveOutcome::Conflict(path)) => {
+            app.notice = Some(format!(
+                "Review changed in another session. Local notes kept at {}. Restart to load the latest review.",
+                path.display()
+            ));
+        }
+        Err(e) => app.notice = Some(format!("Could not save review: {e}")),
+    }
 }
 
 /// Writes under the git common dir, so an export never appears as a change
@@ -371,4 +391,153 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
         Ok(_) => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod review_save_tests {
+    use super::*;
+
+    #[test]
+    fn a_conflicting_save_notice_names_the_recoverable_local_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("shared".into());
+        let ours = store.load(&id).version;
+        let theirs = store.load(&id).version;
+        let mut canonical = Review::default();
+        canonical.reviewed.insert("other.rs".into(), 42);
+        store.save(&id, &canonical, &theirs).unwrap();
+        let mut local = Review::default();
+        local.reviewed.insert("local.rs".into(), 17);
+        let mut app = App::new("develop".into());
+        save_review(&mut app, &store, &id, &local, &ours);
+        let notice = app.notice.unwrap();
+        assert!(notice.contains("Review changed in another session"), "{notice}");
+        assert!(notice.contains("Restart to load the latest review"), "{notice}");
+        let recovery = std::fs::read_dir(dir.path().join("branchdiff"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().contains(".conflict-"))
+            .unwrap();
+        assert!(notice.contains(recovery.to_str().unwrap()), "{notice}");
+        assert_eq!(store.load(&id).review, canonical);
+        assert_eq!(serde_json::from_slice::<Review>(&std::fs::read(recovery).unwrap()).unwrap(), local);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use branchdiff::cache::Diffs;
+    use branchdiff::git::Worktree;
+    use branchdiff::worker::Loaded;
+
+    fn fixture() -> (tempfile::TempDir, App, Runtime) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _) = unbounded();
+        let rt = Runtime {
+            // Results are delivered explicitly to exercise their order.
+            pool: Pool::new(0, tx),
+            loads: Loads::default(),
+            probes: Probes::default(),
+            lists: Lists::default(),
+            store: Store::new(dir.path()),
+            common_dir: dir.path().into(),
+            clipboard: None,
+            paused: Arc::new(AtomicBool::new(false)),
+            repo: dir.path().into(),
+            watch: None,
+            highlighting: HashSet::new(),
+        };
+        let mut app = App::new("main".into());
+        app.handle_msg(list("a"));
+        (dir, app, rt)
+    }
+
+    fn list(branch: &str) -> Msg {
+        Msg::Worktrees(Ok(vec![Worktree { path: "/r/a".into(), head: "same".into(), branch: Some(branch.into()) }]))
+    }
+
+    fn loaded(diffs: Diffs) -> Msg {
+        Msg::Loaded {
+            path: "/r/a".into(),
+            result: Ok(Loaded {
+                key: CacheKey {
+                    worktree: "/r/a".into(),
+                    base_commit: "base".into(),
+                    head: "same".into(),
+                    fingerprint: 1,
+                },
+                diffs,
+                op: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_branch_switch_discards_an_in_flight_load_and_promotes_the_replacement() {
+        let (_dir, mut app, mut rt) = fixture();
+        let saved = branchdiff::store::Review {
+            comments: vec![branchdiff::store::Comment {
+                path: "new.rs".into(),
+                line: 1,
+                side: branchdiff::store::Side::New,
+                line_text: "new".into(),
+                body: "saved on b".into(),
+            }],
+            ..Default::default()
+        };
+        let id = ReviewId::Branch("b".into());
+        rt.store.save(&id, &saved, &rt.store.load(&id).version).unwrap();
+        app.handle_msg(loaded(Arc::new(branchdiff::diff::parse(
+            b"diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ b/old.rs\n@@ -0,0 +1 @@\n+old\n",
+        ))));
+        rt.loads.request("/r/a".into(), "main".into());
+        let effects = on_msg(&mut app, &mut rt, list("b"));
+        assert_eq!(app.current().unwrap().review, saved);
+        assert!(matches!(effects.as_slice(), [Effect::Load { .. }]));
+        // This is what performing the returned effect does while the old load runs.
+        assert!(rt.loads.request("/r/a".into(), "main".into()).is_none());
+        assert!(on_msg(&mut app, &mut rt, loaded(Arc::new(vec![]))).is_empty());
+        assert!(app.current().unwrap().diffs.is_none());
+        assert!(rt.loads.is_running(Path::new("/r/a")));
+        let current = Arc::new(branchdiff::diff::parse(
+            b"diff --git a/new.rs b/new.rs\n--- a/new.rs\n+++ b/new.rs\n@@ -0,0 +1 @@\n+new\n",
+        ));
+        on_msg(&mut app, &mut rt, loaded(current.clone()));
+        assert!(Arc::ptr_eq(app.current().unwrap().diffs.as_ref().unwrap(), &current));
+        app.current_mut().unwrap().cursor = 1;
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        app.paste("new comment");
+        let saves = app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let [Effect::SaveReview { id, review, .. }] = saves.as_slice() else { panic!("missing save") };
+        assert_eq!(id, &ReviewId::Branch("b".into()));
+        assert_eq!(review.comments[0].body, "saved on b");
+        assert_eq!(review.comments[1].line_text, "new");
+    }
+
+    #[test]
+    fn a_late_error_is_discarded_before_the_replacement_effect_is_performed() {
+        let (_dir, mut app, mut rt) = fixture();
+        rt.loads.request("/r/a".into(), "main".into());
+        let effects = on_msg(&mut app, &mut rt, list("b"));
+        // next_effects can drain both messages before performing any effects.
+        let late = Msg::Loaded { path: "/r/a".into(), result: Err(GitError::BaseMissing("main".into())) };
+        assert!(on_msg(&mut app, &mut rt, late).is_empty());
+        assert!(app.current().unwrap().error.is_none());
+        assert!(app.input.is_none());
+        assert!(matches!(effects.as_slice(), [Effect::Load { .. }]));
+        assert!(rt.loads.request("/r/a".into(), "main".into()).is_some());
+    }
+
+    #[test]
+    fn removing_and_readding_a_path_does_not_revive_its_previous_load() {
+        let (_dir, mut app, mut rt) = fixture();
+        rt.loads.request("/r/a".into(), "main".into());
+        on_msg(&mut app, &mut rt, Msg::Worktrees(Ok(vec![])));
+        on_msg(&mut app, &mut rt, list("a"));
+        assert!(rt.loads.request("/r/a".into(), "main".into()).is_none());
+        on_msg(&mut app, &mut rt, loaded(Arc::new(vec![])));
+        assert!(app.current().unwrap().diffs.is_none());
+    }
 }
