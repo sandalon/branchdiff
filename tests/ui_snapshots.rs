@@ -284,7 +284,10 @@ fn help_overlay_lists_every_hotkey() {
     let descriptions = ["previous or next worktree", "next area", "previous area", "toggle word wrap", "quit"];
     let columns: Vec<usize> = descriptions
         .iter()
-        .map(|description| out.lines().find(|line| line.contains(description)).unwrap().find(description).unwrap())
+        .map(|description| {
+            let line = out.lines().find(|line| line.contains(description)).unwrap();
+            UnicodeWidthStr::width(&line[..line.find(description).unwrap()])
+        })
         .collect();
     assert!(columns.iter().all(|column| *column == columns[0]), "description columns: {columns:?}");
     assert!(out.contains("Shift+Tab / Left   previous area"));
@@ -907,6 +910,24 @@ fn the_diff_cursor_stays_on_screen_when_moved_past_the_window() {
     let text: String = row.iter().map(|c| c.symbol()).collect();
     assert!(text.contains("line30"), "{text}");
     assert!(is_reversed(row[0]), "{text}");
+}
+
+#[test]
+fn page_keys_scroll_the_diff_even_when_another_pane_has_focus() {
+    let mut a = app_with(vec![long_file(40)]);
+    assert_eq!(a.focus, Focus::Worktrees);
+    render(&mut a);
+
+    a.handle_key(KeyEvent::from(KeyCode::PageDown));
+    let down = render(&mut a);
+    assert_eq!(a.focus, Focus::Worktrees);
+    assert_eq!((a.current().unwrap().cursor, a.current().unwrap().scroll), (9, 9));
+    assert_eq!(row_of(&down, "line9"), Some(1), "{down}");
+
+    a.handle_key(KeyEvent::from(KeyCode::PageUp));
+    let up = render(&mut a);
+    assert_eq!((a.current().unwrap().cursor, a.current().unwrap().scroll), (0, 0));
+    assert_eq!(row_of(&up, "@@ -0,0 +1 @@"), Some(1), "{up}");
 }
 
 #[test]

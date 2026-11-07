@@ -41,6 +41,7 @@ A blank `base` counts as unset, and an unusable config file is ignored with a no
 | `Tab` / `Right` | next area |
 | `Shift+Tab` / `Left` | previous area |
 | `j` / `k` | move and scroll |
+| `Page Up` / `Page Down` | scroll the diff pane one page |
 | `n` / `p` | next or previous file |
 | `v` | unified or side-by-side diff |
 | `Shift+W` | toggle word wrap in the diff pane |
