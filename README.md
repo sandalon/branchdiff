@@ -60,6 +60,7 @@ Comments and reviewed marks are stored as JSON under `<git-common-dir>/branchdif
 
 ## Notes
 
+- Files marked reviewed in earlier versions need to be marked again after upgrading; comments are retained. New marks also track permission and rename changes.
 - On Linux without a clipboard manager, copied text is lost when `branchdiff` quits.
 - `e` picks the editor in git's order (`GIT_EDITOR`, `core.editor`, `VISUAL`, `EDITOR`, then `vi`, or `notepad` on Windows) but runs it without a shell, so variables in the value aren't expanded. On Windows, VS Code may need `EDITOR=code.cmd`.
 - A commit inside a real submodule may not show the "changed" badge until `r` is pressed.

@@ -770,20 +770,39 @@ fn new_side_start(header: &str) -> u32 {
     start.and_then(|n| n.parse().ok()).unwrap_or(1).max(1)
 }
 
-/// Identifies a file's content cheaply, since this runs for every file on
-/// every frame. Files with no `content_id`, such as mode-only changes, pure
-/// renames and dirty submodules, fall back to hashing hunks.
+/// Identifies both content and metadata, including changes without hunks.
+/// Blob IDs avoid hashing whole tracked files on every frame. Files without
+/// one, such as dirty submodules, fall back to hashing hunk text.
 ///
-/// Saved in reviews, so it uses `fnv1a`, which is stable across Rust releases.
+/// The version prefix deliberately invalidates old content-only reviewed
+/// marks. The encoding and `fnv1a` stay stable across Rust releases.
 fn content_hash(file: &crate::diff::FileDiff) -> u64 {
-    if let Some(id) = &file.content_id {
-        return fnv1a(id.as_bytes());
+    fn field(bytes: &mut Vec<u8>, value: Option<&str>) {
+        bytes.push(u8::from(value.is_some()));
+        if let Some(value) = value {
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
     }
-    let mut bytes = Vec::new();
-    for line in file.hunks.iter().flat_map(|h| &h.lines) {
-        bytes.push(line.kind as u8);
-        bytes.extend_from_slice(line.text.as_bytes());
-        bytes.push(b'\n');
+    let mut bytes = b"branchdiff-reviewed-v2\0".to_vec();
+    bytes.push(file.status.letter() as u8);
+    bytes.push(u8::from(file.binary));
+    field(&mut bytes, Some(&file.path));
+    field(&mut bytes, file.old_path.as_deref());
+    for mode in [file.old_mode, file.new_mode] {
+        bytes.push(u8::from(mode.is_some()));
+        bytes.extend_from_slice(&mode.unwrap_or(0).to_le_bytes());
+    }
+    field(&mut bytes, file.content_id.as_deref());
+    if file.content_id.is_none() {
+        for line in file.hunks.iter().flat_map(|h| &h.lines) {
+            bytes.push(match line.kind {
+                crate::diff::LineKind::Context => b' ',
+                crate::diff::LineKind::Added => b'+',
+                crate::diff::LineKind::Removed => b'-',
+            });
+            field(&mut bytes, Some(&line.text));
+        }
     }
     fnv1a(&bytes)
 }

@@ -14,6 +14,8 @@ fn file(path: &str) -> FileDiff {
     FileDiff {
         path: path.into(),
         old_path: None,
+        old_mode: None,
+        new_mode: None,
         status: Status::Modified,
         binary: false,
         content_id: None,
@@ -102,6 +104,8 @@ fn file_with_line(text: &str) -> FileDiff {
     FileDiff {
         path: "a.rs".into(),
         old_path: None,
+        old_mode: None,
+        new_mode: None,
         status: Status::Modified,
         binary: false,
         content_id: None,
@@ -1001,6 +1005,8 @@ fn changing_a_binary_file_resets_its_reviewed_mark() {
     let binary = |id: &str| FileDiff {
         path: "b.dat".into(),
         old_path: None,
+        old_mode: None,
+        new_mode: None,
         status: Status::Modified,
         binary: true,
         content_id: Some(id.into()),
@@ -1301,6 +1307,104 @@ fn content_hash_differs_when_only_a_lines_kind_differs() {
     let gone = numbered(LineKind::Removed, Some(1), None);
     let with_line = |l| FileDiff { hunks: vec![hunk("@@", vec![l])], ..file("a") };
     assert_ne!(content_hash(&with_line(added)), content_hash(&with_line(gone)));
+}
+
+#[test]
+fn a_mode_only_mark_does_not_review_an_unrelated_rename() {
+    let mut a = app(&["a"]);
+    let mode = crate::diff::parse(b"diff --git a/run b/run\nold mode 100644\nnew mode 100755\n");
+    deliver(&mut a, "a", mode);
+    press(&mut a, 'x');
+    assert!(a.is_reviewed(0));
+    let rename =
+        crate::diff::parse(b"diff --git a/other b/run\nsimilarity index 100%\nrename from other\nrename to run\n");
+    deliver(&mut a, "a", rename);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn mode_changes_reset_reviewed_marks_even_when_blob_ids_match() {
+    let original = FileDiff {
+        content_id: Some("aaaa..bbbb".into()),
+        old_mode: Some(0o100644),
+        new_mode: Some(0o100644),
+        ..file("run")
+    };
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", vec![original.clone()]);
+    press(&mut a, 'x');
+    deliver(&mut a, "a", vec![original.clone()]);
+    assert!(a.is_reviewed(0), "an unchanged reload retains the mark");
+    deliver(&mut a, "a", vec![FileDiff { new_mode: Some(0o100755), ..original }]);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn changing_a_pure_renames_source_resets_its_reviewed_mark() {
+    let mut a = app(&["a"]);
+    let renamed = FileDiff { status: Status::Renamed, old_path: Some("old".into()), ..file("new") };
+    deliver(&mut a, "a", vec![renamed.clone()]);
+    press(&mut a, 'x');
+    deliver(&mut a, "a", vec![FileDiff { old_path: Some("different".into()), ..renamed }]);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn tracking_an_untracked_file_requires_a_new_review() {
+    let mut a = app(&["a"]);
+    let untracked = FileDiff { status: Status::Untracked, content_id: Some("same".into()), ..file("new") };
+    deliver(&mut a, "a", vec![untracked.clone()]);
+    press(&mut a, 'x');
+    deliver(&mut a, "a", vec![FileDiff { status: Status::Added, ..untracked }]);
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn legacy_content_only_reviewed_marks_are_invalidated() {
+    let mut a = app(&["a"]);
+    let file = FileDiff { content_id: Some("aaaa..bbbb".into()), ..file("run") };
+    deliver(&mut a, "a", vec![file]);
+    a.states[0].review.reviewed.insert("run".into(), fnv1a(b"aaaa..bbbb"));
+    assert!(!a.is_reviewed(0));
+}
+
+#[test]
+fn reviewed_fingerprints_stay_stable_between_builds() {
+    let file = FileDiff { content_id: Some("aaaa..bbbb".into()), ..file("run") };
+    assert_eq!(content_hash(&file), 0xfbc8c8028ca34e24);
+}
+
+#[cfg(unix)]
+#[test]
+fn untracked_permission_and_type_changes_require_review_even_with_identical_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    assert_eq!(crate::git::run(dir.path(), ["init", "-q"]).unwrap().code, Some(0));
+    let commit =
+        ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "base"];
+    assert_eq!(crate::git::run(dir.path(), commit).unwrap().code, Some(0));
+    let path = dir.path().join("untracked");
+    std::fs::write(&path, "target").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let original = crate::diff::load(dir.path(), "HEAD").unwrap();
+    let content_id = original[0].content_id.clone();
+    let mut a = app(&["a"]);
+    deliver(&mut a, "a", original);
+    press(&mut a, 'x');
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = crate::diff::load(dir.path(), "HEAD").unwrap();
+    assert_eq!(executable[0].content_id, content_id);
+    deliver(&mut a, "a", executable);
+    assert!(!a.is_reviewed(0), "the execute bit changed");
+    press(&mut a, 'x');
+
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("target", &path).unwrap();
+    let symlink = crate::diff::load(dir.path(), "HEAD").unwrap();
+    assert_eq!(symlink[0].content_id, content_id);
+    deliver(&mut a, "a", symlink);
+    assert!(!a.is_reviewed(0), "the object type changed");
 }
 
 #[test]
