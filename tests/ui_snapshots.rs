@@ -250,6 +250,7 @@ fn side_by_side() {
 #[test]
 fn full_screen_diff_replaces_both_navigation_panes() {
     let mut a = app();
+    a.focus = Focus::Diff;
     press(&mut a, "f");
     let out = render(&mut a);
     let buffer = render_buffer(&mut a, 80, 12);
@@ -258,6 +259,18 @@ fn full_screen_diff_replaces_both_navigation_panes() {
     assert!(out.contains("Diff"));
     assert_eq!(buffer[(0, 0)].symbol(), "┌");
     assert_eq!(buffer[(79, 0)].symbol(), "┐");
+}
+
+#[test]
+fn the_full_screen_pane_follows_focus() {
+    let mut a = app();
+    press(&mut a, "f");
+    let out = render(&mut a);
+    assert!(out.contains("Worktrees") && !out.contains("Files") && !out.contains("Diff"), "{out}");
+
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    let out = render(&mut a);
+    assert!(out.contains("Files") && !out.contains("Worktrees") && !out.contains("Diff"), "{out}");
 }
 
 #[test]

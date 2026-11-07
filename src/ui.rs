@@ -73,10 +73,22 @@ fn display_text(s: &str) -> Cow<'_, str> {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, status] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
     let visible = (main.height as usize).saturating_sub(BORDERS);
-    if app.diff_fullscreen {
-        let width = (main.width as usize).saturating_sub(BORDERS);
-        keep_diff_selection_visible(app, visible, width);
-        draw_diff(f, app, main);
+    if app.fullscreen {
+        match app.focus {
+            Focus::Worktrees => {
+                keep_worktree_selection_visible(app, visible);
+                draw_worktrees(f, app, main);
+            }
+            Focus::Files => {
+                keep_file_selection_visible(app, visible);
+                draw_files(f, app, main);
+            }
+            Focus::Diff => {
+                let width = (main.width as usize).saturating_sub(BORDERS);
+                keep_diff_selection_visible(app, visible, width);
+                draw_diff(f, app, main);
+            }
+        }
     } else {
         let side = (f.area().width / 5).clamp(16, 30);
         let [left, files, diff] =
@@ -142,16 +154,24 @@ fn list_offset(offset: usize, selected: usize, visible: usize, len: usize) -> us
 /// Moves the stored offsets of the lists and the diff, for panes that show
 /// `visible` rows.
 fn keep_selection_visible(app: &mut App, visible: usize, diff_width: usize) {
+    keep_worktree_selection_visible(app, visible);
+    keep_file_selection_visible(app, visible);
+    keep_diff_selection_visible(app, visible, diff_width);
+}
+
+fn keep_worktree_selection_visible(app: &mut App, visible: usize) {
     app.worktree_offset = list_offset(app.worktree_offset, app.selected, visible, app.worktrees.len());
+}
+
+fn keep_file_selection_visible(app: &mut App, visible: usize) {
     let files = app.file_count();
     if let Some(s) = app.current_mut() {
         s.file_offset = list_offset(s.file_offset, s.file, visible, files);
     }
-    keep_diff_selection_visible(app, visible, diff_width);
 }
 
-/// Updates only the state needed by the full-screen pane. In particular, this
-/// avoids doing any work for the hidden worktree and file lists.
+/// Moves the diff scroll only, so a full-screen diff does no work for the
+/// hidden lists.
 fn keep_diff_selection_visible(app: &mut App, visible: usize, width: usize) {
     let rows = app.diff_row_count();
     if app.word_wrap {
