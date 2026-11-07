@@ -70,7 +70,7 @@ fn timed(app: &mut App, key: KeyCode) -> Duration {
         .map(|_| {
             let start = Instant::now();
             app.handle_key(KeyEvent::from(key));
-            t.draw(|f| ui::draw(f, app)).unwrap();
+            t.draw(|f| ui::draw(f, app, std::path::Path::new("/r"))).unwrap();
             start.elapsed()
         })
         .collect();

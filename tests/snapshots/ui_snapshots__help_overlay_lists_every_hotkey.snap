@@ -2,14 +2,14 @@
 source: tests/ui_snapshots.rs
 expression: out
 ---
-"┌Worktrees─────┐┌Files─────────┐┌Diff──────────────────────────────────────────┐"
-"│▸ feat-auth┌Help──────────────────────────────────────────────────┐           │"
-"│  fix-cache│ [ / ]              previous or next worktree         │           │"
-"│           │ 1-9                jump to a worktree                │           │"
+"┌Worktrees──┌Help──────────────────────────────────────────────────┐───────────┐"
+"│▸ feat-auth│ [ / ]              previous or next worktree         │           │"
+"│  fix-cache│ 1-9                jump to a worktree                │           │"
 "│           │ w                  fuzzy find a worktree             │           │"
 "│           │ Tab / Right        next area                         │           │"
 "│           │ Shift+Tab / Left   previous area                     │           │"
 "│           │ j / k              move and scroll                   │           │"
+"│           │ Page Up / Down     scroll the diff one page          │           │"
 "│           │ n / p              next or previous file             │           │"
 "│           │ v                  unified or side-by-side diff      │           │"
 "│           │ Shift+W            toggle word wrap                  │           │"
@@ -25,4 +25,4 @@ expression: out
 "│           │ Esc                close help or a prompt            │           │"
 "│           │ q                  quit                              │           │"
 "└───────────└──────────────────────────────────────────────────────┘───────────┘"
-" base: develop   feat-auth   1 file   0 comments   ? help                       "
+" cwd: /r   base: develop   feat-auth   1 file   0 comments   ? help             "

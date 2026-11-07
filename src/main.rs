@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::try_init().context("could not start the terminal")?;
     keep_terminal_on_worker_panic();
     set_bracketed_paste(true);
-    let result = run(&mut terminal, info, base, config_problem);
+    let result = run(&mut terminal, info, base, &cwd, config_problem);
     let _ = terminal.show_cursor();
     set_bracketed_paste(false);
     // Not `ratatui::restore` or the terminal's drop, which both panic writing
@@ -136,7 +136,7 @@ fn spawn_quit_watch(tx: Sender<Event>) {
     });
 }
 
-fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Option<String>) -> Result<()> {
+fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, cwd: &Path, notice: Option<String>) -> Result<()> {
     let (msg_tx, msg_rx) = unbounded::<Msg>();
     let (key_tx, key_rx) = unbounded::<Event>();
     let paused = Arc::new(AtomicBool::new(false));
@@ -170,7 +170,7 @@ fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, notice: Opt
     request_list(&app, &mut rt);
 
     loop {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|f| ui::draw(f, &mut app, cwd))?;
         if app.should_quit {
             return Ok(());
         }

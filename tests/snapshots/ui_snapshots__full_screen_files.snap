@@ -13,4 +13,4 @@ expression: render(&mut full_screen_file_list())
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" base: develop   feat-auth   5 files   0 comments   ? help                      "
+" cwd: /r   base: develop   feat-auth   5 files   0 comments   ? help            "
