@@ -357,7 +357,11 @@ fn draw_worktrees(f: &mut Frame, app: &App, area: Rect, full: bool) {
 /// go, least useful first, so the warnings stay. Only a pane under 10 cells
 /// wide can cut those.
 fn worktree_row(w: &Worktree, s: &WorktreeState, room: usize) -> String {
-    let added: u32 = s.diffs.as_ref().map_or(0, |d| d.iter().map(|x| x.added).sum());
+    let added = if s.evicted {
+        "?".to_string()
+    } else {
+        s.diffs.as_ref().map_or(0u64, |d| d.iter().map(|x| u64::from(x.added)).sum()).to_string()
+    };
     let comments = comment_badge(s);
     let warnings = warning_badges(s);
     let badges = [format!(" +{added}{comments}{warnings}"), format!("{comments}{warnings}")]
@@ -379,9 +383,14 @@ fn full_worktree_row(
     home: Option<&Path>,
 ) -> Option<TextLine<'static>> {
     let diffs = s.diffs.as_ref().map_or(&[][..], |d| d.as_slice());
-    let (added, removed) = diffs.iter().fold((0u32, 0u32), |(a, r), x| (a + x.added, r + x.removed));
-    let badges =
-        format!("+{added} −{removed}  {}{}{}", plural(diffs.len(), "file"), comment_badge(s), warning_badges(s));
+    let counts = if s.evicted {
+        "+? −?  ? files".to_string()
+    } else {
+        let (added, removed) =
+            diffs.iter().fold((0u64, 0u64), |(a, r), x| (a + u64::from(x.added), r + u64::from(x.removed)));
+        format!("+{added} −{removed}  {}", plural(diffs.len(), "file"))
+    };
+    let badges = format!("{counts}{}{}", comment_badge(s), warning_badges(s));
     let path_room = room.checked_sub(name_width + 2 * COLUMN_GAP + drawn_width(&badges))?;
     if path_room < MIN_PATH {
         return None;
@@ -1195,6 +1204,18 @@ mod tests {
     }
     fn texts(spans: &[Span]) -> Vec<String> {
         spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn evicted_worktree_counts_stay_unknown_in_both_list_layouts() {
+        let w = Worktree { path: "/repo/worktree".into(), head: "abc".into(), branch: Some("feature".into()) };
+        let mut state = WorktreeState::default();
+        state.evicted = true;
+        assert!(worktree_row(&w, &state, 80).contains("+?"));
+        let full = full_worktree_row(&w, &state, 120, 20, None).unwrap();
+        let text: String = full.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("+? −?  ? files"));
+        assert!(text.contains("/repo/worktree"));
     }
 
     #[test]

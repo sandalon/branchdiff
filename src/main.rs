@@ -7,7 +7,7 @@ use branchdiff::store::{ReviewId, Store};
 use branchdiff::worker::{Job, Lists, Loads, Msg, Pool, Probes, Reaction, WORKER_THREAD};
 use branchdiff::{config, editor, signals, ui, watch};
 use clap::Parser;
-use crossbeam_channel::{select, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -137,7 +137,9 @@ fn spawn_quit_watch(tx: Sender<Event>) {
 }
 
 fn run(terminal: &mut DefaultTerminal, info: RepoInfo, base: String, cwd: &Path, notice: Option<String>) -> Result<()> {
-    let (msg_tx, msg_rx) = unbounded::<Msg>();
+    // Completed loads own diff models, so backpressure bounds results waiting
+    // while the UI is saving or an editor owns the terminal.
+    let (msg_tx, msg_rx) = bounded::<Msg>(4);
     let (key_tx, key_rx) = unbounded::<Event>();
     let paused = Arc::new(AtomicBool::new(false));
     spawn_quit_watch(key_tx.clone());
