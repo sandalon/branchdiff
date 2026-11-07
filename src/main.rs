@@ -3,7 +3,7 @@ use arboard::Clipboard;
 use branchdiff::app::{coalesce_saves, App, Effect};
 use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
-use branchdiff::store::{ReviewId, Store};
+use branchdiff::store::{Review, ReviewId, ReviewVersion, SaveOutcome, Store};
 use branchdiff::worker::{Job, Lists, Loads, Msg, Pool, Probes, Reaction, WORKER_THREAD};
 use branchdiff::{config, editor, signals, ui, watch};
 use clap::Parser;
@@ -291,7 +291,7 @@ fn on_msg(app: &mut App, rt: &mut Runtime, msg: Msg) -> Vec<Effect> {
                     } else if let Some(path) = loaded.left_in_place {
                         app.notice = Some(format!("Review could not be read or moved, still at {}", path.display()));
                     }
-                    app.set_review(i, loaded.review);
+                    app.set_review_version(i, loaded.review, loaded.version);
                 }
             }
             effects
@@ -326,11 +326,7 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
                 rt.pool.submit(Job::Highlight { key, file_index, diffs });
             }
         }
-        Effect::SaveReview { id, review } => {
-            if let Err(e) = rt.store.save(&id, &review) {
-                app.notice = Some(format!("Could not save review: {e}"));
-            }
-        }
+        Effect::SaveReview { id, review, version } => save_review(app, &rt.store, &id, &review, &version),
         Effect::CopyExport(md) => {
             if rt.clipboard.is_none() {
                 rt.clipboard = Clipboard::new().ok();
@@ -346,6 +342,19 @@ fn perform(effect: Effect, app: &mut App, rt: &mut Runtime, terminal: &mut Defau
         Effect::OpenEditor { path, line } => open_editor(terminal, &path, line, app, rt)?,
     }
     Ok(())
+}
+
+fn save_review(app: &mut App, store: &Store, id: &ReviewId, review: &Review, version: &ReviewVersion) {
+    match store.save(id, review, version) {
+        Ok(SaveOutcome::Saved) => {}
+        Ok(SaveOutcome::Conflict(path)) => {
+            app.notice = Some(format!(
+                "Review changed in another session. Local notes kept at {}. Restart to load the latest review.",
+                path.display()
+            ));
+        }
+        Err(e) => app.notice = Some(format!("Could not save review: {e}")),
+    }
 }
 
 /// Writes under the git common dir, so an export never appears as a change
@@ -382,6 +391,38 @@ fn open_editor(terminal: &mut DefaultTerminal, path: &Path, line: u32, app: &mut
         Ok(_) => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod review_save_tests {
+    use super::*;
+
+    #[test]
+    fn a_conflicting_save_notice_names_the_recoverable_local_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("shared".into());
+        let ours = store.load(&id).version;
+        let theirs = store.load(&id).version;
+        let mut canonical = Review::default();
+        canonical.reviewed.insert("other.rs".into(), 42);
+        store.save(&id, &canonical, &theirs).unwrap();
+        let mut local = Review::default();
+        local.reviewed.insert("local.rs".into(), 17);
+        let mut app = App::new("develop".into());
+        save_review(&mut app, &store, &id, &local, &ours);
+        let notice = app.notice.unwrap();
+        assert!(notice.contains("Review changed in another session"), "{notice}");
+        assert!(notice.contains("Restart to load the latest review"), "{notice}");
+        let recovery = std::fs::read_dir(dir.path().join("branchdiff"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().contains(".conflict-"))
+            .unwrap();
+        assert!(notice.contains(recovery.to_str().unwrap()), "{notice}");
+        assert_eq!(store.load(&id).review, canonical);
+        assert_eq!(serde_json::from_slice::<Review>(&std::fs::read(recovery).unwrap()).unwrap(), local);
+    }
 }
 
 #[cfg(test)]
@@ -446,7 +487,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        rt.store.save(&ReviewId::Branch("b".into()), &saved).unwrap();
+        let id = ReviewId::Branch("b".into());
+        rt.store.save(&id, &saved, &rt.store.load(&id).version).unwrap();
         app.handle_msg(loaded(Arc::new(branchdiff::diff::parse(
             b"diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ b/old.rs\n@@ -0,0 +1 @@\n+old\n",
         ))));
@@ -468,7 +510,7 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('c')));
         app.paste("new comment");
         let saves = app.handle_key(KeyEvent::from(KeyCode::Enter));
-        let [Effect::SaveReview { id, review }] = saves.as_slice() else { panic!("missing save") };
+        let [Effect::SaveReview { id, review, .. }] = saves.as_slice() else { panic!("missing save") };
         assert_eq!(id, &ReviewId::Branch("b".into()));
         assert_eq!(review.comments[0].body, "saved on b");
         assert_eq!(review.comments[1].line_text, "new");

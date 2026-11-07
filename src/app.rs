@@ -2,7 +2,7 @@ use crate::cache::{CacheKey, Diffs};
 use crate::diff::{FileDiff, Hunk, Status};
 use crate::git::{GitError, Worktree};
 use crate::highlight::HighlightedFile;
-use crate::store::{fnv1a, Comment, Review, ReviewId, Side};
+use crate::store::{fnv1a, Comment, Review, ReviewId, ReviewVersion, Side};
 use crate::worker::Msg;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
@@ -33,7 +33,7 @@ pub enum Effect {
     Load { path: PathBuf, base: String },
     ReloadWorktrees,
     ListBranches,
-    SaveReview { id: ReviewId, review: Review },
+    SaveReview { id: ReviewId, review: Review, version: ReviewVersion },
     CopyExport(String),
     WriteExport(String),
     OpenEditor { path: PathBuf, line: u32 },
@@ -73,6 +73,7 @@ pub struct WorktreeState {
     pub cursor: usize,
     pub scroll: usize,
     pub review: Review,
+    pub review_version: ReviewVersion,
     pub outdated: usize,
     pub highlights: HashMap<usize, HighlightedFile>,
     /// Evicted models reload when selected; reviews and navigation survive.
@@ -188,12 +189,17 @@ impl App {
     }
 
     pub fn set_review(&mut self, index: usize, review: Review) {
+        self.set_review_version(index, review, ReviewVersion::default());
+    }
+
+    pub fn set_review_version(&mut self, index: usize, review: Review, version: ReviewVersion) {
         // An open prompt targets the review being replaced, as after a branch switch.
         if index == self.selected && matches!(self.input, Some(Input::Comment { .. } | Input::ConfirmClear)) {
             self.input = None;
         }
         if let Some(s) = self.states.get_mut(index) {
             s.review = review;
+            s.review_version = version;
             s.outdated = count_outdated(s);
         }
     }
@@ -774,7 +780,11 @@ impl App {
     /// change the selection before `main` performs this.
     fn save_effect(&self) -> Vec<Effect> {
         match (self.selected_worktree(), self.current()) {
-            (Some(w), Some(s)) => vec![Effect::SaveReview { id: ReviewId::of(w), review: s.review.clone() }],
+            (Some(w), Some(s)) => vec![Effect::SaveReview {
+                id: ReviewId::of(w),
+                review: s.review.clone(),
+                version: s.review_version.clone(),
+            }],
             _ => Vec::new(),
         }
     }
@@ -939,15 +949,15 @@ fn content_hash(file: &crate::diff::FileDiff) -> u64 {
     fnv1a(&bytes)
 }
 
-/// Keeps the last save per review, since each one costs an fsync and holding
-/// `x` would otherwise queue saves faster than they finish.
+/// Keeps the last save per editing state, since each costs an fsync. Distinct
+/// worktrees reviewing the same commit must both reach conflict detection.
 pub fn coalesce_saves(effects: Vec<Effect>) -> Vec<Effect> {
     let mut seen = HashSet::new();
     let mut kept: Vec<Effect> = effects
         .into_iter()
         .rev()
         .filter(|e| match e {
-            Effect::SaveReview { id, .. } => seen.insert(id.clone()),
+            Effect::SaveReview { id, version, .. } => seen.insert((id.clone(), version.session_id())),
             _ => true,
         })
         .collect();
