@@ -567,6 +567,9 @@ fn untracked_symlinks_show_their_target_and_are_not_followed() {
 fn untracked_lines_keep_carriage_returns_like_patch_lines_do() {
     let repo = Repo::new();
     let wt = repo.add_worktree("feat");
+    // Git for Windows sets autocrlf in its system config, which would make git
+    // itself drop the carriage returns this test compares against.
+    run(&wt, &["config", "core.autocrlf", "false"]);
     std::fs::write(wt.join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
     let texts = |files: Vec<diff::FileDiff>| -> Vec<String> {
         files[0].hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.clone()).collect()
