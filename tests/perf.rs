@@ -70,7 +70,7 @@ fn timed(app: &mut App, key: KeyCode) -> Duration {
         .map(|_| {
             let start = Instant::now();
             app.handle_key(KeyEvent::from(key));
-            t.draw(|f| ui::draw(f, app)).unwrap();
+            t.draw(|f| ui::draw(f, app, std::path::Path::new("/r"))).unwrap();
             start.elapsed()
         })
         .collect();
@@ -98,9 +98,21 @@ fn keypress_to_redraw_is_within_budget() {
 #[ignore]
 fn full_screen_keypress_to_redraw_is_within_budget() {
     let mut a = loaded_app();
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
     a.handle_key(KeyEvent::from(KeyCode::Char('f')));
     let d = timed(&mut a, KeyCode::Char('j'));
     assert!(d < BUDGET, "full-screen redraw took {d:?}");
+}
+
+#[test]
+#[ignore]
+fn full_screen_file_list_keypress_to_redraw_is_within_budget() {
+    let mut a = loaded_app();
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    a.handle_key(KeyEvent::from(KeyCode::Char('f')));
+    let d = timed(&mut a, KeyCode::Char('j'));
+    assert!(d < BUDGET, "full-screen file list redraw took {d:?}");
 }
 
 #[test]

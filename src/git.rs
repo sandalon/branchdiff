@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::fmt;
@@ -6,7 +7,7 @@ use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
@@ -181,7 +182,47 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, GitError> {
     for w in list.iter_mut().filter(|w| w.branch.is_none()) {
         w.branch = rebasing_branch(&w.path);
     }
+    // Git's native order always puts the main worktree first. For review it is
+    // more useful to put the worktree with the newest commit or in-progress
+    // edit first. The sort is stable, so equal or unavailable times retain
+    // Git's deterministic order.
+    list.sort_by_key(|w| Reverse(worktree_modified(w)));
     Ok(list)
+}
+
+/// The newest change represented by a worktree: its HEAD commit, or the mtime
+/// of a dirty path. Looking only at dirty paths avoids walking an entire large
+/// checkout while still noticing edits that have not been committed yet.
+fn worktree_modified(worktree: &Worktree) -> SystemTime {
+    let mut newest = commit_time(worktree).unwrap_or(UNIX_EPOCH);
+    let Ok(status) =
+        run(&worktree.path, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none"])
+    else {
+        return newest;
+    };
+    if status.code != Some(0) {
+        return newest;
+    }
+    for path in dirty_paths(&status.stdout) {
+        let path = worktree.path.join(path);
+        // Creating, renaming, or deleting a path updates its parent even when
+        // the path's own mtime is old or it no longer has metadata.
+        for candidate in std::iter::once(path.as_path()).chain(path.parent()) {
+            if let Ok(modified) = std::fs::symlink_metadata(candidate).and_then(|metadata| metadata.modified()) {
+                newest = newest.max(modified);
+            }
+        }
+    }
+    newest
+}
+
+fn commit_time(worktree: &Worktree) -> Option<SystemTime> {
+    if worktree.head.is_empty() {
+        return None;
+    }
+    let text = ok_stdout(run(&worktree.path, ["show", "-s", "--format=%ct", &worktree.head]).ok()?).ok()?;
+    let seconds = text.trim().parse().ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
 }
 
 /// The branch being rebased in a worktree, which git lists as detached until the

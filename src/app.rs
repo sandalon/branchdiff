@@ -21,6 +21,12 @@ pub enum DiffView {
     SideBySide,
 }
 
+#[derive(Clone, Copy)]
+enum Movement {
+    Vertical(isize),
+    DiffPage(isize),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
     Load { path: PathBuf, base: String },
@@ -126,13 +132,15 @@ pub struct App {
     pub selected: usize,
     /// First row shown in the worktree list. `ui` keeps it around `selected`.
     pub worktree_offset: usize,
+    /// Screen rows in the diff pane on the most recently drawn frame. This is
+    /// zero before the first frame, and on a terminal too short for content.
+    diff_viewport_rows: usize,
     pub focus: Focus,
     pub view: DiffView,
     /// Whether long lines in the diff pane continue on following screen rows.
     pub word_wrap: bool,
-    /// Whether the diff pane occupies all of the main area.
-    pub diff_fullscreen: bool,
-    focus_before_fullscreen: Focus,
+    /// Whether the focused pane occupies all of the main area.
+    pub fullscreen: bool,
     pub help_open: bool,
     pub input: Option<Input>,
     pub notice: Option<String>,
@@ -141,6 +149,9 @@ pub struct App {
     /// Cleared on terminals without truecolor, so `ui` converts colours.
     pub truecolor: bool,
     cache_clock: u64,
+    /// Shown as `~` at the start of worktree paths. `main` sets it, so tests
+    /// don't depend on the machine's home directory.
+    pub home: Option<PathBuf>,
 }
 
 /// Answers whether `modifiers` mark a shortcut rather than typed text.
@@ -159,11 +170,11 @@ impl App {
             states: Vec::new(),
             selected: 0,
             worktree_offset: 0,
+            diff_viewport_rows: 0,
             focus: Focus::Worktrees,
             view: DiffView::Unified,
             word_wrap: false,
-            diff_fullscreen: false,
-            focus_before_fullscreen: Focus::Worktrees,
+            fullscreen: false,
             help_open: false,
             input: None,
             notice: None,
@@ -171,6 +182,7 @@ impl App {
             should_quit: false,
             truecolor: true,
             cache_clock: 0,
+            home: None,
         }
     }
 
@@ -228,8 +240,9 @@ impl App {
         if is_shortcut(key.modifiers, cfg!(windows)) {
             return Vec::new();
         }
+        let movement = Self::movement(key.code);
         // Holding a movement key would otherwise wipe a notice before it's read.
-        if !matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down) {
+        if movement.is_none() {
             self.notice = None;
         }
         // Checked before switching, because `]` and digits are text here.
@@ -254,6 +267,13 @@ impl App {
             self.word_wrap = !self.word_wrap;
             return Vec::new();
         }
+        if let Some(movement) = movement {
+            match movement {
+                Movement::Vertical(delta) => self.move_vertical(delta),
+                Movement::DiffPage(delta) => self.page_diff(delta),
+            }
+            return self.selected_cache_effects();
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_open = true,
@@ -261,15 +281,13 @@ impl App {
             KeyCode::BackTab | KeyCode::Left => self.step_focus(-1),
             KeyCode::Char('n') => self.step_file(1),
             KeyCode::Char('p') => self.step_file(-1),
-            KeyCode::Char('j') | KeyCode::Down => self.move_vertical(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_vertical(-1),
             KeyCode::Char('v') => {
                 self.view = match self.view {
                     DiffView::Unified => DiffView::SideBySide,
                     DiffView::SideBySide => DiffView::Unified,
                 };
             }
-            KeyCode::Char('f') => self.toggle_diff_fullscreen(),
+            KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
             KeyCode::Char('b') => return vec![Effect::ListBranches],
             KeyCode::Char('r') => return self.reload_selected(),
             KeyCode::Char('c') => self.start_comment(),
@@ -330,6 +348,18 @@ impl App {
         }
     }
 
+    /// Classifies all keys that move a selection or viewport. Keeping this in
+    /// one place also defines which repeated keys preserve a notice.
+    fn movement(code: KeyCode) -> Option<Movement> {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => Some(Movement::Vertical(1)),
+            KeyCode::Char('k') | KeyCode::Up => Some(Movement::Vertical(-1)),
+            KeyCode::PageDown => Some(Movement::DiffPage(1)),
+            KeyCode::PageUp => Some(Movement::DiffPage(-1)),
+            _ => None,
+        }
+    }
+
     /// Answers whether `code` is a worktree switching key.
     fn switch_worktree(&mut self, code: KeyCode) -> bool {
         match code {
@@ -372,24 +402,10 @@ impl App {
     /// wrapping at either end. `Tab` and `Right` go forward, `Shift+Tab` and
     /// `Left` go back.
     fn step_focus(&mut self, delta: isize) {
-        if self.diff_fullscreen {
-            return;
-        }
         const ORDER: [Focus; 3] = [Focus::Worktrees, Focus::Files, Focus::Diff];
         let n = ORDER.len() as isize;
         let i = ORDER.iter().position(|f| *f == self.focus).unwrap_or(0) as isize;
         self.focus = ORDER[(i + delta).rem_euclid(n) as usize];
-    }
-
-    fn toggle_diff_fullscreen(&mut self) {
-        if self.diff_fullscreen {
-            self.diff_fullscreen = false;
-            self.focus = self.focus_before_fullscreen;
-        } else {
-            self.focus_before_fullscreen = self.focus;
-            self.diff_fullscreen = true;
-            self.focus = Focus::Diff;
-        }
     }
 
     fn step_file(&mut self, delta: isize) {
@@ -420,6 +436,32 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Scrolls the diff pane by one viewport without changing which pane has
+    /// focus. Moving the cursor with the scroll keeps its screen-row position,
+    /// so commenting and editor actions continue to target a visible row.
+    fn page_diff(&mut self, delta: isize) {
+        let page = self.diff_viewport_rows;
+        if page == 0 {
+            return;
+        }
+        let rows = self.diff_row_count();
+        let last = rows.saturating_sub(1);
+        let last_scroll = rows.saturating_sub(page);
+        if let Some(s) = self.current_mut() {
+            if delta < 0 {
+                s.cursor = s.cursor.saturating_sub(page);
+                s.scroll = s.scroll.saturating_sub(page);
+            } else {
+                s.cursor = s.cursor.saturating_add(page).min(last);
+                s.scroll = s.scroll.saturating_add(page).min(last_scroll);
+            }
+        }
+    }
+
+    pub(crate) fn set_diff_viewport_rows(&mut self, rows: usize) {
+        self.diff_viewport_rows = rows;
     }
 
     /// Rows in the current file: one per hunk header plus one per line.

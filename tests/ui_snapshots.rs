@@ -157,14 +157,18 @@ fn render(a: &mut App) -> String {
 }
 
 fn render_sized(a: &mut App, width: u16, height: u16) -> String {
+    render_sized_at(a, width, height, std::path::Path::new("/r"))
+}
+
+fn render_sized_at(a: &mut App, width: u16, height: u16, cwd: &std::path::Path) -> String {
     let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
-    t.draw(|f| ui::draw(f, a)).unwrap();
+    t.draw(|f| ui::draw(f, a, cwd)).unwrap();
     t.backend().to_string()
 }
 
 fn render_buffer(a: &mut App, width: u16, height: u16) -> Buffer {
     let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
-    t.draw(|f| ui::draw(f, a)).unwrap();
+    t.draw(|f| ui::draw(f, a, std::path::Path::new("/r"))).unwrap();
     t.backend().buffer().clone()
 }
 
@@ -231,6 +235,17 @@ fn cell_of<'a>(buffer: &'a Buffer, symbol: &str) -> &'a Cell {
     buffer.content.iter().find(|c| c.symbol() == symbol).unwrap()
 }
 
+/// The column and row where `text` first starts on screen.
+fn position_of(buffer: &Buffer, text: &str) -> (u16, u16) {
+    for y in 0..buffer.area.height {
+        let row: Vec<&str> = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
+        if let Some(x) = (0..row.len()).find(|&x| row[x..].concat().starts_with(text)) {
+            return (x as u16, y);
+        }
+    }
+    panic!("{text:?} is not on screen");
+}
+
 fn is_light(colour: Color) -> bool {
     matches!(colour, Color::Rgb(r, g, b) if r > 150 && g > 150 && b > 150)
 }
@@ -250,6 +265,7 @@ fn side_by_side() {
 #[test]
 fn full_screen_diff_replaces_both_navigation_panes() {
     let mut a = app();
+    a.focus = Focus::Diff;
     press(&mut a, "f");
     let out = render(&mut a);
     let buffer = render_buffer(&mut a, 80, 12);
@@ -258,6 +274,18 @@ fn full_screen_diff_replaces_both_navigation_panes() {
     assert!(out.contains("Diff"));
     assert_eq!(buffer[(0, 0)].symbol(), "┌");
     assert_eq!(buffer[(79, 0)].symbol(), "┐");
+}
+
+#[test]
+fn the_full_screen_pane_follows_focus() {
+    let mut a = app();
+    press(&mut a, "f");
+    let out = render(&mut a);
+    assert!(out.contains("Worktrees") && !out.contains("Files") && !out.contains("Diff"), "{out}");
+
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    let out = render(&mut a);
+    assert!(out.contains("Files") && !out.contains("Worktrees") && !out.contains("Diff"), "{out}");
 }
 
 #[test]
@@ -280,7 +308,10 @@ fn help_overlay_lists_every_hotkey() {
     let descriptions = ["previous or next worktree", "next area", "previous area", "toggle word wrap", "quit"];
     let columns: Vec<usize> = descriptions
         .iter()
-        .map(|description| out.lines().find(|line| line.contains(description)).unwrap().find(description).unwrap())
+        .map(|description| {
+            let line = out.lines().find(|line| line.contains(description)).unwrap();
+            UnicodeWidthStr::width(&line[..line.find(description).unwrap()])
+        })
         .collect();
     assert!(columns.iter().all(|column| *column == columns[0]), "description columns: {columns:?}");
     assert!(out.contains("Shift+Tab / Left   previous area"));
@@ -739,7 +770,7 @@ fn warnings_come_first_in_the_status_bar() {
     a.states[0].error = None;
     a.states[0].outdated = 2;
     let line = status_line(&render(&mut a));
-    assert!(line.starts_with(" ! rebase in progress   ● changed   (2 outdated)   base: develop"), "{line}");
+    assert!(line.starts_with(" ! rebase in progress   ● changed   (2 outdated)   cwd: /r"), "{line}");
 }
 
 #[test]
@@ -869,6 +900,15 @@ fn a_long_base_branch_leaves_the_worktree_name_and_counts_in_the_status_bar() {
 }
 
 #[test]
+fn a_long_working_directory_keeps_its_end_in_the_status_bar() {
+    let mut a = app();
+    let cwd = std::path::Path::new("/a/very/long/path/to/the/current/project-directory");
+    let line = status_line(&render_sized_at(&mut a, 80, 12, cwd));
+    assert!(line.contains("cwd: …ject-directory"), "{line}");
+    assert!(line.contains("base: develop   feat-auth   1 file   0 comments"), "{line}");
+}
+
+#[test]
 fn a_path_with_control_characters_stays_on_one_row() {
     let path = |p: &str| FileDiff { path: p.into(), ..sample_file() };
     let mut a = app_with(vec![path("a.rs"), path("b\nc\td.rs"), path("e.rs")]);
@@ -894,6 +934,24 @@ fn the_diff_cursor_stays_on_screen_when_moved_past_the_window() {
     let text: String = row.iter().map(|c| c.symbol()).collect();
     assert!(text.contains("line30"), "{text}");
     assert!(is_reversed(row[0]), "{text}");
+}
+
+#[test]
+fn page_keys_scroll_the_diff_even_when_another_pane_has_focus() {
+    let mut a = app_with(vec![long_file(40)]);
+    assert_eq!(a.focus, Focus::Worktrees);
+    render(&mut a);
+
+    a.handle_key(KeyEvent::from(KeyCode::PageDown));
+    let down = render(&mut a);
+    assert_eq!(a.focus, Focus::Worktrees);
+    assert_eq!((a.current().unwrap().cursor, a.current().unwrap().scroll), (9, 9));
+    assert_eq!(row_of(&down, "line9"), Some(1), "{down}");
+
+    a.handle_key(KeyEvent::from(KeyCode::PageUp));
+    let up = render(&mut a);
+    assert_eq!((a.current().unwrap().cursor, a.current().unwrap().scroll), (0, 0));
+    assert_eq!(row_of(&up, "@@ -0,0 +1 @@"), Some(1), "{up}");
 }
 
 #[test]
@@ -925,7 +983,7 @@ fn the_help_hint_is_whole_or_absent_beside_a_notice_or_a_comment() {
     commented.focus = Focus::Diff;
     press(&mut commented, "jcwhy");
     commented.handle_key(KeyEvent::from(KeyCode::Enter));
-    assert!(render_sized(&mut commented, 80, 12).contains(" * why   ? help"));
+    assert!(render_sized(&mut commented, 80, 12).contains(" * why   cwd: /r   ? help"));
     for a in [&mut noticed, &mut commented] {
         for width in 3..60 {
             let line = status_line(&render_sized(a, width, 12));
@@ -938,15 +996,15 @@ fn the_help_hint_is_whole_or_absent_beside_a_notice_or_a_comment() {
 fn the_status_bar_shortens_a_name_only_when_it_has_to() {
     let mut a = app();
     let name = "feat-auth";
-    for width in 40..70 {
+    for width in 48..75 {
         let line = status_line(&render_sized(&mut a, width, 12));
-        // 48 cells hold the bar without the hint, and 57 hold it with the hint.
+        // 58 cells hold the bar with its new cwd field; 67 also hold the hint.
         let whole = line.contains(name);
         let hint = line.ends_with("? help");
         match width {
-            ..48 => assert!(!whole && !hint, "{width}: {line}"),
-            48..52 => assert!(whole && !hint, "{width}: {line}"),
-            52..57 => assert!(hint, "{width}: {line}"),
+            ..58 => assert!(!whole && !hint, "{width}: {line}"),
+            58..62 => assert!(whole && !hint, "{width}: {line}"),
+            62..67 => assert!(!whole && hint, "{width}: {line}"),
             _ => assert!(whole && hint, "{width}: {line}"),
         }
     }
@@ -1015,4 +1073,93 @@ fn the_cursor_reaches_the_pane_edge_on_context_and_header_rows() {
         assert!(diff_row(&buffer, 2).iter().all(|c| is_reversed(c)), "context, split {view}");
         press(&mut a, "k");
     }
+}
+
+/// A full-screen file list with a reviewed file, a rename, a binary file and
+/// a path too long for the screen.
+fn full_screen_file_list() -> App {
+    let deep = format!("{}/deep.rs", ["very_long_folder_name"; 5].join("/"));
+    let files = vec![
+        FileDiff {
+            path: "src/app/tests.rs".into(),
+            content_id: Some("1".into()),
+            added: 17,
+            removed: 0,
+            ..sample_file()
+        },
+        FileDiff { path: "src/ui.rs".into(), added: 333, removed: 33, ..sample_file() },
+        FileDiff {
+            path: "src/new_name.rs".into(),
+            old_path: Some("src/old_name.rs".into()),
+            status: Status::Renamed,
+            added: 2,
+            removed: 1,
+            ..sample_file()
+        },
+        FileDiff {
+            path: "assets/logo.png".into(),
+            status: Status::Added,
+            binary: true,
+            hunks: vec![],
+            ..sample_file()
+        },
+        FileDiff { path: deep, ..sample_file() },
+    ];
+    let mut a = app_with(files);
+    a.focus = Focus::Files;
+    press(&mut a, "xf");
+    a
+}
+
+#[test]
+fn full_screen_files() {
+    insta::assert_snapshot!(render(&mut full_screen_file_list()));
+}
+
+#[test]
+fn full_screen_files_on_a_narrow_terminal() {
+    insta::assert_snapshot!(render_sized(&mut full_screen_file_list(), 40, 12));
+}
+
+#[test]
+fn full_screen_files_dim_folders_but_not_file_names() {
+    let buffer = render_buffer(&mut full_screen_file_list(), 80, 12);
+    let (x, y) = position_of(&buffer, "src/ui.rs");
+    assert!(buffer[(x, y)].modifier.contains(Modifier::DIM), "the folder is dimmed");
+    assert!(!buffer[(x + 4, y)].modifier.contains(Modifier::DIM), "the file name is not");
+}
+
+#[test]
+fn the_narrow_file_list_is_not_dimmed() {
+    let mut a = full_screen_file_list();
+    press(&mut a, "f");
+    let buffer = render_buffer(&mut a, 80, 12);
+    let (x, y) = position_of(&buffer, "src/ui.rs");
+    assert!(!buffer[(x, y)].modifier.contains(Modifier::DIM));
+}
+
+#[test]
+fn full_screen_worktrees() {
+    let mut a = app();
+    a.states[0].review.comments = comments(2, "src/a.rs");
+    press(&mut a, "f");
+    insta::assert_snapshot!(render(&mut a));
+}
+
+#[test]
+fn full_screen_worktrees_dim_the_path() {
+    let mut a = app();
+    press(&mut a, "f");
+    let buffer = render_buffer(&mut a, 80, 12);
+    let (x, y) = position_of(&buffer, "/r/fix-cache");
+    assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
+}
+
+#[test]
+fn full_screen_worktrees_drop_the_path_when_it_has_no_room() {
+    let mut a = app();
+    press(&mut a, "f");
+    let out = render_sized(&mut a, 30, 8);
+    assert!(!out.contains("/r/"), "{out}");
+    assert!(out.contains("feat-auth +1"), "falls back to the narrow row: {out}");
 }

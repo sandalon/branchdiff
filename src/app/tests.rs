@@ -770,20 +770,35 @@ fn question_mark_toggles_help_and_esc_closes_it() {
 }
 
 #[test]
-fn f_toggles_a_diff_only_view_and_restores_focus() {
+fn f_makes_the_focused_pane_full_screen_and_keeps_focus() {
     let mut a = app(&["a"]);
     a.focus = Focus::Files;
 
     press(&mut a, 'f');
-    assert!(a.diff_fullscreen);
-    assert_eq!(a.focus, Focus::Diff);
-
-    a.handle_key(KeyEvent::from(KeyCode::Tab));
-    assert_eq!(a.focus, Focus::Diff, "hidden panes cannot receive focus");
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Files);
 
     press(&mut a, 'f');
-    assert!(!a.diff_fullscreen);
+    assert!(!a.fullscreen);
     assert_eq!(a.focus, Focus::Files);
+}
+
+#[test]
+fn tab_moves_the_full_screen_view_with_focus() {
+    let mut a = app(&["a"]);
+    press(&mut a, 'f');
+
+    a.handle_key(KeyEvent::from(KeyCode::Tab));
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Files);
+
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    a.handle_key(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(a.focus, Focus::Diff);
+
+    press(&mut a, 'f');
+    assert!(!a.fullscreen);
+    assert_eq!(a.focus, Focus::Diff, "leaving full screen keeps the pane last shown");
 }
 
 #[test]
@@ -1726,6 +1741,23 @@ fn finder_and_vertical_selection_reload_evicted_worktrees() {
         a.handle_key(KeyEvent::from(KeyCode::Enter)),
         vec![Effect::Load { path: "/r/c".into(), base: "develop".into() }]
     );
+}
+
+#[test]
+fn fullscreen_worktree_movement_reloads_an_evicted_model() {
+    let mut a = app(&["a", "b"]);
+    for name in ["a", "b"] {
+        deliver(&mut a, name, vec![file_with_rows(name, 20)]);
+    }
+    a.trim_cache_to(a.states[0].cached_bytes);
+    a.focus = Focus::Worktrees;
+    press(&mut a, 'f');
+    assert!(a.fullscreen);
+    assert_eq!(press(&mut a, 'j'), vec![Effect::Load { path: "/r/b".into(), base: "develop".into() }]);
+    assert!(a.fullscreen);
+    assert_eq!(a.focus, Focus::Worktrees);
+    deliver(&mut a, "b", vec![file_with_rows("b", 20)]);
+    assert!(a.current_file().is_some());
 }
 
 #[test]

@@ -29,6 +29,49 @@ fn lists_worktrees_with_branches() {
     assert_eq!(branches, vec!["develop", "feat"]);
 }
 
+fn commit_at(cwd: &std::path::Path, message: &str, seconds: u64) {
+    run(cwd, &["add", "."]);
+    let date = format!("@{seconds} +0000");
+    let mut command = std::process::Command::new("git");
+    for var in git::REPO_ENV_VARS {
+        command.env_remove(var);
+    }
+    let output = command
+        .current_dir(cwd)
+        .args(["commit", "-qm", message])
+        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git commit: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn worktrees_are_sorted_by_latest_commit_then_dirty_file() {
+    let repo = Repo::new();
+    let feat = repo.add_worktree("feat");
+    std::fs::write(repo.main.join("main.txt"), "main\n").unwrap();
+    commit_at(&repo.main, "main", 2_000_000_000);
+    std::fs::write(feat.join("feat.txt"), "feat\n").unwrap();
+    commit_at(&feat, "feat", 2_000_000_100);
+
+    let branches = || {
+        git::list_worktrees(&repo.main)
+            .unwrap()
+            .into_iter()
+            .map(|worktree| worktree.branch.unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(branches(), vec!["feat", "develop"]);
+
+    let dirty = repo.main.join("a.txt");
+    std::fs::write(&dirty, "newest uncommitted edit\n").unwrap();
+    set_mtime(&dirty, 3_000_000_000);
+    assert_eq!(branches(), vec!["develop", "feat"]);
+}
+
 #[test]
 fn lists_detached_head_without_branch() {
     let repo = Repo::new();
