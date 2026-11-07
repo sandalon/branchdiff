@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       BRANCHDIFF_TEST_QUIET_MS: 3000
@@ -20,9 +20,12 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo test --release --test perf -- --ignored
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      # Functional PTY tests run above on every platform. Keep strict timing
+      # thresholds on the established Unix runners rather than ConPTY hosts.
+      - if: runner.os != 'Windows'
+        run: cargo test --locked --release --test perf -- --ignored
 
   msrv:
     runs-on: ubuntu-latest
