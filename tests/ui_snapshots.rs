@@ -231,6 +231,17 @@ fn cell_of<'a>(buffer: &'a Buffer, symbol: &str) -> &'a Cell {
     buffer.content.iter().find(|c| c.symbol() == symbol).unwrap()
 }
 
+/// The column and row where `text` first starts on screen.
+fn position_of(buffer: &Buffer, text: &str) -> (u16, u16) {
+    for y in 0..buffer.area.height {
+        let row: Vec<&str> = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect();
+        if let Some(x) = (0..row.len()).find(|&x| row[x..].concat().starts_with(text)) {
+            return (x as u16, y);
+        }
+    }
+    panic!("{text:?} is not on screen");
+}
+
 fn is_light(colour: Color) -> bool {
     matches!(colour, Color::Rgb(r, g, b) if r > 150 && g > 150 && b > 150)
 }
@@ -1028,4 +1039,67 @@ fn the_cursor_reaches_the_pane_edge_on_context_and_header_rows() {
         assert!(diff_row(&buffer, 2).iter().all(|c| is_reversed(c)), "context, split {view}");
         press(&mut a, "k");
     }
+}
+
+/// A full-screen file list with a reviewed file, a rename, a binary file and
+/// a path too long for the screen.
+fn full_screen_file_list() -> App {
+    let deep = format!("{}/deep.rs", ["very_long_folder_name"; 5].join("/"));
+    let files = vec![
+        FileDiff {
+            path: "src/app/tests.rs".into(),
+            content_id: Some("1".into()),
+            added: 17,
+            removed: 0,
+            ..sample_file()
+        },
+        FileDiff { path: "src/ui.rs".into(), added: 333, removed: 33, ..sample_file() },
+        FileDiff {
+            path: "src/new_name.rs".into(),
+            old_path: Some("src/old_name.rs".into()),
+            status: Status::Renamed,
+            added: 2,
+            removed: 1,
+            ..sample_file()
+        },
+        FileDiff {
+            path: "assets/logo.png".into(),
+            status: Status::Added,
+            binary: true,
+            hunks: vec![],
+            ..sample_file()
+        },
+        FileDiff { path: deep, ..sample_file() },
+    ];
+    let mut a = app_with(files);
+    a.focus = Focus::Files;
+    press(&mut a, "xf");
+    a
+}
+
+#[test]
+fn full_screen_files() {
+    insta::assert_snapshot!(render(&mut full_screen_file_list()));
+}
+
+#[test]
+fn full_screen_files_on_a_narrow_terminal() {
+    insta::assert_snapshot!(render_sized(&mut full_screen_file_list(), 40, 12));
+}
+
+#[test]
+fn full_screen_files_dim_folders_but_not_file_names() {
+    let buffer = render_buffer(&mut full_screen_file_list(), 80, 12);
+    let (x, y) = position_of(&buffer, "src/ui.rs");
+    assert!(buffer[(x, y)].modifier.contains(Modifier::DIM), "the folder is dimmed");
+    assert!(!buffer[(x + 4, y)].modifier.contains(Modifier::DIM), "the file name is not");
+}
+
+#[test]
+fn the_narrow_file_list_is_not_dimmed() {
+    let mut a = full_screen_file_list();
+    press(&mut a, "f");
+    let buffer = render_buffer(&mut a, 80, 12);
+    let (x, y) = position_of(&buffer, "src/ui.rs");
+    assert!(!buffer[(x, y)].modifier.contains(Modifier::DIM));
 }

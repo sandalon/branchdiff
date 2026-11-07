@@ -1,0 +1,16 @@
+---
+source: tests/ui_snapshots.rs
+expression: render(&mut full_screen_file_list())
+---
+"┌Files─────────────────────────────────────────────────────────────────────────┐"
+"│✓M src/app/tests.rs                                                     +17 −0│"
+"│ M src/ui.rs                                                          +333 −33│"
+"│ R src/old_name.rs → src/new_name.rs                                     +2 −1│"
+"│ A assets/logo.png                                                         bin│"
+"│ M …ong_folder_name/very_long_folder_name/very_long_folder_name/deep.rs  +1 −1│"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" base: develop   feat-auth   5 files   0 comments   ? help                      "
