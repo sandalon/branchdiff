@@ -1103,3 +1103,29 @@ fn the_narrow_file_list_is_not_dimmed() {
     let (x, y) = position_of(&buffer, "src/ui.rs");
     assert!(!buffer[(x, y)].modifier.contains(Modifier::DIM));
 }
+
+#[test]
+fn full_screen_worktrees() {
+    let mut a = app();
+    a.states[0].review.comments = comments(2, "src/a.rs");
+    press(&mut a, "f");
+    insta::assert_snapshot!(render(&mut a));
+}
+
+#[test]
+fn full_screen_worktrees_dim_the_path() {
+    let mut a = app();
+    press(&mut a, "f");
+    let buffer = render_buffer(&mut a, 80, 12);
+    let (x, y) = position_of(&buffer, "/r/fix-cache");
+    assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
+}
+
+#[test]
+fn full_screen_worktrees_drop_the_path_when_it_has_no_room() {
+    let mut a = app();
+    press(&mut a, "f");
+    let out = render_sized(&mut a, 30, 8);
+    assert!(!out.contains("/r/"), "{out}");
+    assert!(out.contains("feat-auth +1"), "falls back to the narrow row: {out}");
+}

@@ -135,6 +135,9 @@ pub struct App {
     pub should_quit: bool,
     /// Cleared on terminals without truecolor, so `ui` converts colours.
     pub truecolor: bool,
+    /// Shown as `~` at the start of worktree paths. `main` sets it, so tests
+    /// don't depend on the machine's home directory.
+    pub home: Option<PathBuf>,
 }
 
 /// Answers whether `modifiers` mark a shortcut rather than typed text.
@@ -163,6 +166,7 @@ impl App {
             fatal: None,
             should_quit: false,
             truecolor: true,
+            home: None,
         }
     }
 
