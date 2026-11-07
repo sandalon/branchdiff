@@ -140,12 +140,15 @@ impl Store {
         if !self.dir.is_dir() {
             return LoadedReview::default();
         }
-        let _lock = match self.lock(&path) {
-            Ok(lock) => lock,
-            Err(_) => return LoadedReview { left_in_place: Some(path), ..LoadedReview::default() },
-        };
+        let lock = self.lock(&path);
+        // Saves replace the file by rename, so a usable review can be read
+        // without the lock, as when an older version left no lock file in a
+        // read-only store. Only moving an unusable file aside needs it.
         if let Some((review, bytes)) = read_review(&path) {
             return LoadedReview { review, version: ReviewVersion::from_bytes(bytes), ..LoadedReview::default() };
+        }
+        if lock.is_err() {
+            return LoadedReview { left_in_place: Some(path), ..LoadedReview::default() };
         }
         match set_aside(&path) {
             Ok(moved_aside) => LoadedReview { moved_aside, ..LoadedReview::default() },
@@ -802,6 +805,25 @@ mod tests {
     fn set_store_dir_mode(store: &Store, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&store.dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_review_without_a_lock_file_still_loads_from_a_read_only_store() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("legacy".into());
+        fs::create_dir_all(&store.dir).unwrap();
+        // Written by a version that never created lock files.
+        fs::write(store.path_for(&id), serde_json::to_vec(&notes("legacy")).unwrap()).unwrap();
+        if !make_store_dir_read_only(&store) {
+            return;
+        }
+        let loaded = store.load(&id);
+        set_store_dir_mode(&store, 0o755);
+        assert_eq!(loaded.review, notes("legacy"));
+        assert_eq!(loaded.left_in_place, None);
+        assert_eq!(store.save(&id, &notes("upgraded"), &loaded.version).unwrap(), SaveOutcome::Saved);
     }
 
     #[cfg(unix)]
