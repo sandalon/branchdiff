@@ -68,7 +68,7 @@ Comments and reviewed marks are stored as JSON under `<git-common-dir>/branchdif
 - On Linux, a low inotify limit makes the badge incomplete and shows a notice.
 - On macOS, a worktree reached through a symlink created after it was added won't show the badge for file edits.
 - On Windows, deleting a worktree's directory by hand isn't noticed until the list next refreshes.
-- Two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save.
+- Concurrent sessions and detached worktrees on the same commit check the saved review's revision before writing. A conflicting save keeps the latest shared review intact and writes your complete local review to a private `*.json.conflict-*.json` recovery file beside it. The notice gives its path; you can keep editing or export your local notes, then restart to load the latest shared review. Repeated conflicting saves retain separate recovery files. All concurrent sessions must use a version with revision checks.
 - Colours assume a dark background, so context rows can be hard to read on a light terminal.
 
 

@@ -888,18 +888,47 @@ fn a_save_records_the_review_it_was_made_for() {
     deliver(&mut a, "a", vec![file_with_line("x")]);
     let fx = press(&mut a, 'x');
     press(&mut a, ']');
-    assert!(matches!(&fx[0], Effect::SaveReview { id: ReviewId::Branch(b), review }
+    assert!(matches!(&fx[0], Effect::SaveReview { id: ReviewId::Branch(b), review, .. }
         if b == "a" && review.reviewed.len() == 1));
 }
 
 #[test]
 fn only_the_last_save_per_review_is_kept() {
+    let versions = [ReviewVersion::default(), ReviewVersion::default()];
     let save = |name: &str, marks: usize| Effect::SaveReview {
+        version: versions[usize::from(name != "a")].clone(),
         id: ReviewId::Branch(name.into()),
         review: Review { comments: vec![], reviewed: (0..marks).map(|i| (i.to_string(), 0)).collect() },
     };
     let kept = coalesce_saves(vec![save("a", 1), save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
     assert_eq!(kept, vec![save("b", 1), Effect::ReloadWorktrees, save("a", 2)]);
+}
+
+#[test]
+fn detached_worktrees_sharing_a_review_keep_both_editing_states_saves() {
+    let mut a = app(&["a", "b"]);
+    for worktree in &mut a.worktrees {
+        worktree.branch = None;
+        worktree.head = "shared-commit".into();
+    }
+    deliver(&mut a, "a", vec![file_with_line("x")]);
+    deliver(&mut a, "b", vec![file_with_line("y")]);
+    let mut effects = press(&mut a, 'x');
+    press(&mut a, ']');
+    effects.extend(press(&mut a, 'x'));
+    let kept = coalesce_saves(effects);
+    assert_eq!(kept.len(), 2, "neither independent snapshot can be silently dropped");
+    let sessions: Vec<_> = kept
+        .iter()
+        .map(|effect| match effect {
+            Effect::SaveReview { id, version, .. } => {
+                assert_eq!(id, &ReviewId::Commit("shared-commit".into()));
+                version.session_id()
+            }
+            other => panic!("unexpected effect {other:?}"),
+        })
+        .collect();
+    assert_ne!(sessions[0], sessions[1]);
 }
 
 #[test]
@@ -1203,7 +1232,14 @@ fn a_save_from_a_later_worktree_holds_its_own_id_and_review() {
     let fx = type_comment(&mut a, "fix");
     assert_eq!(a.states[1].review.comments.len(), 1);
     assert_ne!(a.states[0].review, a.states[1].review);
-    assert_eq!(fx, vec![Effect::SaveReview { id: ReviewId::Branch("b".into()), review: a.states[1].review.clone() }]);
+    assert_eq!(
+        fx,
+        vec![Effect::SaveReview {
+            id: ReviewId::Branch("b".into()),
+            review: a.states[1].review.clone(),
+            version: a.states[1].review_version.clone()
+        }]
+    );
 }
 
 #[test]
