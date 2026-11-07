@@ -68,6 +68,10 @@ pub struct WorktreeState {
     pub review: Review,
     pub outdated: usize,
     pub highlights: HashMap<usize, HighlightedFile>,
+    /// Evicted models reload when selected; reviews and navigation survive.
+    pub(crate) evicted: bool,
+    last_used: u64,
+    cached_bytes: usize,
 }
 
 impl WorktreeState {
@@ -136,6 +140,7 @@ pub struct App {
     pub should_quit: bool,
     /// Cleared on terminals without truecolor, so `ui` converts colours.
     pub truecolor: bool,
+    cache_clock: u64,
 }
 
 /// Answers whether `modifiers` mark a shortcut rather than typed text.
@@ -165,6 +170,7 @@ impl App {
             fatal: None,
             should_quit: false,
             truecolor: true,
+            cache_clock: 0,
         }
     }
 
@@ -236,7 +242,7 @@ impl App {
             || (key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::SHIFT));
         // Switching works from any screen.
         if !toggle_wrap && self.switch_worktree(key.code) {
-            return Vec::new();
+            return self.selected_cache_effects();
         }
         if self.help_open {
             if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
@@ -275,7 +281,53 @@ impl App {
             KeyCode::Char('Y') => return self.export(Effect::WriteExport),
             _ => {}
         }
-        Vec::new()
+        self.selected_cache_effects()
+    }
+
+    fn selected_cache_effects(&mut self) -> Vec<Effect> {
+        self.cache_clock = self.cache_clock.saturating_add(1);
+        let Some(s) = self.states.get_mut(self.selected) else { return Vec::new() };
+        s.last_used = self.cache_clock;
+        if !std::mem::take(&mut s.evicted) {
+            return Vec::new();
+        }
+        vec![Effect::Load { path: self.worktrees[self.selected].path.clone(), base: self.base.clone() }]
+    }
+
+    fn trim_cache(&mut self) {
+        self.trim_cache_to(crate::cache::MAX_CACHED_BYTES);
+    }
+
+    fn trim_cache_to(&mut self, limit: usize) {
+        let mut total: usize = self.states.iter().map(|s| s.cached_bytes).sum();
+        while total > limit {
+            let victim = self
+                .states
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| *i != self.selected && s.diffs.is_some())
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(i, _)| i);
+            let Some(i) = victim else {
+                // The selected model is bounded by MAX_DIFF_BYTES. Its optional
+                // colours may be discarded if they alone exceed the cache.
+                if let Some(s) = self.states.get_mut(self.selected) {
+                    s.highlights.clear();
+                    // Remember plain rendering for the current file; otherwise
+                    // a discarded result could be requested every frame.
+                    s.highlights.insert(s.file, HighlightedFile::default());
+                    s.cached_bytes = s.diffs.as_ref().map_or(0, |d| crate::cache::diff_bytes(d, d.capacity()));
+                }
+                break;
+            };
+            let s = &mut self.states[i];
+            total = total.saturating_sub(s.cached_bytes);
+            s.diffs = None;
+            s.key = None;
+            s.highlights.clear();
+            s.cached_bytes = 0;
+            s.evicted = true;
+        }
     }
 
     /// Answers whether `code` is a worktree switching key.
@@ -414,8 +466,23 @@ impl App {
                             s.op = l.op;
                             s.error = None;
                             s.stale = false;
+                            s.evicted = false;
+                            s.cached_bytes = s.diffs.as_ref().map_or(0, |d| crate::cache::diff_bytes(d, d.capacity()))
+                                + s.highlights.values().map(highlight_bytes).sum::<usize>();
+                            self.cache_clock = self.cache_clock.saturating_add(1);
+                            s.last_used = self.cache_clock;
                         }
                         Err(e) => {
+                            if e == GitError::DiffTooLarge {
+                                // Never let old, markable content stand in for
+                                // a new diff whose changes were omitted.
+                                s.diffs = None;
+                                s.key = None;
+                                s.highlights.clear();
+                                s.cached_bytes = 0;
+                                s.evicted = false;
+                                s.stale = true;
+                            }
                             // A result for an older base can arrive after the base has changed.
                             let missing = matches!(&e, GitError::BaseMissing(b) if *b == self.base);
                             s.error = Some(e);
@@ -425,6 +492,7 @@ impl App {
                         }
                     }
                 }
+                self.trim_cache();
                 Vec::new()
             }
             Msg::Stale(path) => {
@@ -455,7 +523,10 @@ impl App {
             Msg::Highlighted { key, file_index, lines } => {
                 if let Some(s) = self.states.iter_mut().find(|s| s.key.as_ref() == Some(&key)) {
                     s.highlights.insert(file_index, lines);
+                    s.cached_bytes = s.diffs.as_ref().map_or(0, |d| crate::cache::diff_bytes(d, d.capacity()))
+                        + s.highlights.values().map(highlight_bytes).sum::<usize>();
                 }
+                self.trim_cache();
                 Vec::new()
             }
         }
@@ -500,6 +571,7 @@ impl App {
             },
             None => 0,
         };
+        effects.extend(self.selected_cache_effects());
         effects
     }
 
@@ -570,6 +642,7 @@ impl App {
             Some(Input::Worktree { query }) => {
                 if let Some(i) = top_match(&query, &self.worktree_labels()) {
                     self.selected = i;
+                    return self.selected_cache_effects();
                 }
             }
             Some(Input::Base { query, mut branches }) => {
@@ -709,6 +782,23 @@ impl App {
         file.status == Status::Deleted
             && !diffs.is_some_and(|d| d.iter().any(|f| f.path == file.path && f.status != Status::Deleted))
     }
+}
+
+fn highlight_bytes(file: &HighlightedFile) -> usize {
+    file.hunks.capacity() * std::mem::size_of::<Vec<Vec<crate::highlight::Span>>>()
+        + file
+            .hunks
+            .iter()
+            .map(|h| {
+                h.capacity() * std::mem::size_of::<Vec<crate::highlight::Span>>()
+                    + h.iter()
+                        .map(|line| {
+                            line.capacity() * std::mem::size_of::<crate::highlight::Span>()
+                                + line.iter().map(|(_, text)| text.capacity()).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
 }
 
 /// What Enter takes in a filtering prompt. A blank query cancels.

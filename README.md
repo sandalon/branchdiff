@@ -69,3 +69,17 @@ Comments and reviewed marks are stored as JSON under `<git-common-dir>/branchdif
 - On Windows, deleting a worktree's directory by hand isn't noticed until the list next refreshes.
 - Two `branchdiff` sessions reviewing the same branch, or two detached worktrees on the same commit, overwrite each other's comments when they save.
 - Colours assume a dark background, so context rows can be hard to read on a light terminal.
+
+
+Large diffs are limited to an 8 MiB tracked patch and a 64 MiB estimated diff
+model per worktree. A patch that exceeds these limits is rejected in full with
+an error; partial changes cannot be marked reviewed. Use `git diff` to review
+such a patch, or reduce its size and press `r`. Untracked reads have a separate
+32 MiB aggregate budget, with oversized files listed as unavailable.
+
+Loaded diffs and syntax colours share a 128 MiB estimated cache budget. Older
+worktrees are evicted and reloaded when selected; comments, reviewed marks and
+navigation positions are retained. Evicted worktrees show an unknown (`+?`)
+change count until reloaded. These budgets cover application-owned
+models, not Git's own memory or allocator overhead. Worker buffers and queued
+results are bounded separately.

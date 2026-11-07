@@ -935,3 +935,22 @@ fn a_bare_repository_is_skipped_when_seen_from_its_linked_worktree() {
     run(&base.join("bare.git"), &["worktree", "add", "-q", "-b", "linked", linked.to_str().unwrap()]);
     assert_eq!(paths(&git::list_worktrees(&linked).unwrap()), vec![linked]);
 }
+
+#[test]
+fn oversized_tracked_patch_is_rejected_and_a_later_refresh_recovers() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("a.txt"), vec![b'x'; git::MAX_PATCH_BYTES]).unwrap();
+    assert_eq!(branchdiff::diff::load(&repo.main, "HEAD"), Err(GitError::DiffTooLarge));
+    std::fs::write(repo.main.join("a.txt"), "small change\n").unwrap();
+    let files = branchdiff::diff::load(&repo.main, "HEAD").unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "a.txt");
+    assert!(!files[0].hunks.is_empty());
+}
+
+#[test]
+fn untracked_line_amplification_reports_the_same_explicit_load_error() {
+    let repo = Repo::new();
+    std::fs::write(repo.main.join("dense.txt"), vec![b'\n'; branchdiff::diff::MAX_DIFF_BYTES / 256]).unwrap();
+    assert_eq!(branchdiff::diff::load(&repo.main, "HEAD"), Err(GitError::DiffTooLarge));
+}
