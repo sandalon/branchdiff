@@ -144,7 +144,12 @@ fn press(a: &mut App, keys: &str) {
 
 /// Delivers colour for the first file: spans per line per hunk.
 fn highlight(a: &mut App, hunks: Vec<Vec<Vec<(Color, String)>>>) {
-    a.handle_msg(Msg::Highlighted { key: key(), file_index: 0, lines: HighlightedFile { hunks } });
+    a.handle_msg(Msg::Highlighted {
+        key: key(),
+        source: Arc::downgrade(a.current().unwrap().diffs.as_ref().unwrap()),
+        file_index: 0,
+        lines: HighlightedFile { hunks },
+    });
 }
 
 /// One line's spans.

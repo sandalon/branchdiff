@@ -365,7 +365,12 @@ fn a_reload_keeps_colours_only_while_the_key_is_unchanged() {
     deliver(&mut a, "a", vec![file("1")]);
     assert!(a.highlight_effect().is_some());
     let key = a.current().unwrap().key.clone().unwrap();
-    a.handle_msg(Msg::Highlighted { key: key.clone(), file_index: 0, lines: Default::default() });
+    a.handle_msg(Msg::Highlighted {
+        key: key.clone(),
+        source: Arc::downgrade(a.states[0].diffs.as_ref().unwrap()),
+        file_index: 0,
+        lines: Default::default(),
+    });
     assert_eq!(a.highlight_effect(), None);
 
     deliver(&mut a, "a", vec![file("1")]);
@@ -388,7 +393,12 @@ fn a_highlight_for_a_stale_key_changes_nothing() {
     let loaded = Loaded { key: current, diffs: Arc::new(vec![file("1")]), op: None };
     a.handle_msg(Msg::Loaded { path: "/r/a".into(), result: Ok(loaded) });
 
-    a.handle_msg(Msg::Highlighted { key: stale, file_index: 0, lines: Default::default() });
+    a.handle_msg(Msg::Highlighted {
+        key: stale,
+        source: Arc::downgrade(a.states[0].diffs.as_ref().unwrap()),
+        file_index: 0,
+        lines: Default::default(),
+    });
     assert!(a.states.iter().all(|s| s.highlights.is_empty()));
 }
 
@@ -400,7 +410,12 @@ fn a_highlight_reaches_its_own_worktree_when_another_is_selected() {
     assert_eq!(a.selected, 0);
     let key = a.states[1].key.clone().unwrap();
 
-    a.handle_msg(Msg::Highlighted { key, file_index: 0, lines: Default::default() });
+    a.handle_msg(Msg::Highlighted {
+        key,
+        source: Arc::downgrade(a.states[1].diffs.as_ref().unwrap()),
+        file_index: 0,
+        lines: Default::default(),
+    });
     assert!(a.states[0].highlights.is_empty());
     assert!(a.states[1].highlights.contains_key(&0));
 }
@@ -1669,4 +1684,62 @@ fn a_probe_result_alone_changes_nothing_in_the_app() {
     let mut a = app(&["a"]);
     assert!(a.handle_msg(Msg::Probed { path: "/r/a".into(), changed: true }).is_empty());
     assert!(!a.states[0].stale);
+}
+
+#[test]
+fn switching_branch_at_the_same_path_reloads_and_cannot_comment_on_the_old_diff() {
+    let mut a = app_on_line();
+    type_comment(&mut a, "old review");
+    press(&mut a, 'x');
+    press(&mut a, 'c');
+    let mut next = wt("a");
+    next.branch = Some("b".into());
+    // Even two branches at the same commit have different reviews.
+    let effects = a.handle_msg(Msg::Worktrees(Ok(vec![next])));
+    assert_eq!(effects, vec![Effect::Load { path: "/r/a".into(), base: "develop".into() }]);
+    let s = a.current().unwrap();
+    assert!(s.key.is_none() && s.diffs.is_none() && s.highlights.is_empty());
+    assert_eq!(s.review, Review::default());
+    assert_eq!(position(&a), (0, 0, 0));
+    assert!(a.input.is_none());
+    assert!(type_comment(&mut a, "must not save").is_empty());
+    assert!(a.current().unwrap().review.comments.is_empty());
+}
+
+#[test]
+fn moving_a_detached_worktree_to_another_commit_reloads_its_diff() {
+    let mut a = app(&["a"]);
+    a.worktrees[0].branch = None;
+    deliver(&mut a, "a", vec![file_with_line("old commit")]);
+    let mut next = a.worktrees[0].clone();
+    next.head = "new commit".into();
+    let effects = a.handle_msg(Msg::Worktrees(Ok(vec![next])));
+    assert_eq!(effects.len(), 1);
+    assert!(a.current_file().is_none());
+}
+
+#[test]
+fn a_new_commit_on_the_same_branch_preserves_the_review_and_diff_until_refresh() {
+    let mut a = app_on_line();
+    type_comment(&mut a, "keep");
+    let diffs = a.current().unwrap().diffs.clone().unwrap();
+    let mut next = a.worktrees[0].clone();
+    next.head = "new commit".into();
+    assert!(a.handle_msg(Msg::Worktrees(Ok(vec![next]))).is_empty());
+    assert!(Arc::ptr_eq(a.current().unwrap().diffs.as_ref().unwrap(), &diffs));
+    assert_eq!(a.current().unwrap().review.comments[0].body, "keep");
+}
+
+#[test]
+fn a_late_highlight_cannot_attach_to_another_branch_with_the_same_cache_key() {
+    let mut a = app_on_line();
+    let key = a.current().unwrap().key.clone().unwrap();
+    let source = Arc::downgrade(a.current().unwrap().diffs.as_ref().unwrap());
+    let mut next = a.worktrees[0].clone();
+    next.branch = Some("b".into());
+    a.handle_msg(Msg::Worktrees(Ok(vec![next])));
+    deliver(&mut a, "a", vec![file_with_line("let x = 1;")]);
+    assert_eq!(a.current().unwrap().key.as_ref(), Some(&key));
+    a.handle_msg(Msg::Highlighted { key, source, file_index: 0, lines: Default::default() });
+    assert!(a.current().unwrap().highlights.is_empty());
 }
