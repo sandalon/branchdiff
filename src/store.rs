@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 
 /// Longest encoded name kept whole. File names are usually limited to 255
@@ -42,6 +43,51 @@ pub struct Review {
     pub reviewed: BTreeMap<String, u64>,
 }
 
+/// The exact persisted revision seen by one editing state. Cloned save effects
+/// share updates after successful saves, while independent worktrees/sessions
+/// retain their own baseline even when they review the same commit.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewVersion(Arc<Mutex<Option<Vec<u8>>>>);
+
+impl ReviewVersion {
+    fn from_bytes(bytes: Option<Vec<u8>>) -> Self {
+        Self(Arc::new(Mutex::new(bytes)))
+    }
+
+    pub fn session_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+impl PartialEq for ReviewVersion {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        let own = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let other = other.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        own == other
+    }
+}
+
+impl Eq for ReviewVersion {}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SaveOutcome {
+    Saved,
+    /// The canonical review was left intact. This private JSON contains all
+    /// local notes and reviewed marks, including local deletions.
+    Conflict(PathBuf),
+}
+
+#[derive(Serialize)]
+struct PersistedReview<'a> {
+    #[serde(rename = "_branchdiff_revision")]
+    revision: &'a str,
+    #[serde(flatten)]
+    review: &'a Review,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReviewId {
     Branch(String),
@@ -60,6 +106,7 @@ impl ReviewId {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadedReview {
     pub review: Review,
+    pub version: ReviewVersion,
     /// Where an unreadable review was moved, so the UI can say so.
     pub moved_aside: Option<PathBuf>,
     /// An unreadable review that could not be moved. It stays where it is, and
@@ -88,8 +135,17 @@ impl Store {
     /// read or parsed is moved aside, so the next save can't overwrite it.
     pub fn load(&self, id: &ReviewId) -> LoadedReview {
         let path = self.path_for(id);
-        if let Some(review) = read_review(&path) {
-            return LoadedReview { review, ..LoadedReview::default() };
+        // A missing directory needs no lock. If another session creates it
+        // now, the first save will detect that its baseline was missing.
+        if !self.dir.is_dir() {
+            return LoadedReview::default();
+        }
+        let _lock = match self.lock(&path) {
+            Ok(lock) => lock,
+            Err(_) => return LoadedReview { left_in_place: Some(path), ..LoadedReview::default() },
+        };
+        if let Some((review, bytes)) = read_review(&path) {
+            return LoadedReview { review, version: ReviewVersion::from_bytes(bytes), ..LoadedReview::default() };
         }
         match set_aside(&path) {
             Ok(moved_aside) => LoadedReview { moved_aside, ..LoadedReview::default() },
@@ -101,35 +157,121 @@ impl Store {
     /// A file already there that can't be used is moved aside first, and if it
     /// can't be moved it is left alone and the save fails.
     ///
-    /// Replaces the whole file: if two processes edit one review, the last
-    /// save wins.
-    pub fn save(&self, id: &ReviewId, review: &Review) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(review)?;
+    /// Compares the expected persisted revision under an interprocess lock.
+    /// A conflicting snapshot is retained separately, never applied over newer
+    /// notes. Only a successful canonical save advances this editing state's
+    /// revision; retrying a conflict therefore remains safe.
+    pub fn save(&self, id: &ReviewId, review: &Review, version: &ReviewVersion) -> Result<SaveOutcome> {
         let path = self.path_for(id);
-        if read_review(&path).is_none() {
-            set_aside(&path).map_err(|e| anyhow!("{e}: could not move aside {}", path.display()))?;
+        let mut expected = version.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = self.lock(&path).map_err(|e| anyhow!("{e}: {}", self.dir.display()))?;
+        let (current, recovered) = match read_review(&path) {
+            Some((_, bytes)) => (bytes, false),
+            None => {
+                set_aside(&path).map_err(|e| anyhow!("{e}: could not move aside {}", path.display()))?;
+                // Corrupt data has been preserved. It cannot represent a
+                // competing usable review, so recovery may save local notes.
+                (None, true)
+            }
+        };
+        let mut tmp = NamedTempFile::new_in(&self.dir)?;
+        // The fresh temp name, timestamp and process id make every saved
+        // revision distinct, including writes that restore identical notes.
+        let revision = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+            tmp.path().file_name().unwrap_or_default().to_string_lossy()
+        );
+        let bytes = serde_json::to_vec_pretty(&PersistedReview { revision: &revision, review })?;
+        if current != *expected && !recovered {
+            let prefix = format!("{}.conflict-", path.file_name().unwrap_or_default().to_string_lossy());
+            tmp = tempfile::Builder::new().prefix(&prefix).suffix(".json").tempfile_in(&self.dir)?;
+            tmp.write_all(&bytes)?;
+            tmp.as_file().sync_all()?;
+            let (_, recovery) = tmp.keep().map_err(|e| e.error)?;
+            return Ok(SaveOutcome::Conflict(recovery));
         }
-        self.replace(&path, &bytes).map_err(|e| anyhow!("{e}: {}", self.dir.display()))
+        tmp.write_all(&bytes)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| anyhow!("{}: {}", e.error, self.dir.display()))?;
+        *expected = Some(bytes);
+        Ok(SaveOutcome::Saved)
     }
 
-    /// Review files end up 0600, which suits private review notes.
-    fn replace(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    /// Locks contain no notes and can be opened read-only by another user of
+    /// a shared repository. JSON and recovery files remain owner-private.
+    fn lock(&self, path: &Path) -> io::Result<fs::File> {
         fs::create_dir_all(&self.dir)?;
-        let mut tmp = NamedTempFile::new_in(&self.dir)?;
-        tmp.write_all(bytes)?;
-        // Otherwise a power loss can keep the rename but not the data, leaving
-        // an empty file in place of the review.
-        tmp.as_file().sync_all()?;
-        tmp.persist(path).map(drop).map_err(|e| e.error)
+        // Lock a stable sibling rather than the JSON inode replaced by rename.
+        // Closing the handle releases the native lock, including after a crash.
+        let lock_path = path.with_extension("json.lock");
+        let file = match fs::File::open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                match fs::File::options().read(true).write(true).create_new(true).open(&lock_path) {
+                    Ok(file) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            // Only chmod this newly created handle. Never
+                            // change an existing path's permissions or truncate
+                            // it, including when another process wins creation.
+                            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+                        }
+                        file
+                    }
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => fs::File::open(&lock_path)?,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(ErrorKind::InvalidData, "review lock is not a regular file"));
+        }
+        lock_file(&file)?;
+        Ok(file)
+    }
+}
+
+#[cfg(unix)]
+fn lock_file(file: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: file owns this live descriptor for the duration of the lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lock_file(file: &fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    // SAFETY: OVERLAPPED is a C structure whose zero initialization selects
+    // offset zero. This synchronous handle keeps the structure live until the
+    // blocking call returns; closing file releases its one-byte lock.
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    let locked = unsafe { LockFileEx(file.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut overlapped) };
+    if locked == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
 /// Returns `None` if something is there that can't be used. A missing file is
 /// an empty review, including when a file sits where the store directory goes.
-fn read_review(path: &Path) -> Option<Review> {
+fn read_review(path: &Path) -> Option<(Review, Option<Vec<u8>>)> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).ok(),
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Some(Review::default()),
+        Ok(bytes) => serde_json::from_slice(&bytes).ok().map(|review| (review, Some(bytes))),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Some((Review::default(), None)),
         Err(_) => None,
     }
 }
@@ -138,7 +280,7 @@ fn read_review(path: &Path) -> Option<Review> {
 /// ones, and returns that name. Returns `None` if the file has gone, which
 /// means another process moved it first.
 fn set_aside(path: &Path) -> io::Result<Option<PathBuf>> {
-    // Two processes moving different bad files at the same instant can pick the same free name, which is accepted as too narrow to matter.
+    // Callers hold this review's stable sibling lock while selecting the name.
     let mut free = path.with_extension("json.corrupt");
     let mut n = 0;
     while free.exists() {
@@ -185,6 +327,233 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn save_current(store: &Store, id: &ReviewId, review: &Review) -> Result<SaveOutcome> {
+        let version = store.load(id).version;
+        store.save(id, review, &version)
+    }
+
+    fn notes(body: &str) -> Review {
+        Review { comments: vec![comment(body)], ..Review::default() }
+    }
+
+    fn conflict(outcome: SaveOutcome) -> PathBuf {
+        match outcome {
+            SaveOutcome::Conflict(path) => path,
+            SaveOutcome::Saved => panic!("stale snapshot replaced the canonical review"),
+        }
+    }
+
+    #[test]
+    fn stale_sessions_preserve_newer_notes_and_every_conflicting_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let first = Store::new(dir.path());
+        let second = Store::new(dir.path());
+        let id = ReviewId::Branch("feat".into());
+        let first_version = first.load(&id).version;
+        let second_version = second.load(&id).version;
+        assert_eq!(first.save(&id, &notes("newer"), &first_version).unwrap(), SaveOutcome::Saved);
+        let first_recovery = conflict(second.save(&id, &notes("local"), &second_version).unwrap());
+        let second_recovery = conflict(second.save(&id, &notes("local plus another note"), &second_version).unwrap());
+        assert_ne!(first_recovery, second_recovery);
+        assert_eq!(first.load(&id).review, notes("newer"));
+        assert_eq!(read_review(&first_recovery).unwrap().0, notes("local"));
+        assert_eq!(read_review(&second_recovery).unwrap().0, notes("local plus another note"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(first_recovery).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn stale_clear_cannot_erase_new_notes_or_reviewed_marks() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Commit("abc".into());
+        let mut newer = notes("keep");
+        newer.reviewed.insert("a.rs".into(), 42);
+        let editor = store.load(&id).version;
+        store.save(&id, &newer, &editor).unwrap();
+        let stale = store.load(&id).version;
+        newer.comments.push(comment("another session added this"));
+        store.save(&id, &newer, &editor).unwrap();
+        let recovery = conflict(store.save(&id, &Review::default(), &stale).unwrap());
+        assert_eq!(store.load(&id).review, newer);
+        assert_eq!(read_review(&recovery).unwrap().0, Review::default());
+    }
+
+    #[test]
+    fn cloned_effect_versions_advance_but_independent_states_do_not() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Commit("shared-by-two-detached-worktrees".into());
+        let first = store.load(&id).version;
+        let later_effect = first.clone();
+        let other_worktree = store.load(&id).version;
+        store.save(&id, &notes("first edit"), &first).unwrap();
+        assert_eq!(store.save(&id, &notes("second edit"), &later_effect).unwrap(), SaveOutcome::Saved);
+        conflict(store.save(&id, &notes("other worktree"), &other_worktree).unwrap());
+        assert_eq!(store.load(&id).review, notes("second edit"));
+    }
+
+    #[test]
+    fn legacy_reviews_upgrade_and_external_same_revision_edits_are_detected() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("legacy".into());
+        fs::create_dir_all(&store.dir).unwrap();
+        fs::write(store.path_for(&id), serde_json::to_vec(&notes("legacy")).unwrap()).unwrap();
+        let loaded = store.load(&id);
+        assert_eq!(loaded.review, notes("legacy"));
+        assert_eq!(store.save(&id, &notes("upgraded"), &loaded.version).unwrap(), SaveOutcome::Saved);
+        let bytes = fs::read(store.path_for(&id)).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["_branchdiff_revision"].is_string());
+        json["comments"][0]["body"] = "external edit preserving the revision field".into();
+        fs::write(store.path_for(&id), serde_json::to_vec(&json).unwrap()).unwrap();
+        conflict(store.save(&id, &notes("stale"), &loaded.version).unwrap());
+        assert_eq!(store.load(&id).review.comments[0].body, "external edit preserving the revision field");
+    }
+
+    #[test]
+    fn a_deleted_review_is_not_silently_recreated_by_a_stale_session() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("feat".into());
+        let version = store.load(&id).version;
+        store.save(&id, &notes("before deletion"), &version).unwrap();
+        fs::remove_file(store.path_for(&id)).unwrap();
+        let recovery = conflict(store.save(&id, &notes("local after deletion"), &version).unwrap());
+        assert!(!store.path_for(&id).exists());
+        assert_eq!(read_review(&recovery).unwrap().0, notes("local after deletion"));
+    }
+
+    #[test]
+    fn restoring_identical_notes_still_creates_a_new_persisted_revision() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("feat".into());
+        let editor = store.load(&id).version;
+        store.save(&id, &notes("original"), &editor).unwrap();
+        let stale = store.load(&id).version;
+        store.save(&id, &notes("intermediate"), &editor).unwrap();
+        store.save(&id, &notes("original"), &editor).unwrap();
+        conflict(store.save(&id, &notes("stale edit"), &stale).unwrap());
+        assert_eq!(store.load(&id).review, notes("original"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_read_only_locks_work_without_changing_existing_permissions_or_contents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path());
+        let id = ReviewId::Branch("shared".into());
+        let version = store.load(&id).version;
+        store.save(&id, &notes("first"), &version).unwrap();
+        let path = store.path_for(&id).with_extension("json.lock");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        fs::write(&path, "existing lock contents").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let loaded = store.load(&id);
+        assert_eq!(loaded.review, notes("first"));
+        assert_eq!(store.save(&id, &notes("second"), &loaded.version).unwrap(), SaveOutcome::Saved);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o444);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing lock contents");
+        // Permit TempDir's ordinary cleanup on platforms with stricter rules.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {}", path.display());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    struct WriterChildren(Vec<std::process::Child>);
+
+    impl Drop for WriterChildren {
+        fn drop(&mut self) {
+            // A broken lock or readiness assertion must fail this test rather
+            // than leave child processes alive and hang the whole CI job.
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Runs only when launched by the race test below, in a fresh process with
+    /// its own native lock handle and independent baseline.
+    #[test]
+    fn writer_subprocess() {
+        let Some(root) = std::env::var_os("BRANCHDIFF_WRITER_ROOT") else { return };
+        let root = PathBuf::from(root);
+        let name = std::env::var("BRANCHDIFF_WRITER_NAME").unwrap();
+        let store = Store::new(&root);
+        let id = ReviewId::Branch("concurrent".into());
+        let version = store.load(&id).version;
+        fs::write(root.join(format!("{name}.ready")), "ready").unwrap();
+        wait_for(&root.join("go"));
+        let outcome = store.save(&id, &notes(&name), &version).unwrap();
+        let result = match outcome {
+            SaveOutcome::Saved => "saved".to_string(),
+            SaveOutcome::Conflict(path) => path.to_string_lossy().into_owned(),
+        };
+        fs::write(root.join(format!("{name}.result")), result).unwrap();
+    }
+
+    #[test]
+    fn separate_processes_competing_for_one_revision_keep_both_reviews() {
+        let dir = TempDir::new().unwrap();
+        let mut children = WriterChildren(Vec::new());
+        for name in ["one", "two"] {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "store::tests::writer_subprocess", "--nocapture"])
+                .env("BRANCHDIFF_WRITER_ROOT", dir.path())
+                .env("BRANCHDIFF_WRITER_NAME", name)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            children.0.push(child);
+        }
+        for name in ["one", "two"] {
+            wait_for(&dir.path().join(format!("{name}.ready")));
+        }
+        fs::write(dir.path().join("go"), "go").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for child in &mut children.0 {
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(std::time::Instant::now() < deadline, "writer process did not release its lock");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                use std::io::Read;
+                pipe.read_to_string(&mut stderr).unwrap();
+            }
+            assert!(status.success(), "{stderr}");
+        }
+        let outcomes: Vec<_> = ["one", "two"]
+            .map(|name| fs::read_to_string(dir.path().join(format!("{name}.result"))).unwrap())
+            .into_iter()
+            .collect();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.as_str() == "saved").count(), 1);
+        let recovery = outcomes.iter().find(|outcome| outcome.as_str() != "saved").unwrap();
+        let store = Store::new(dir.path());
+        let canonical = store.load(&ReviewId::Branch("concurrent".into())).review;
+        let recovered = read_review(Path::new(recovery)).unwrap().0;
+        let mut bodies = vec![canonical.comments[0].body.as_str(), recovered.comments[0].body.as_str()];
+        bodies.sort();
+        assert_eq!(bodies, ["one", "two"]);
+    }
+
     fn comment(body: &str) -> Comment {
         Comment { path: "a.rs".into(), line: 3, side: Side::New, line_text: "let x = 1;".into(), body: body.into() }
     }
@@ -196,7 +565,7 @@ mod tests {
         let mut r = Review::default();
         r.comments.push(comment("fix"));
         r.reviewed.insert("a.rs".into(), 42);
-        store.save(&ReviewId::Branch("feat".into()), &r).unwrap();
+        save_current(&store, &ReviewId::Branch("feat".into()), &r).unwrap();
         assert_eq!(store.load(&ReviewId::Branch("feat".into())).review, r);
     }
 
@@ -212,7 +581,7 @@ mod tests {
         let store = Store::new(dir.path());
         let mut r = Review::default();
         r.comments.push(comment("slash"));
-        store.save(&ReviewId::Branch("feature/x".into()), &r).unwrap();
+        save_current(&store, &ReviewId::Branch("feature/x".into()), &r).unwrap();
         assert_eq!(store.load(&ReviewId::Branch("feature-x".into())).review, Review::default());
         assert_eq!(store.load(&ReviewId::Branch("feature/x".into())).review, r);
     }
@@ -221,7 +590,7 @@ mod tests {
     fn detached_head_is_keyed_by_commit() {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
-        store.save(&ReviewId::Commit("abc".into()), &Review::default()).unwrap();
+        save_current(&store, &ReviewId::Commit("abc".into()), &Review::default()).unwrap();
         assert!(store.path_for(&ReviewId::Commit("abc".into())).to_string_lossy().contains("commit-"));
     }
 
@@ -233,12 +602,12 @@ mod tests {
         let id = ReviewId::Branch("feat".into());
         let mut r = Review::default();
         r.comments.push(comment("keep"));
-        store.save(&id, &r).unwrap();
+        save_current(&store, &id, &r).unwrap();
         let old = std::fs::read(store.path_for(&id)).unwrap();
         if !make_store_dir_read_only(&store) {
             return;
         }
-        let saved = store.save(&id, &Review::default());
+        let saved = save_current(&store, &id, &Review::default());
         set_store_dir_mode(&store, 0o755);
         assert!(saved.is_err());
         assert_eq!(std::fs::read(store.path_for(&id)).unwrap(), old);
@@ -249,7 +618,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         let id = ReviewId::Branch("feat".into());
-        store.save(&id, &Review::default()).unwrap();
+        save_current(&store, &id, &Review::default()).unwrap();
         let path = store.path_for(&id);
         std::thread::scope(|s| {
             for writer in 0..4 {
@@ -257,14 +626,21 @@ mod tests {
                 s.spawn(move || {
                     let r = Review { comments: vec![comment("body"); 1 + writer * 200], ..Review::default() };
                     for _ in 0..5 {
-                        store.save(id, &r).unwrap();
+                        save_current(store, id, &r).unwrap();
                         let saved = std::fs::read(path).unwrap();
                         serde_json::from_slice::<Review>(&saved).unwrap();
                     }
                 });
             }
         });
-        assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 1, "no temp files left behind");
+        assert!(
+            std::fs::read_dir(&store.dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp")),
+            "no temp files left behind"
+        );
     }
 
     #[test]
@@ -272,10 +648,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         let id = ReviewId::Branch("feat".into());
-        store.save(&id, &Review::default()).unwrap();
+        save_current(&store, &id, &Review::default()).unwrap();
         let mut r = Review::default();
         r.comments.push(comment("newer"));
-        store.save(&id, &r).unwrap();
+        save_current(&store, &id, &r).unwrap();
         assert_eq!(store.load(&id).review, r);
     }
 
@@ -286,10 +662,10 @@ mod tests {
         let id = ReviewId::Branch("feat".into());
         let mut r = Review::default();
         r.comments.push(comment("in memory"));
-        store.save(&id, &r).unwrap();
+        save_current(&store, &id, &r).unwrap();
         let loaded = store.load(&id);
         std::fs::write(store.path_for(&id), "garbled").unwrap();
-        store.save(&id, &loaded.review).unwrap();
+        save_current(&store, &id, &loaded.review).unwrap();
         assert_eq!(std::fs::read(store.path_for(&id).with_extension("json.corrupt")).unwrap(), b"garbled");
         assert_eq!(store.load(&id).review, r);
     }
@@ -307,7 +683,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("branchdiff"), "a file, not a directory").unwrap();
         let store = Store::new(dir.path());
-        let message = store.save(&ReviewId::Branch("feat".into()), &Review::default()).unwrap_err().to_string();
+        let message =
+            save_current(&store, &ReviewId::Branch("feat".into()), &Review::default()).unwrap_err().to_string();
         assert!(message.contains("os error"), "{message}");
         assert!(message.contains(&dir.path().join("branchdiff").display().to_string()), "{message}");
     }
@@ -321,7 +698,7 @@ mod tests {
         for name in &names {
             let mut r = Review::default();
             r.comments.push(comment(name));
-            store.save(&ReviewId::Branch(name.clone()), &r).unwrap();
+            save_current(&store, &ReviewId::Branch(name.clone()), &r).unwrap();
         }
         for name in &names {
             assert_eq!(store.load(&ReviewId::Branch(name.clone())).review.comments[0].body, *name);
@@ -342,14 +719,14 @@ mod tests {
         let contents: [&[u8]; 4] = [b"not json", b"{\xff}", b"", br#"{"comments":[{"path":"a"#];
         for (i, bytes) in contents.into_iter().enumerate() {
             let id = ReviewId::Branch(format!("branch{i}"));
-            store.save(&id, &Review::default()).unwrap();
+            save_current(&store, &id, &Review::default()).unwrap();
             std::fs::write(store.path_for(&id), bytes).unwrap();
             let loaded = store.load(&id);
             assert_eq!(loaded.review, Review::default());
             assert_eq!(loaded.left_in_place, None);
             let moved = loaded.moved_aside.unwrap();
             assert_eq!(moved, store.path_for(&id).with_extension("json.corrupt"));
-            store.save(&id, &Review::default()).unwrap();
+            save_current(&store, &id, &Review::default()).unwrap();
             assert_eq!(std::fs::read(moved).unwrap(), bytes);
         }
     }
@@ -375,7 +752,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::new(dir.path());
         let id = ReviewId::Branch("feat".into());
-        store.save(&id, &Review::default()).unwrap();
+        save_current(&store, &id, &Review::default()).unwrap();
         let mut moved = Vec::new();
         for text in ["first", "second"] {
             std::fs::write(store.path_for(&id), text).unwrap();
@@ -396,7 +773,7 @@ mod tests {
         assert!(!reported(store.load(&id)));
         let mut r = Review::default();
         r.comments.push(comment("keep"));
-        store.save(&id, &r).unwrap();
+        save_current(&store, &id, &r).unwrap();
         let loaded = store.load(&id);
         assert_eq!(loaded.review, r);
         assert!(!reported(loaded));
@@ -416,7 +793,7 @@ mod tests {
 
     #[cfg(unix)]
     fn corrupt_file_in_read_only_dir(store: &Store, id: &ReviewId) -> bool {
-        store.save(id, &Review::default()).unwrap();
+        save_current(store, id, &Review::default()).unwrap();
         std::fs::write(store.path_for(id), "not json").unwrap();
         make_store_dir_read_only(store)
     }
@@ -452,7 +829,7 @@ mod tests {
         if !corrupt_file_in_read_only_dir(&store, &id) {
             return;
         }
-        let message = store.save(&id, &Review::default()).unwrap_err().to_string();
+        let message = save_current(&store, &id, &Review::default()).unwrap_err().to_string();
         set_store_dir_mode(&store, 0o755);
         assert!(message.contains("os error"), "{message}");
         assert!(message.contains("could not move aside"), "{message}");
@@ -472,7 +849,7 @@ mod tests {
         set_store_dir_mode(&store, 0o755);
         let mut r = Review::default();
         r.comments.push(comment("new"));
-        store.save(&id, &r).unwrap();
+        save_current(&store, &id, &r).unwrap();
         assert_eq!(std::fs::read(store.path_for(&id).with_extension("json.corrupt")).unwrap(), b"not json");
         assert_eq!(store.load(&id).review, r);
     }
