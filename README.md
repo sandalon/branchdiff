@@ -65,7 +65,7 @@ Comments and reviewed marks are stored as JSON under `<git-common-dir>/branchdif
 
 - Files marked reviewed in earlier versions need to be marked again after upgrading; comments are retained. New marks also track permission and rename changes.
 - On Linux without a clipboard manager, copied text is lost when `branchdiff` quits.
-- `e` picks the editor in git's order (`GIT_EDITOR`, `core.editor`, `VISUAL`, `EDITOR`, then `vi`, or `notepad` on Windows) but runs it without a shell, so variables in the value aren't expanded. On Windows, VS Code may need `EDITOR=code.cmd`.
+- `e` picks the editor in git's order (`GIT_EDITOR`, `core.editor`, `VISUAL`, `EDITOR`, then `vi`, or `notepad` on Windows) but runs it without a shell, so variables in the value aren't expanded. On Windows, VS Code may need `EDITOR=code.cmd`. As with `git commit`, a `core.editor` set in the repository's own `.git/config` is honored, so pressing `e` in a repository you didn't create runs whatever program it names; set `GIT_EDITOR` to override it. Branchdiff's own git commands ignore `core.fsmonitor`, so merely opening a repository never runs its hooks.
 - A commit inside a real submodule may not show the "changed" badge until `r` is pressed.
 - The "changed" badge stays on after an edit is reverted, until `r` is pressed. A change that only moves the merge base doesn't raise it.
 - On Linux, a low inotify limit makes the badge incomplete and shows a notice.
