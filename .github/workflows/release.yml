@@ -58,6 +58,9 @@ jobs:
         working-directory: dist
         run: sha256sum branchdiff-* > SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        # Private repositories require GitHub Enterprise Cloud. Opt in only
+        # when that feature is available; checksums and releases work on all plans.
+        if: github.event.repository.private == false || vars.ENABLE_PRIVATE_ATTESTATIONS == 'true'
         with:
           subject-path: dist/branchdiff-*
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
