@@ -96,6 +96,9 @@ where
         // Stops `git diff` refreshing the index, which takes `index.lock` and
         // can race a concurrent `git add`. GIT_OPTIONAL_LOCKS does not cover it.
         .args(["-c", "diff.autoRefreshIndex=false"])
+        // A repository's own config could name an fsmonitor hook, which `git
+        // status` and `git diff` would run as the user just for opening it.
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
         // Stops `git status` rewriting the index, which the watcher would see.
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -639,6 +642,31 @@ mod tests {
         let out = run_limited(dir.path(), ["hash-object", "--stdin"], 4096, Duration::from_secs(30)).unwrap();
         assert_eq!(out.code, Some(0));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+    }
+
+    /// A repository's own config must not run code when branchdiff opens it.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_fsmonitor_hook_is_never_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("hook-ran");
+        let hook = dir.path().join("fsmonitor-hook");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert_eq!(run(&repo, ["init", "-q"]).unwrap().code, Some(0));
+        let set =
+            Command::new("git").current_dir(&repo).args(["config", "core.fsmonitor"]).arg(&hook).status().unwrap();
+        assert!(set.success());
+        std::fs::write(repo.join("a"), "x\n").unwrap();
+        assert_eq!(run(&repo, ["add", "a"]).unwrap().code, Some(0));
+        let _ = std::fs::remove_file(&marker);
+
+        fingerprint(&repo).unwrap();
+        diff_with_limit(&repo, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", 4096).unwrap();
+        assert!(!marker.exists(), "the repository's fsmonitor hook ran");
     }
 
     #[test]
