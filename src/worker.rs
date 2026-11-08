@@ -12,6 +12,10 @@ use std::thread;
 /// panic, which `guarded` contains, from one that ends the program.
 pub const WORKER_THREAD: &str = "branchdiff-worker";
 
+/// Loads that may run at once. Each may briefly hold up to `MAX_DIFF_BYTES`
+/// while it reads and parses, so this bounds what loads cost together.
+pub const MAX_CONCURRENT_LOADS: usize = 2;
+
 const PANIC_MESSAGE_CHARS: usize = 120;
 const PANIC_NO_MESSAGE: &str = "internal error in a background job";
 
@@ -235,32 +239,40 @@ impl Lists {
     }
 }
 
+/// Loads run on threads of their own, at most `MAX_CONCURRENT_LOADS` of them,
+/// so that waiting loads never keep probes and highlights from a thread.
 pub struct Pool {
     jobs: Sender<Job>,
+    loads: Sender<Job>,
 }
 
 impl Pool {
     pub fn new(threads: usize, msgs: Sender<Msg>) -> Self {
-        let (jobs, rx): (Sender<Job>, Receiver<Job>) = unbounded();
-        for _ in 0..threads {
-            let (rx, msgs) = (rx.clone(), msgs.clone());
-            // A failed spawn leaves a smaller pool, which is better than ending
-            // the program. If every spawn fails, `submit` discards all jobs and
-            // `Loads` holds each worktree as running for good.
-            let _ = thread::Builder::new().name(WORKER_THREAD.into()).spawn(move || {
-                for job in rx {
-                    if msgs.send(run(job)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        Self { jobs }
+        Self { jobs: spawn(threads, &msgs), loads: spawn(threads.min(MAX_CONCURRENT_LOADS), &msgs) }
     }
 
     pub fn submit(&self, job: Job) {
-        let _ = self.jobs.send(job);
+        let lane = if matches!(job, Job::Load { .. }) { &self.loads } else { &self.jobs };
+        let _ = lane.send(job);
     }
+}
+
+fn spawn(threads: usize, msgs: &Sender<Msg>) -> Sender<Job> {
+    let (jobs, rx): (Sender<Job>, Receiver<Job>) = unbounded();
+    for _ in 0..threads {
+        let (rx, msgs) = (rx.clone(), msgs.clone());
+        // A failed spawn leaves a smaller pool, which is better than ending
+        // the program. If every spawn fails, `submit` discards all jobs and
+        // `Loads` holds each worktree as running for good.
+        let _ = thread::Builder::new().name(WORKER_THREAD.into()).spawn(move || {
+            for job in rx {
+                if msgs.send(run(job)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    jobs
 }
 
 fn run(job: Job) -> Msg {
@@ -353,6 +365,7 @@ fn load(path: &Path, base: &str) -> Result<Loaded, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     const PANIC_PATH: &str = "/branchdiff-test-panic";
@@ -362,6 +375,40 @@ mod tests {
     pub(super) fn panic_if_marked(path: &Path) {
         if path == Path::new(PANIC_PATH) {
             panic!("test panic on {}", thread::current().name().unwrap_or("an unnamed thread"));
+        }
+        // A job on a path named HOLD_NAME runs until that path is removed.
+        if path.file_name() == Some(std::ffi::OsStr::new(HOLD_NAME)) {
+            HELD.fetch_add(1, Ordering::SeqCst);
+            while path.exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            HELD.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    const HOLD_NAME: &str = "branchdiff-test-hold";
+    static HELD: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn loads_beyond_the_limit_wait_without_holding_up_other_jobs() {
+        let (tx, rx) = unbounded();
+        let pool = Pool::new(4, tx);
+        let dirs: Vec<_> = (0..MAX_CONCURRENT_LOADS + 2).map(|_| tempfile::TempDir::new().unwrap()).collect();
+        for dir in &dirs {
+            let path = dir.path().join(HOLD_NAME);
+            std::fs::write(&path, "").unwrap();
+            pool.submit(Job::Load { path, base: "develop".into() });
+        }
+        let key = CacheKey { worktree: "a".into(), base_commit: "b".into(), head: "h".into(), fingerprint: 1 };
+        pool.submit(Job::Highlight { key, file_index: 0, diffs: Arc::new(vec![]) });
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Msg::Highlighted { .. }));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(HELD.load(Ordering::SeqCst), MAX_CONCURRENT_LOADS);
+        for dir in &dirs {
+            std::fs::remove_file(dir.path().join(HOLD_NAME)).unwrap();
+        }
+        for _ in &dirs {
+            assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Msg::Loaded { .. }));
         }
     }
 

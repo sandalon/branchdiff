@@ -7,7 +7,7 @@ use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
@@ -73,6 +73,7 @@ pub const REPO_ENV_VARS: &[&str] = &[
     "GIT_EXTERNAL_DIFF",
 ];
 
+#[derive(Debug)]
 pub struct Output {
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
@@ -117,23 +118,146 @@ fn spawn_error(cwd: &Path, e: std::io::Error) -> GitError {
     }
 }
 
-fn output(raw: std::process::Output) -> Output {
-    Output {
-        code: raw.status.code(),
-        stdout: raw.stdout,
-        stderr: String::from_utf8_lossy(&raw.stderr).trim().to_string(),
-    }
-}
+/// Longest a git command may run. Generous, since a cold `git status` of a
+/// very large checkout can take a while, but a hung hook or filter must not
+/// hold a worker for good.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Most stdout kept from a git command other than `diff`, which has its own
+/// limit. Status and file listings of very large checkouts stay well under it.
+pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Stderr beyond this is read and discarded, so a noisy hook can neither fill
+/// memory nor block git on a full pipe.
+pub const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 pub fn run<I, S>(cwd: &Path, args: I) -> Result<Output, GitError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_limited(cwd, args, MAX_OUTPUT_BYTES, GIT_TIMEOUT)
+}
+
+fn run_limited<I, S>(cwd: &Path, args: I, limit: usize, timeout: Duration) -> Result<Output, GitError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    match exec(cwd, command(cwd, args), None, limit, timeout)? {
+        Exec::Done(out) => Ok(out),
+        Exec::TooLarge => Err(GitError::Failed(format!("git output exceeded {} MiB", limit / (1024 * 1024)))),
+    }
+}
+
+enum Exec {
+    Done(Output),
+    TooLarge,
+}
+
+/// Runs `cmd` with `input` on its stdin, or none, keeping at most `limit`
+/// bytes of stdout and `MAX_STDERR_BYTES` of stderr. A command that writes
+/// more than `limit` or outlives `timeout` is killed, with anything it
+/// started on Unix, and reaped. Readers left blocked by a process that
+/// escaped the kill hold only bounded buffers and end when it closes the pipe.
+fn exec(
+    cwd: &Path,
+    mut cmd: Command,
+    input: Option<Vec<u8>>,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Exec, GitError> {
     if !cwd.is_dir() {
         return Err(cwd_gone(cwd));
     }
-    command(cwd, args).output().map(output).map_err(|e| spawn_error(cwd, e))
+    let deadline = Instant::now() + timeout;
+    // Without a stdin of its own, git would share the terminal with the TUI.
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Its own process group, so that a kill reaches hooks and filters too.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().map_err(|e| spawn_error(cwd, e))?;
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        // Written from its own thread, because git can fill its stdout pipe
+        // while we are still filling its stdin.
+        thread::spawn(move || stdin.write_all(&bytes));
+    }
+    let stderr = read_prefix(child.stderr.take().expect("stderr was piped"), MAX_STDERR_BYTES, false);
+    let stdout = read_prefix(child.stdout.take().expect("stdout was piped"), limit.saturating_add(1), true);
+    let stdout = match stdout.recv_deadline(deadline) {
+        Ok(Ok(bytes)) if bytes.len() > limit => {
+            kill(&mut child);
+            return Ok(Exec::TooLarge);
+        }
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            kill(&mut child);
+            return Err(GitError::Failed(e.to_string()));
+        }
+        Err(_) => return Err(timed_out(&mut child, timeout)),
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => return Err(timed_out(&mut child, timeout)),
+            // Stdout has closed, so git is all but done: this is rarely reached.
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(e) => return Err(GitError::Failed(e.to_string())),
+        }
+    };
+    // A hook that outlives git could hold stderr open; its text isn't needed.
+    let stderr = stderr.recv_deadline(deadline.min(Instant::now() + Duration::from_millis(100)));
+    let stderr = stderr.ok().and_then(Result::ok).unwrap_or_default();
+    Ok(Exec::Done(Output { code: status.code(), stdout, stderr: String::from_utf8_lossy(&stderr).trim().to_string() }))
+}
+
+/// Reads `pipe` on its own thread, keeping its first `keep` bytes. With `stop`
+/// it stops there, and otherwise drains the rest so the writer never blocks.
+fn read_prefix(
+    mut pipe: impl Read + Send + 'static,
+    keep: usize,
+    stop: bool,
+) -> crossbeam_channel::Receiver<std::io::Result<Vec<u8>>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut chunk = [0; 8192];
+        let result = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break Ok(kept),
+                Ok(n) => {
+                    let room = keep - kept.len();
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                    if stop && n >= room {
+                        break Ok(kept);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn timed_out(child: &mut std::process::Child, timeout: Duration) -> GitError {
+    kill(child);
+    GitError::Failed(format!("git timed out after {}s", timeout.as_secs_f32()))
+}
+
+/// Kills `child` and everything in its process group, then reaps it.
+fn kill(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: plain syscall. The group was created for this child, which
+        // has not been reaped yet, so its id cannot have been reused.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn cwd_gone(cwd: &Path) -> GitError {
@@ -347,26 +471,17 @@ pub fn untracked(cwd: &Path) -> Result<Vec<String>, GitError> {
 /// and the index, since a tracked file is never ignored. End a path with `/` to
 /// test a directory that no longer exists, which `target/` could not match otherwise.
 pub fn any_not_ignored(cwd: &Path, paths: &[PathBuf]) -> Result<bool, GitError> {
-    if !cwd.is_dir() {
-        return Err(cwd_gone(cwd));
-    }
     let mut input = Vec::new();
     for path in paths {
         input.extend_from_slice(path.to_string_lossy().as_bytes());
         input.push(0);
     }
-    let mut child = command(cwd, ["check-ignore", "-z", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| spawn_error(cwd, e))?;
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    // Written from a second thread, because git can fill its stdout pipe while
-    // we are still filling its stdin.
-    let writer = thread::spawn(move || stdin.write_all(&input));
-    let out = child.wait_with_output().map(output).map_err(|e| spawn_error(cwd, e))?;
-    let _ = writer.join();
+    let cmd = command(cwd, ["check-ignore", "-z", "--stdin"]);
+    let out = match exec(cwd, cmd, Some(input), MAX_OUTPUT_BYTES, GIT_TIMEOUT)? {
+        Exec::Done(out) => out,
+        // Git prints only paths it was given, so this can't really happen.
+        Exec::TooLarge => return Ok(true),
+    };
     // Exit code 1 means that nothing was ignored.
     if !matches!(out.code, Some(0 | 1)) {
         return Err(failed(out));
@@ -385,10 +500,7 @@ pub fn diff(cwd: &Path, merge_base: &str) -> Result<Vec<u8>, GitError> {
 }
 
 fn diff_with_limit(cwd: &Path, merge_base: &str, limit: usize) -> Result<Vec<u8>, GitError> {
-    if !cwd.is_dir() {
-        return Err(cwd_gone(cwd));
-    }
-    let mut cmd = command(
+    let cmd = command(
         cwd,
         [
             "-c",
@@ -414,45 +526,10 @@ fn diff_with_limit(cwd: &Path, merge_base: &str, limit: usize) -> Result<Vec<u8>
             "--",
         ],
     );
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| spawn_error(cwd, e))?;
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    // Drain concurrently so diagnostics cannot fill the pipe and block git.
-    // Keep only a bounded prefix, even when a hook or filter is very noisy.
-    let diagnostics = thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut chunk = [0; 8192];
-        while let Ok(n) = stderr.read(&mut chunk) {
-            if n == 0 {
-                break;
-            }
-            let keep = n.min((64 * 1024usize).saturating_sub(kept.len()));
-            kept.extend_from_slice(&chunk[..keep]);
-        }
-        kept
-    });
-    let mut bytes = Vec::new();
-    let read = stdout.by_ref().take(limit.saturating_add(1) as u64).read_to_end(&mut bytes);
-    let too_large = bytes.len() > limit;
-    if too_large || read.is_err() {
-        let _ = child.kill();
-    }
-    drop(stdout);
-    let status = child.wait();
-    let stderr = diagnostics.join().unwrap_or_default();
-    if too_large {
-        return Err(GitError::DiffTooLarge);
-    }
-    read.map_err(|e| GitError::Failed(e.to_string()))?;
-    let status = status.map_err(|e| GitError::Failed(e.to_string()))?;
-    if status.success() {
-        Ok(bytes)
-    } else {
-        Err(failed(Output {
-            code: status.code(),
-            stdout: Vec::new(),
-            stderr: String::from_utf8_lossy(&stderr).trim().into(),
-        }))
+    match exec(cwd, cmd, None, limit, GIT_TIMEOUT)? {
+        Exec::Done(out) if out.code == Some(0) => Ok(out.stdout),
+        Exec::Done(out) => Err(failed(Output { stdout: Vec::new(), ..out })),
+        Exec::TooLarge => Err(GitError::DiffTooLarge),
     }
 }
 
@@ -506,6 +583,65 @@ mod tests {
         assert_eq!(diff_with_limit(dir.path(), "HEAD", complete.len() - 1), Err(GitError::DiffTooLarge));
         // A rejected child was reaped and a later refresh can still succeed.
         assert_eq!(diff_with_limit(dir.path(), "HEAD", 4096).unwrap(), complete);
+    }
+
+    /// A repository whose aliases run `script` through the shell.
+    #[cfg(unix)]
+    fn alias_repo(script: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(run(dir.path(), ["init", "-q"]).unwrap().code, Some(0));
+        let alias = format!("!{script}");
+        assert_eq!(run(dir.path(), ["config", "alias.probe", &alias]).unwrap().code, Some(0));
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_never_ends_is_killed_at_its_deadline() {
+        let dir = alias_repo("sleep 30");
+        let started = std::time::Instant::now();
+        let result = run_limited(dir.path(), ["probe"], 1024, Duration::from_millis(300));
+        assert!(matches!(result, Err(GitError::Failed(ref e)) if e.contains("timed out")), "{result:?}");
+        // Killing the process group also ends the shell and `sleep`, which
+        // would otherwise hold the pipes open until they exit.
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_over_the_limit_is_rejected_without_being_buffered() {
+        let dir = alias_repo("yes");
+        let result = run_limited(dir.path(), ["probe"], 4096, Duration::from_secs(30));
+        assert!(matches!(result, Err(GitError::Failed(ref e)) if e.contains("exceeded")), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_is_drained_but_only_a_prefix_is_kept() {
+        let dir = alias_repo("yes noise | head -c 4194304 >&2; exit 3");
+        let out = run_limited(dir.path(), ["probe"], 4096, Duration::from_secs(30)).unwrap();
+        assert_eq!(out.code, Some(3));
+        assert!(out.stderr.len() <= MAX_STDERR_BYTES, "kept {} bytes", out.stderr.len());
+        assert!(out.stderr.starts_with("noise"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_command_does_not_wait_for_a_descendant_holding_stderr() {
+        let dir = alias_repo("sleep 3 >/dev/null &");
+        let started = Instant::now();
+        let out = run_limited(dir.path(), ["probe"], 4096, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.code, Some(0));
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn git_cannot_read_the_terminal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // `hash-object --stdin` would wait on an inherited terminal for good.
+        let out = run_limited(dir.path(), ["hash-object", "--stdin"], 4096, Duration::from_secs(30)).unwrap();
+        assert_eq!(out.code, Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
     }
 
     /// A repository's own config must not run code when branchdiff opens it.
