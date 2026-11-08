@@ -205,7 +205,7 @@ fn exec(
         }
     };
     // A hook that outlives git could hold stderr open; its text isn't needed.
-    let stderr = stderr.recv_deadline(deadline.max(Instant::now() + Duration::from_millis(100)));
+    let stderr = stderr.recv_deadline(deadline.min(Instant::now() + Duration::from_millis(100)));
     let stderr = stderr.ok().and_then(Result::ok).unwrap_or_default();
     Ok(Exec::Done(Output { code: status.code(), stdout, stderr: String::from_utf8_lossy(&stderr).trim().to_string() }))
 }
@@ -620,6 +620,16 @@ mod tests {
         assert_eq!(out.code, Some(3));
         assert!(out.stderr.len() <= MAX_STDERR_BYTES, "kept {} bytes", out.stderr.len());
         assert!(out.stderr.starts_with("noise"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_command_does_not_wait_for_a_descendant_holding_stderr() {
+        let dir = alias_repo("sleep 3 >/dev/null &");
+        let started = Instant::now();
+        let out = run_limited(dir.path(), ["probe"], 4096, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.code, Some(0));
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
     }
 
     #[test]
