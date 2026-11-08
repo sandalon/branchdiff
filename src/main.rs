@@ -360,10 +360,8 @@ fn save_review(app: &mut App, store: &Store, id: &ReviewId, review: &Review, ver
 /// Writes under the git common dir, so an export never appears as a change
 /// in the worktree being reviewed.
 fn write_export(rt: &Runtime, md: &str) -> String {
-    let dir = rt.common_dir.join("branchdiff/exports");
-    let path = dir.join("latest.md");
-    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, md)) {
-        Ok(()) => format!("Wrote {}", path.display()),
+    match branchdiff::export::write_file(&rt.common_dir, md) {
+        Ok(path) => format!("Wrote {}", path.display()),
         Err(e) => format!("Could not write export: {e}"),
     }
 }
