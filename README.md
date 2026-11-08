@@ -14,6 +14,13 @@ Download a binary for your platform from the latest release, or build from sourc
 cargo install --path .
 ```
 
+Each release lists every binary's SHA-256 in `SHA256SUMS` and has a build provenance attestation. To verify a download:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify branchdiff-<target> --repo sandalon/branchdiff
+```
+
 ## Usage
 
 From anywhere inside a repo:
