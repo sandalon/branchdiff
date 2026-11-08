@@ -69,12 +69,22 @@ fn code_span(text: &str) -> String {
 /// Renaming replaces a symlink at `latest.md` instead of writing through it,
 /// and a symlinked or foreign-owned directory on the way is refused.
 pub fn write_file(common_dir: &Path, md: &str) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        unix::write_file(common_dir, md)
+    }
+    #[cfg(not(unix))]
+    write_file_portable(common_dir, md)
+}
+
+#[cfg(not(unix))]
+fn write_file_portable(common_dir: &Path, md: &str) -> io::Result<PathBuf> {
     // `branchdiff` keeps its default mode: it also holds the review store,
     // whose locks other users of a shared repository may need to open.
     let store = common_dir.join("branchdiff");
     owned_dir(&store, &mut fs::DirBuilder::new())?;
     let dir = store.join("exports");
-    owned_dir(&dir, fs::DirBuilder::new().mode_private())?;
+    owned_dir(&dir, &mut fs::DirBuilder::new())?;
     let path = dir.join("latest.md");
     let (mut file, temp) = crate::store::create_unique(&dir, ".latest-", ".md.tmp")?;
     let written = file.write_all(md.as_bytes()).and_then(|()| file.sync_all());
@@ -87,7 +97,8 @@ pub fn write_file(common_dir: &Path, md: &str) -> io::Result<PathBuf> {
 }
 
 /// Creates `dir` with `builder` if needed, then checks that it is a real
-/// directory, not a symlink to one, and on Unix that it belongs to this user.
+/// directory, not a symlink to one.
+#[cfg(not(unix))]
 fn owned_dir(dir: &Path, builder: &mut fs::DirBuilder) -> io::Result<()> {
     match builder.create(dir) {
         Ok(()) => {}
@@ -98,29 +109,114 @@ fn owned_dir(dir: &Path, builder: &mut fs::DirBuilder) -> io::Result<()> {
     if !meta.file_type().is_dir() {
         return Err(io::Error::new(ErrorKind::InvalidData, format!("{} is not a directory", dir.display())));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        if meta.uid() != unsafe { libc::geteuid() } {
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                format!("{} belongs to another user", dir.display()),
-            ));
-        }
-    }
     Ok(())
 }
 
-trait PrivateDir {
-    fn mode_private(&mut self) -> &mut Self;
-}
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use std::ffi::{CStr, CString};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-impl PrivateDir for fs::DirBuilder {
-    fn mode_private(&mut self) -> &mut Self {
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(self, 0o700);
-        self
+    pub(super) fn write_file(common_dir: &Path, md: &str) -> io::Result<PathBuf> {
+        let common = fs::File::open(common_dir)?;
+        let store = owned_dir(&common, c"branchdiff", 0o777)?;
+        let exports = owned_dir(&store, c"exports", 0o700)?;
+        // Other users must not be able to swap the temporary name before the
+        // rename. Keep the store's shared lock permissions unchanged.
+        if exports.metadata()?.mode() & 0o022 != 0 {
+            return Err(io::Error::new(ErrorKind::PermissionDenied, "exports directory is writable by other users"));
+        }
+        write_at(&exports, md)?;
+        Ok(common_dir.join("branchdiff/exports/latest.md"))
+    }
+
+    fn owned_dir(parent: &fs::File, name: &CStr, mode: libc::mode_t) -> io::Result<fs::File> {
+        // SAFETY: parent is live and name is a NUL-terminated single component.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        // Hold the checked directory open: a concurrent rename or symlink swap
+        // of its pathname cannot redirect later operations to another directory.
+        // SAFETY: same live parent/name; successful open returns an owned fd.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was just opened and has no other owner.
+        let dir = unsafe { fs::File::from_raw_fd(fd) };
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if dir.metadata()?.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(ErrorKind::PermissionDenied, "export directory belongs to another user"));
+        }
+        Ok(dir)
+    }
+
+    fn write_at(dir: &fs::File, md: &str) -> io::Result<()> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let (mut file, name) = loop {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = CString::new(format!(".latest-{}-{n}.md.tmp", std::process::id())).unwrap();
+            // SAFETY: dir is live and name is NUL-terminated. O_EXCL refuses
+            // existing entries, including symlinks. Only this user can read it.
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: fd was just opened and has no other owner.
+                break (unsafe { fs::File::from_raw_fd(fd) }, name);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        };
+        let written = file.write_all(md.as_bytes()).and_then(|()| file.sync_all());
+        drop(file);
+        let result = written.and_then(|()| {
+            // SAFETY: both paths are single NUL-terminated components relative
+            // to the same live directory. Rename replaces a symlink itself.
+            if unsafe { libc::renameat(dir.as_raw_fd(), name.as_ptr(), dir.as_raw_fd(), c"latest.md".as_ptr()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+        if result.is_err() {
+            // SAFETY: name is the entry created above in this live directory.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        }
+        result
+    }
+
+    #[test]
+    fn a_directory_swap_cannot_redirect_the_write() {
+        let root = tempfile::TempDir::new().unwrap();
+        let common = fs::File::open(root.path()).unwrap();
+        let exports = owned_dir(&common, c"exports", 0o700).unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::rename(root.path().join("exports"), root.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.path().join("exports")).unwrap();
+        write_at(&exports, "notes").unwrap();
+        assert_eq!(fs::read_to_string(root.path().join("original/latest.md")).unwrap(), "notes");
+        assert_eq!(fs::read_dir(elsewhere).unwrap().count(), 0);
     }
 }
 
@@ -153,6 +249,18 @@ mod tests {
         let fresh = tempfile::TempDir::new().unwrap();
         let path = write_file(fresh.path(), "notes").unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_export_directory_writable_by_other_users_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let exports = dir.path().join("branchdiff/exports");
+        fs::create_dir_all(&exports).unwrap();
+        fs::set_permissions(&exports, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(write_file(dir.path(), "notes").unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_dir(exports).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
