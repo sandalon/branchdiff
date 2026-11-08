@@ -39,7 +39,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 criterion = "0.8"
 insta = "1"
-portable-pty = "0.8"
+portable-pty = "0.9"
 vt100 = "0.18.1"
 
 [profile.release]
