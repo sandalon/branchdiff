@@ -11,13 +11,34 @@ use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
+#[derive(Default)]
+struct TerminalResponses(Vec<u8>);
+
+impl vt100::Callbacks for TerminalResponses {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        // portable-pty 0.9 enables ConPTY cursor inheritance. ConPTY waits for
+        // this response before emitting the child's first frame.
+        if i1.is_none() && i2.is_none() && c == 'n' && params == [&[6][..]] {
+            let (row, col) = screen.cursor_position();
+            self.0.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+        }
+    }
+}
+
 struct Session {
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
     input: Box<dyn Write + Send>,
     output: Receiver<std::io::Result<Vec<u8>>>,
     bytes: Vec<u8>,
-    screen: vt100::Parser,
+    screen: vt100::Parser<TerminalResponses>,
     started: Instant,
 }
 
@@ -54,7 +75,12 @@ impl Session {
             input,
             output,
             bytes: Vec::new(),
-            screen: vt100::Parser::new(NonZeroU16::new(24).unwrap(), NonZeroU16::new(100).unwrap(), 0),
+            screen: vt100::Parser::new_with_callbacks(
+                NonZeroU16::new(24).unwrap(),
+                NonZeroU16::new(100).unwrap(),
+                0,
+                TerminalResponses::default(),
+            ),
             started,
         }
     }
@@ -74,6 +100,12 @@ impl Session {
             });
             let chunk = chunk.expect("could not read the terminal");
             self.screen.process(&chunk);
+            let replies = &mut self.screen.callbacks_mut().0;
+            if !replies.is_empty() {
+                self.input.write_all(replies).unwrap();
+                self.input.flush().unwrap();
+                replies.clear();
+            }
             self.bytes.extend(chunk);
             assert!(self.bytes.len() <= 256 * 1024, "terminal output exceeded the smoke-test limit");
         }
@@ -106,6 +138,22 @@ impl Drop for Session {
             let _ = self.child.wait();
         }
     }
+}
+
+#[test]
+fn terminal_answers_cursor_queries_across_read_boundaries() {
+    let mut parser = vt100::Parser::new_with_callbacks(
+        NonZeroU16::new(24).unwrap(),
+        NonZeroU16::new(100).unwrap(),
+        0,
+        TerminalResponses::default(),
+    );
+    parser.process(b"\x1b[");
+    parser.process(b"6n");
+    assert_eq!(parser.callbacks().0, b"\x1b[1;1R");
+    parser.callbacks_mut().0.clear();
+    parser.process(b"\x1b[5;7H\x1b[6n");
+    assert_eq!(parser.callbacks().0, b"\x1b[5;7R");
 }
 
 #[test]
