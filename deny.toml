@@ -1,0 +1,34 @@
+# Dependency policy, checked in CI by `cargo deny check advisories bans sources`.
+#
+# Advisories: every vulnerability fails the build. Unmaintained, unsound, and
+# yanked crates fail it too, anywhere in the tree, so that each one is looked
+# at and either replaced or listed in `ignore` below with the reason it is
+# acceptable. Informational notices that are none of these are only reported.
+# Revisit `ignore` whenever a listed crate's dependents release.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = [
+    # bincode 1.3.3 is unmaintained but has no known vulnerability, and its
+    # maintainers consider 1.3.3 complete. It comes in only through syntect,
+    # which uses it to load the syntax and theme dumps built into the binary,
+    # never untrusted data. syntect's `default-themes` and two-face's bundled
+    # syntaxes need those dumps, so it stays until syntect moves off bincode 1.
+    { id = "RUSTSEC-2025-0141", reason = "transitive via syntect; only decodes dumps built into the binary" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
