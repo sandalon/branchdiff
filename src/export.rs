@@ -1,5 +1,8 @@
 use crate::store::{Comment, Side};
 use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
 
 /// Enough to identify a line. A minified line could otherwise fill the prompt,
 /// and the agent can read the rest from the file.
@@ -60,9 +63,126 @@ fn code_span(text: &str) -> String {
     format!("{ticks}{pad}{text}{pad}{ticks}")
 }
 
+/// Writes `md` to `<common_dir>/branchdiff/exports/latest.md` and returns that
+/// path. The git common dir can be shared with other users, so the file is
+/// owner-private, and it is written to a new file then renamed into place.
+/// Renaming replaces a symlink at `latest.md` instead of writing through it,
+/// and a symlinked or foreign-owned directory on the way is refused.
+pub fn write_file(common_dir: &Path, md: &str) -> io::Result<PathBuf> {
+    // `branchdiff` keeps its default mode: it also holds the review store,
+    // whose locks other users of a shared repository may need to open.
+    let store = common_dir.join("branchdiff");
+    owned_dir(&store, &mut fs::DirBuilder::new())?;
+    let dir = store.join("exports");
+    owned_dir(&dir, fs::DirBuilder::new().mode_private())?;
+    let path = dir.join("latest.md");
+    let (mut file, temp) = crate::store::create_unique(&dir, ".latest-", ".md.tmp")?;
+    let written = file.write_all(md.as_bytes()).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| fs::rename(&temp, &path)) {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// Creates `dir` with `builder` if needed, then checks that it is a real
+/// directory, not a symlink to one, and on Unix that it belongs to this user.
+fn owned_dir(dir: &Path, builder: &mut fs::DirBuilder) -> io::Result<()> {
+    match builder.create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::new(ErrorKind::InvalidData, format!("{} is not a directory", dir.display())));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} belongs to another user", dir.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+trait PrivateDir {
+    fn mode_private(&mut self) -> &mut Self;
+}
+
+impl PrivateDir for fs::DirBuilder {
+    fn mode_private(&mut self) -> &mut Self {
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(self, 0o700);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_the_export_under_the_common_dir_and_replaces_it_next_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_file(dir.path(), "first").unwrap();
+        assert_eq!(path, dir.path().join("branchdiff/exports/latest.md"));
+        assert_eq!(write_file(dir.path(), "second").unwrap(), path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        // No temporary files are left behind.
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_are_owner_private_even_when_replacing_a_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let exports = dir.path().join("branchdiff/exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        std::fs::write(exports.join("latest.md"), "old").unwrap();
+        std::fs::set_permissions(exports.join("latest.md"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = write_file(dir.path(), "notes").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let fresh = tempfile::TempDir::new().unwrap();
+        let path = write_file(fresh.path(), "notes").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_latest_md_is_replaced_not_followed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let exports = dir.path().join("branchdiff/exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        std::os::unix::fs::symlink(&victim, exports.join("latest.md")).unwrap();
+        let path = write_file(dir.path(), "notes").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_file());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "notes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_export_directory_is_rejected() {
+        for link in ["branchdiff", "branchdiff/exports"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let elsewhere = dir.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::create_dir_all(dir.path().join(link).parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.path().join(link)).unwrap();
+            assert!(write_file(dir.path(), "notes").is_err(), "{link} was followed");
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        }
+    }
 
     fn c(path: &str, line: u32, body: &str) -> Comment {
         Comment { path: path.into(), line, side: Side::New, line_text: "code".into(), body: body.into() }

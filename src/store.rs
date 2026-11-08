@@ -255,7 +255,7 @@ impl Store {
 /// Creates a new owner-private file in `dir` with a name no other writer has.
 /// Unlike `tempfile`, std opens long Windows paths and sets no temporary
 /// attribute that a persisted review would keep.
-fn create_unique(dir: &Path, prefix: &str, suffix: &str) -> io::Result<(fs::File, PathBuf)> {
+pub(crate) fn create_unique(dir: &Path, prefix: &str, suffix: &str) -> io::Result<(fs::File, PathBuf)> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     loop {
