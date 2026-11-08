@@ -14,6 +14,18 @@ Download a binary for your platform from the latest release, or build from sourc
 cargo install --path .
 ```
 
+Releases produced by this workflow list every binary's SHA-256 in `SHA256SUMS`. Download it alongside your binary, then verify the checksum:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+Public repositories also publish build provenance attestations. Private repositories require GitHub Enterprise Cloud and the repository Actions variable `ENABLE_PRIVATE_ATTESTATIONS=true` to enable them. When an attestation is available, verify it with:
+
+```sh
+gh attestation verify branchdiff-<target> --repo sandalon/branchdiff
+```
+
 ## Usage
 
 From anywhere inside a repo:
