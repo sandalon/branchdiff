@@ -73,6 +73,16 @@ A blank `base` counts as unset, and an unusable config file is ignored with a no
 
 Comments and reviewed marks are stored as JSON under `<git-common-dir>/branchdiff/`, one file per branch, so they survive a worktree being removed and recreated — and they never modify a worktree. Review files are private to their owner, so another user sharing the same `.git` sees theirs moved aside.
 
+## Troubleshooting
+
+Branchdiff keeps a log of startup details, errors, timings, and git commands that fail or take longer than a second. Print its location with:
+
+```sh
+branchdiff --log-path
+```
+
+By default it is `%LOCALAPPDATA%\branchdiff\branchdiff.log` on Windows, `~/Library/Logs/branchdiff/branchdiff.log` on macOS, and `$XDG_STATE_HOME/branchdiff/branchdiff.log` (or `~/.local/state/branchdiff/branchdiff.log`) elsewhere. Set `BRANCHDIFF_LOG_FILE` to use another file. Run with `--verbose` to log every git command. The log is moved to `branchdiff.log.old` once it reaches 5 MiB. It contains repository paths and branch names, so check it before attaching it to an issue.
+
 ## Notes
 
 - Files marked reviewed in earlier versions need to be marked again after upgrading; comments are retained. New marks also track permission and rename changes.
