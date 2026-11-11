@@ -277,22 +277,39 @@ fn spawn(threads: usize, msgs: &Sender<Msg>) -> Sender<Job> {
 
 fn run(job: Job) -> Msg {
     match job {
-        Job::ListWorktrees { cwd } => Msg::Worktrees(guarded(|| {
-            #[cfg(test)]
-            tests::panic_if_marked(&cwd);
-            git::list_worktrees(&cwd)
-        })),
+        Job::ListWorktrees { cwd } => {
+            let started = std::time::Instant::now();
+            let result = guarded(|| {
+                #[cfg(test)]
+                tests::panic_if_marked(&cwd);
+                git::list_worktrees(&cwd)
+            });
+            let seconds = started.elapsed().as_secs_f64();
+            match &result {
+                Ok(list) => crate::log!("listed {} worktrees in {seconds:.3}s", list.len()),
+                Err(e) => crate::log!("listing worktrees failed after {seconds:.3}s: {e}"),
+            }
+            Msg::Worktrees(result)
+        }
         Job::ListBranches { cwd } => Msg::Branches(guarded(|| {
             #[cfg(test)]
             tests::panic_if_marked(&cwd);
             git::branches(&cwd)
         })),
         Job::Load { path, base } => {
+            let started = std::time::Instant::now();
             let result = guarded(|| {
                 #[cfg(test)]
                 tests::panic_if_marked(&path);
                 load(&path, &base)
             });
+            let (seconds, shown) = (started.elapsed().as_secs_f64(), path.display());
+            match &result {
+                Ok(loaded) => {
+                    crate::log!("loaded {shown} against {base}: {} files in {seconds:.3}s", loaded.diffs.len())
+                }
+                Err(e) => crate::log!("loading {shown} against {base} failed after {seconds:.3}s: {e}"),
+            }
             Msg::Loaded { path, result }
         }
         Job::Highlight { key, file_index, diffs } => {

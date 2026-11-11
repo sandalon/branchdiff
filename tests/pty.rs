@@ -49,6 +49,8 @@ impl Session {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_branchdiff"));
         cmd.cwd(&repo.main);
         cmd.env("TERM", "xterm-256color");
+        // Keeps test runs out of the user's own log.
+        cmd.env("BRANCHDIFF_LOG_FILE", repo.main.join(".git").join("branchdiff-test.log"));
         let started = Instant::now();
         let child = pty.slave.spawn_command(cmd).unwrap();
         drop(pty.slave);

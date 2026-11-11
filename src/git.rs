@@ -229,7 +229,45 @@ enum Exec {
 /// more than `limit` or outlives `timeout` is killed, with anything it
 /// started on Unix, and reaped. Readers left blocked by a process that
 /// escaped the kill hold only bounded buffers and end when it closes the pipe.
-fn exec(
+fn exec(cwd: &Path, cmd: Command, input: Option<Vec<u8>>, limit: usize, timeout: Duration) -> Result<Exec, GitError> {
+    if !crate::logging::enabled() {
+        return exec_unlogged(cwd, cmd, input, limit, timeout);
+    }
+    let shown = shown_args(&cmd);
+    let started = Instant::now();
+    let result = exec_unlogged(cwd, cmd, input, limit, timeout);
+    let elapsed = started.elapsed();
+    let outcome = match &result {
+        Ok(Exec::Done(out)) if out.code == Some(0) => None,
+        Ok(Exec::Done(out)) => Some(format!("exit {:?}: {}", out.code, first_line(&out.stderr))),
+        Ok(Exec::TooLarge) => Some(format!("output over {limit} bytes")),
+        Err(e) => Some(e.to_string()),
+    };
+    if crate::logging::verbose() || elapsed >= crate::logging::SLOW_COMMAND || outcome.is_some() {
+        let outcome = outcome.as_deref().unwrap_or("ok");
+        crate::log!("git {shown} in {}: {:.3}s, {outcome}", cwd.display(), elapsed.as_secs_f64());
+    }
+    result
+}
+
+/// A command's arguments without the `-c` settings every command pins.
+fn shown_args(cmd: &Command) -> String {
+    let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let mut rest = args.as_slice();
+    while let [flag, _, tail @ ..] = rest {
+        if flag != "-c" {
+            break;
+        }
+        rest = tail;
+    }
+    rest.join(" ")
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
+}
+
+fn exec_unlogged(
     cwd: &Path,
     mut cmd: Command,
     input: Option<Vec<u8>>,
@@ -626,6 +664,17 @@ fn diff_with_limit(cwd: &Path, merge_base: &str, limit: usize) -> Result<Vec<u8>
         Exec::Done(out) if out.code == Some(0) => Ok(out.stdout),
         Exec::Done(out) => Err(failed(Output { stdout: Vec::new(), ..out })),
         Exec::TooLarge => Err(GitError::DiffTooLarge),
+    }
+}
+
+/// `git --version`'s text, such as "git version 2.46.0.windows.1".
+pub fn version() -> Result<String, GitError> {
+    let cwd = std::env::temp_dir();
+    let mut cmd = Command::new("git");
+    cmd.arg("--version");
+    match exec(&cwd, cmd, None, 4096, Duration::from_secs(10))? {
+        Exec::Done(out) => Ok(ok_stdout(out)?.trim().to_string()),
+        Exec::TooLarge => Err(GitError::Failed("unexpected git --version output".into())),
     }
 }
 

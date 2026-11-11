@@ -5,7 +5,7 @@ use branchdiff::cache::CacheKey;
 use branchdiff::git::{self, GitError, RepoInfo};
 use branchdiff::store::{Review, ReviewId, ReviewVersion, SaveOutcome, Store};
 use branchdiff::worker::{Job, Lists, Loads, Msg, Pool, Probes, Reaction, WORKER_THREAD};
-use branchdiff::{config, editor, signals, ui, watch};
+use branchdiff::{config, editor, log, logging, signals, ui, watch};
 use clap::Parser;
 use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
 use ratatui::crossterm::event::{
@@ -26,11 +26,39 @@ struct Cli {
     /// Base branch to compare against
     #[arg(long)]
     base: Option<String>,
+    /// Log every git command, not only slow and failed ones
+    #[arg(long, short)]
+    verbose: bool,
+    /// Print where the log file is, then exit
+    #[arg(long)]
+    log_path: bool,
 }
 
 fn main() -> Result<()> {
+    let result = start();
+    match &result {
+        Ok(()) => log!("exiting normally"),
+        Err(e) => log!("exiting with an error: {e:#}"),
+    }
+    result
+}
+
+fn start() -> Result<()> {
     let cli = Cli::parse();
+    let log_path = logging::default_path();
+    if cli.log_path {
+        match &log_path {
+            Some(path) => println!("{}", path.display()),
+            None => bail!("no log location; set {} to choose one", logging::LOG_FILE_ENV),
+        }
+        return Ok(());
+    }
+    if let Some(path) = &log_path {
+        // Best effort: troubleshooting output must never stop the program.
+        let _ = logging::init(path, cli.verbose);
+    }
     let cwd = std::env::current_dir()?;
+    log_startup(&cwd);
     let info = match git::discover(&cwd) {
         Ok(i) => i,
         Err(e @ (GitError::GitMissing | GitError::NotARepo)) => bail!("{e}"),
@@ -41,6 +69,10 @@ fn main() -> Result<()> {
         Err(notice) => (None, Some(notice)),
     };
     let base = cli.base.or(configured).unwrap_or_else(|| "develop".into());
+    log!("repository {} (common dir {}), base {base}", info.toplevel.display(), info.common_dir.display());
+    if let Some(problem) = &config_problem {
+        log!("config: {problem}");
+    }
 
     signals::catch_quit_signals();
     let mut terminal = ratatui::try_init().context("could not start the terminal")?;
@@ -54,6 +86,26 @@ fn main() -> Result<()> {
     let _ = ratatui::try_restore();
     std::mem::forget(terminal);
     result
+}
+
+/// What a bug report needs to know about where branchdiff ran.
+fn log_startup(cwd: &Path) {
+    if !logging::enabled() {
+        return;
+    }
+    log!(
+        "branchdiff {} starting on {}/{} in {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cwd.display()
+    );
+    let git = git::version().unwrap_or_else(|e| format!("unavailable ({e})"));
+    log!("{git}");
+    let vars = ["TERM", "TERM_PROGRAM", "COLORTERM", "WT_SESSION", "MSYSTEM", "SHELL"];
+    let present: Vec<_> =
+        vars.iter().filter_map(|v| std::env::var(v).ok().map(|value| format!("{v}={value}"))).collect();
+    log!("environment: {}", present.join(" "));
 }
 
 const MAX_HIGHLIGHTS: usize = 2;
@@ -77,6 +129,9 @@ fn set_bracketed_paste(on: bool) {
 fn keep_terminal_on_worker_panic() {
     let ratatui_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+        log!("panic on {thread}: {info}\n{}", std::backtrace::Backtrace::force_capture());
         if std::thread::current().name() != Some(WORKER_THREAD) {
             set_bracketed_paste(false);
             ratatui_hook(info);
