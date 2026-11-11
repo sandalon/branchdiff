@@ -85,6 +85,79 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    // A repository's own config could name an fsmonitor hook, which `git
+    // status` and `git diff` would run as the user just for opening it. Git's
+    // built-in daemon runs no repository code, and without it a large checkout
+    // on Windows can take minutes to scan, so a `true` setting is kept. The
+    // value is always pinned on the command line, so a hook configured after
+    // the check still never runs.
+    // An empty value also disables hooks on older Git versions, which treat
+    // even the string "false" as a hook command.
+    let fsmonitor = if builtin_fsmonitor(cwd) { "core.fsmonitor=true" } else { "core.fsmonitor=" };
+    let mut cmd = base_command(cwd);
+    cmd.args(["-c", fsmonitor]).args(args);
+    cmd
+}
+
+/// Whether git's built-in fsmonitor daemon is enabled for `cwd`, remembered
+/// per directory since every command would otherwise pay for the lookup.
+fn builtin_fsmonitor(cwd: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(&on) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
+        return on;
+    }
+    let on = builtin_fsmonitor_configured(cwd);
+    seen.lock().unwrap_or_else(|e| e.into_inner()).insert(cwd.to_path_buf(), on);
+    on
+}
+
+/// Git has the built-in daemon only on Windows and macOS. Elsewhere a `true`
+/// setting does nothing useful, so it is never passed on.
+fn builtin_fsmonitor_configured(cwd: &Path) -> bool {
+    if !cfg!(any(windows, target_os = "macos")) || !cwd.is_dir() || !git_has_builtin_fsmonitor(cwd) {
+        return false;
+    }
+    // A hook path is not a boolean, so `--type=bool` fails for it. `git
+    // config` itself never consults fsmonitor.
+    let mut cmd = base_command(cwd);
+    cmd.args(["config", "--type=bool", "--get", "core.fsmonitor"]);
+    match exec(cwd, cmd, None, 4096, Duration::from_secs(10)) {
+        Ok(Exec::Done(out)) => out.code == Some(0) && out.stdout.trim_ascii() == b"true",
+        _ => false,
+    }
+}
+
+fn git_has_builtin_fsmonitor(cwd: &Path) -> bool {
+    use std::sync::OnceLock;
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut cmd = base_command(cwd);
+        cmd.arg("--version");
+        match exec(cwd, cmd, None, 4096, Duration::from_secs(10)) {
+            Ok(Exec::Done(out)) if out.code == Some(0) => version_has_builtin_fsmonitor(&out.stdout),
+            _ => false,
+        }
+    })
+}
+
+fn version_has_builtin_fsmonitor(version: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(version) else { return false };
+    let Some(version) = text.trim().strip_prefix("git version ") else { return false };
+    let mut parts = version.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else { return false };
+    match (major.parse::<u32>(), minor.parse::<u32>()) {
+        // The built-in daemon shipped in Git 2.37. Older Git may interpret
+        // "true" as a hook pathname rather than a boolean.
+        (Ok(major), Ok(minor)) => (major, minor) >= (2, 37),
+        _ => false,
+    }
+}
+
+/// Every git command's shared setup, except for `core.fsmonitor`.
+fn base_command(cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     for var in REPO_ENV_VARS {
         cmd.env_remove(var);
@@ -96,10 +169,6 @@ where
         // Stops `git diff` refreshing the index, which takes `index.lock` and
         // can race a concurrent `git add`. GIT_OPTIONAL_LOCKS does not cover it.
         .args(["-c", "diff.autoRefreshIndex=false"])
-        // A repository's own config could name an fsmonitor hook, which `git
-        // status` and `git diff` would run as the user just for opening it.
-        .args(["-c", "core.fsmonitor=false"])
-        .args(args)
         // Stops `git status` rewriting the index, which the watcher would see.
         .env("GIT_OPTIONAL_LOCKS", "0")
         // `merge_base` matches on stderr text, so it must not be translated.
@@ -351,8 +420,35 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, GitError> {
     // more useful to put the worktree with the newest commit or in-progress
     // edit first. The sort is stable, so equal or unavailable times retain
     // Git's deterministic order.
-    list.sort_by_key(|w| Reverse(worktree_modified(w)));
-    Ok(list)
+    let modified = all_modified(&list);
+    let mut keyed: Vec<_> = modified.into_iter().zip(list).collect();
+    keyed.sort_by_key(|(time, _)| Reverse(*time));
+    Ok(keyed.into_iter().map(|(_, w)| w).collect())
+}
+
+/// Most `git status` runs that sorting the list starts at once.
+const MAX_CONCURRENT_STATUS: usize = 8;
+
+/// `worktree_modified` for each worktree, in order. Each one runs `git status`,
+/// which takes seconds in a very large checkout, so they run side by side
+/// rather than holding back the list one after another.
+fn all_modified(list: &[Worktree]) -> Vec<SystemTime> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let threads = thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, MAX_CONCURRENT_STATUS);
+    let times = Mutex::new(vec![UNIX_EPOCH; list.len()]);
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..threads.min(list.len()) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(worktree) = list.get(index) else { break };
+                let time = worktree_modified(worktree);
+                times.lock().unwrap_or_else(|e| e.into_inner())[index] = time;
+            });
+        }
+    });
+    times.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The newest change represented by a worktree: its HEAD commit, or the mtime
@@ -716,6 +812,76 @@ mod tests {
         fingerprint(&repo).unwrap();
         diff_with_limit(&repo, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", 4096).unwrap();
         assert!(!marker.exists(), "the repository's fsmonitor hook ran");
+    }
+
+    fn repo_with_fsmonitor(value: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let init = Command::new("git").current_dir(dir.path()).args(["init", "-q"]).status().unwrap();
+        assert!(init.success());
+        if let Some(value) = value {
+            let set =
+                Command::new("git").current_dir(dir.path()).args(["config", "core.fsmonitor", value]).status().unwrap();
+            assert!(set.success());
+        }
+        dir
+    }
+
+    /// Git's own daemon runs no repository code, and large checkouts on
+    /// Windows depend on it, so it stays on where git supports it.
+    #[test]
+    fn the_builtin_fsmonitor_daemon_is_kept_where_git_has_one() {
+        let dir = repo_with_fsmonitor(Some("true"));
+        assert_eq!(
+            builtin_fsmonitor_configured(dir.path()),
+            cfg!(any(windows, target_os = "macos")) && git_has_builtin_fsmonitor(dir.path())
+        );
+    }
+
+    #[test]
+    fn old_or_unknown_git_versions_cannot_enable_a_boolean_fsmonitor_hook() {
+        for version in ["git version 2.35.1", "git version 2.36.0", "unknown", "git version 2.x"] {
+            assert!(!version_has_builtin_fsmonitor(version.as_bytes()), "{version}");
+        }
+        for version in [
+            "git version 2.37.0",
+            "git version 2.46.0.windows.1",
+            "git version 2.39.5 (Apple Git-154)",
+            "git version 3.0.0",
+        ] {
+            assert!(version_has_builtin_fsmonitor(version.as_bytes()), "{version}");
+        }
+    }
+
+    #[test]
+    fn a_hook_configured_after_the_first_command_is_still_overridden() {
+        let dir = repo_with_fsmonitor(Some("true"));
+        let before: Vec<_> = command(dir.path(), ["status"]).get_args().map(|a| a.to_owned()).collect();
+        let set = Command::new("git")
+            .current_dir(dir.path())
+            .args(["config", "core.fsmonitor", "hooks/should-not-run"])
+            .status()
+            .unwrap();
+        assert!(set.success());
+        let after: Vec<_> = command(dir.path(), ["status"]).get_args().map(|a| a.to_owned()).collect();
+        assert_eq!(before, after);
+        assert!(after.iter().any(|a| a == "core.fsmonitor=" || a == "core.fsmonitor=true"));
+    }
+
+    #[test]
+    fn an_fsmonitor_hook_or_no_setting_turns_fsmonitor_off() {
+        for value in [None, Some("false"), Some("/tmp/some-hook"), Some("hooks/fsmonitor-watchman")] {
+            let dir = repo_with_fsmonitor(value);
+            assert!(!builtin_fsmonitor_configured(dir.path()), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn worktrees_sorted_in_parallel_keep_their_order_by_activity() {
+        let list: Vec<_> = (0..20)
+            .map(|i| Worktree { path: format!("/branchdiff-missing-{i}").into(), head: String::new(), branch: None })
+            .collect();
+        // None of these exist, so every time is the epoch and the order holds.
+        assert_eq!(all_modified(&list), vec![UNIX_EPOCH; 20]);
     }
 
     #[test]
