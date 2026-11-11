@@ -174,8 +174,7 @@ fn exec(cwd: &Path, cmd: Command, input: Option<Vec<u8>>, limit: usize, timeout:
         Ok(Exec::TooLarge) => Some(format!("output over {limit} bytes")),
         Err(e) => Some(e.to_string()),
     };
-    // Many commands exit non-zero by design, so failures alone are verbose.
-    if crate::logging::verbose() || elapsed >= crate::logging::SLOW_COMMAND || result.is_err() {
+    if crate::logging::verbose() || elapsed >= crate::logging::SLOW_COMMAND || outcome.is_some() {
         let outcome = outcome.as_deref().unwrap_or("ok");
         crate::log!("git {shown} in {}: {:.3}s, {outcome}", cwd.display(), elapsed.as_secs_f64());
     }

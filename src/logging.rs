@@ -71,12 +71,13 @@ pub fn init(path: &Path, verbose: bool) -> std::io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
-    if std::fs::metadata(path).is_ok_and(|m| m.len() >= MAX_LOG_BYTES) {
-        rotate(path);
-    }
     let file = open(path)?;
     let written = file.metadata().map_or(0, |m| m.len());
-    let _ = LOG.set(Mutex::new(Log { path: path.to_path_buf(), file, written }));
+    let mut log = Log { path: path.to_path_buf(), file, written };
+    if written >= MAX_LOG_BYTES {
+        log.rotate()?;
+    }
+    let _ = LOG.set(Mutex::new(log));
     Ok(())
 }
 
@@ -85,14 +86,51 @@ fn open(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("log must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+            return Err(std::io::Error::other("log must be owned by this user and have no hard links"));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
-fn rotate(path: &Path) {
+fn rotate(path: &Path) -> std::io::Result<()> {
     let mut old = path.as_os_str().to_owned();
     old.push(".old");
-    let _ = std::fs::rename(path, old);
+    std::fs::rename(path, old)
+}
+
+impl Log {
+    fn rotate(&mut self) -> std::io::Result<()> {
+        rotate(&self.path)?;
+        self.file = open(&self.path)?;
+        self.written = 0;
+        Ok(())
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        if self.written.saturating_add(line.len() as u64) > MAX_LOG_BYTES {
+            // If rotation fails, stop appending rather than growing without
+            // limit (for example, when the directory is no longer writable).
+            self.rotate()?;
+        }
+        self.file.write_all(line.as_bytes())?;
+        self.written += line.len() as u64;
+        Ok(())
+    }
 }
 
 pub fn verbose() -> bool {
@@ -116,16 +154,7 @@ pub fn write(args: fmt::Arguments<'_>) {
         args
     );
     let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
-    if log.written + line.len() as u64 > MAX_LOG_BYTES {
-        rotate(&log.path);
-        if let Ok(file) = open(&log.path) {
-            log.file = file;
-            log.written = 0;
-        }
-    }
-    if log.file.write_all(line.as_bytes()).is_ok() {
-        log.written += line.len() as u64;
-    }
+    let _ = log.write_line(&line);
 }
 
 /// Writes a line to the log, if one is open, formatted like `format!`.
@@ -185,10 +214,53 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("b.log");
         std::fs::write(&path, "first").unwrap();
-        rotate(&path);
+        rotate(&path).unwrap();
         std::fs::write(&path, "second").unwrap();
-        rotate(&path);
+        rotate(&path).unwrap();
         assert!(!path.exists());
         assert_eq!(std::fs::read_to_string(dir.path().join("b.log.old")).unwrap(), "second");
+    }
+
+    #[test]
+    fn a_failed_rotation_does_not_keep_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.log");
+        std::fs::write(&path, "existing").unwrap();
+        std::fs::create_dir(dir.path().join("b.log.old")).unwrap();
+        let mut log = Log { file: open(&path).unwrap(), path: path.clone(), written: MAX_LOG_BYTES };
+        assert!(log.write_line("new line\n").is_err());
+        assert!(log.write_line("another line\n").is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "existing");
+    }
+
+    #[test]
+    fn a_full_log_rotates_before_the_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.log");
+        File::create(&path).unwrap().set_len(MAX_LOG_BYTES).unwrap();
+        let file = open(&path).unwrap();
+        let mut log = Log { path: path.clone(), file, written: MAX_LOG_BYTES };
+        log.write_line("next line\n").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "next line\n");
+        assert_eq!(std::fs::metadata(dir.path().join("b.log.old")).unwrap().len(), MAX_LOG_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_logs_become_private_and_links_are_rejected() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.log");
+        std::fs::write(&path, "existing").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let file = open(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let link = dir.path().join("linked.log");
+        symlink(&path, &link).unwrap();
+        assert!(open(&link).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::hard_link(&path, &link).unwrap();
+        assert!(open(&link).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "existing");
     }
 }

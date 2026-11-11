@@ -9,7 +9,8 @@ use std::process::{Command, Output, Stdio};
 
 /// Runs the binary with no controlling terminal, whatever ran these tests.
 fn branchdiff_without_a_terminal(cwd: &std::path::Path) -> Output {
-    branchdiff_logging_to(cwd, &std::env::temp_dir().join("branchdiff-cli-test.log"))
+    let dir = tempfile::tempdir().unwrap();
+    branchdiff_logging_to(cwd, &dir.path().join("branchdiff.log"))
 }
 
 fn branchdiff_logging_to(cwd: &std::path::Path, log: &std::path::Path) -> Output {
@@ -90,4 +91,24 @@ fn a_failed_start_is_written_to_the_log() {
     assert!(text.contains(concat!("branchdiff ", env!("CARGO_PKG_VERSION"), " starting")), "{text}");
     assert!(text.contains("git version "), "{text}");
     assert!(text.contains("exiting with an error: could not start the terminal"), "{text}");
+}
+
+#[test]
+fn failed_git_commands_are_logged_without_verbose() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("branchdiff.log");
+    let out = branchdiff_logging_to(dir.path(), &log);
+    assert_eq!(out.status.code(), Some(1));
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(text.contains("git rev-parse ") && text.contains("--show-toplevel"), "{text}");
+    assert!(text.contains("exit Some(128):"), "{text}");
+}
+
+#[test]
+fn an_unusable_log_does_not_stop_startup() {
+    let repo = Repo::new();
+    let dir = tempfile::tempdir().unwrap();
+    let out = branchdiff_logging_to(&repo.main, dir.path());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("Error: could not start the terminal"));
 }
