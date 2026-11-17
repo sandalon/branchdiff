@@ -322,7 +322,7 @@ fn help_overlay_lists_every_hotkey() {
         .collect();
     assert!(columns.iter().all(|column| *column == columns[0]), "description columns: {columns:?}");
     assert!(out.contains("Shift+Tab / Left   previous area"));
-    insta::assert_snapshot!(out);
+    insta::assert_snapshot!(out.replace(concat!("branchdiff ", env!("CARGO_PKG_VERSION")), "branchdiff [version]"));
 }
 
 #[test]
