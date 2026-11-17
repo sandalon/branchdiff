@@ -1,8 +1,9 @@
 ---
 source: tests/ui_snapshots.rs
-expression: out
+assertion_line: 325
+expression: "out.replace(concat!(\"branchdiff \", env!(\"CARGO_PKG_VERSION\")),\n\"branchdiff [version]\")"
 ---
-"┌Worktrees──┌Help──────────────────────────────────────────────────┐───────────┐"
+"┌Worktrees──┌Help — branchdiff [version]───────────────────────────────┐───────────┐"
 "│▸ feat-auth│ [ / ]              previous or next worktree         │           │"
 "│  fix-cache│ 1-9                jump to a worktree                │           │"
 "│           │ w                  fuzzy find a worktree             │           │"

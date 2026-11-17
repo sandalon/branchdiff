@@ -1119,7 +1119,10 @@ fn draw_help(f: &mut Frame) {
         .collect();
     let area = centered(f.area(), width as u16, (HELP.len() + BORDERS) as u16);
     f.render_widget(Clear, area);
-    f.render_widget(Paragraph::new(rows).block(block("Help", true)), area);
+    f.render_widget(
+        Paragraph::new(rows).block(block(concat!("Help — branchdiff ", env!("CARGO_PKG_VERSION")), true)),
+        area,
+    );
 }
 
 /// The items a filtering prompt lists for `query`, best first.
